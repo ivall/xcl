@@ -869,6 +869,13 @@ impl Lw {
                     _ => self.bin(BinOp::AShr, v, s),
                 }
             }
+            "v_trig_preop_f64" => {
+                if m.omod != 0 || m.clamp {
+                    return err(d, "v_trig_preop_f64 with an output modifier");
+                }
+                // only the exponent of S0 is read, so ABS / NEG do not matter
+                self.trig_preop(lh[0].1, lh[1].0)
+            }
             "v_mad_u64_u32" | "v_mad_i64_i32" => {
                 let p = if name == "v_mad_u64_u32" {
                     let (x, y) = (self.zext64(lh[0].0), self.zext64(lh[1].0));
@@ -1087,6 +1094,87 @@ impl Lw {
             self.write64(&dst, lo, hi);
         }
         Ok(())
+    }
+
+    /// `v_trig_preop_f64` as the HLSL backend's `trig_preop` (recomp/emit.rs): the 53 bits of
+    /// 2/pi below b(1200 - shift), scaled; exact, so built from integers. The table is read
+    /// through a chain of selects (37 words).
+    pub fn trig_preop(&mut self, s0_hi: Value, s1: Value) -> Value {
+        use crate::gpu::recomp::emit::TRIG_PREOP_2_OVER_PI as T;
+        let e = self.lshrc(s0_hi, 20);
+        let e = self.andc(e, 0x7FF);
+        let big = self.cmpc(Pred::UGt, e, 1077);
+        let ex = self.addc(e, (-1077i32) as u32);
+        let z0 = self.c(0);
+        let ex = self.sel(big, ex, z0);
+        let s1 = self.andc(s1, 31);
+        let k53 = self.c(53);
+        let sh = self.mul(s1, k53);
+        let sh = self.add(sh, ex);
+        let huge = self.cmpc(Pred::UGe, e, 1968);
+        let base = self.c(75);
+        let neg = self.c((-53i32) as u32);
+        let base = self.sel(huge, base, neg);
+        let sc = self.sub(base, sh);
+        let w = self.lshrc(sh, 5);
+        let b = self.andc(sh, 31);
+        let (mut t0, mut t1, mut t2) = (self.c(0), self.c(0), self.c(0));
+        for k in 0..T.len() {
+            let at = self.cmpc(Pred::Eq, w, k as u32);
+            let v0 = self.c(T[k]);
+            let v1 = self.c(T.get(k + 1).copied().unwrap_or(0));
+            let v2 = self.c(T.get(k + 2).copied().unwrap_or(0));
+            t0 = self.sel(at, v0, t0);
+            t1 = self.sel(at, v1, t1);
+            t2 = self.sel(at, v2, t2);
+        }
+        // (x << b) | ((y >> 1) >> (31 - b)): no shift by 32 when b is 0
+        let k31 = self.c(31);
+        let nb = self.sub(k31, b);
+        let join = |s: &mut Self, x: Value, y: Value| {
+            let hi = s.shl(x, b);
+            let y1 = s.lshrc(y, 1);
+            let lo = s.lshr(y1, nb);
+            s.or(hi, lo)
+        };
+        let a = join(self, t0, t1);
+        let c = join(self, t1, t2);
+        let vh = self.lshrc(a, 11);
+        let al = self.shlc(a, 21);
+        let ch = self.lshrc(c, 11);
+        let vl = self.or(al, ch);
+        let v = self.pack64(vl, vh);
+        let fh = self.firstbithigh(vh);
+        let fh = self.addc(fh, 32);
+        let fl = self.firstbithigh(vl);
+        let hz = self.nz(vh);
+        let n = self.sel(hz, fh, fl);
+        let e2 = self.add(n, sc);
+        let normal = self.cmpc(Pred::SGe, e2, (-1022i32) as u32);
+        let k52 = self.c(52);
+        let kn = self.sub(k52, n);
+        let kd = self.addc(sc, 1074);
+        let k = self.sel(normal, kn, kd);
+        let ku = self.zext64(k);
+        let l = self.shl(v, ku);
+        let z = self.c(0);
+        let nk = self.sub(z, k);
+        let nku = self.zext64(nk);
+        let r = self.lshr(v, nku);
+        let z64 = self.c64(0);
+        let small = self.cmpc(Pred::SLt, nk, 64);
+        let r = self.sel(small, r, z64);
+        let kpos = self.cmpc(Pred::SGe, k, 0);
+        let mm = self.sel(kpos, l, r);
+        let mask = self.c64((1u64 << 52) - 1);
+        let mant = self.and(mm, mask);
+        let be = self.addc(e2, 1023);
+        let be = self.zext64(be);
+        let s52 = self.c64(52);
+        let be = self.bin(BinOp::Shl, be, s52);
+        let nbits = self.or(be, mant);
+        // a zero window (shift >= 1184) has e2 < -1022 and comes out of the denormal form as 0
+        self.sel(normal, nbits, mm)
     }
 
     /// Double division (D3D11.1 double extensions).

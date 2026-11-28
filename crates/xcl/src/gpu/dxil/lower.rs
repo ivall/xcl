@@ -2090,7 +2090,7 @@ pub fn is_f64_rounded_op(name: &str) -> bool {
     name.contains("_f64")
         && !name.starts_with("v_cmp_")
         && !name.starts_with("v_cmpx_")
-        && !matches!(name, "v_cvt_f32_f64" | "v_cvt_i32_f64" | "v_cvt_u32_f64" | "v_frexp_exp_i32_f64")
+        && !matches!(name, "v_cvt_f32_f64" | "v_cvt_i32_f64" | "v_cvt_u32_f64" | "v_frexp_exp_i32_f64" | "v_trig_preop_f64")
 }
 
 /// The recompiler's `configure_round_modes`: (dynamic f16 rounding, has f64 rounding ops).

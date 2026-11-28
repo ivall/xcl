@@ -43,6 +43,8 @@ pub(super) struct Em {
     uses_lds: bool,
     /// scratch_* used: declare the per-lane private memory
     uses_scratch: bool,
+    /// v_trig_preop_f64 used: declare the 2/pi table (`PRELUDE_TRIG_PREOP`)
+    uses_trig_preop: bool,
     /// split wave64 (`x64`): words one exchange carries (1: masks and lane reads, up to 16:
     /// coherent scalar loads, 32: `ds_bpermute`)
     x64_words: usize,
@@ -590,7 +592,7 @@ fn is_f64_rounded_op(name: &str) -> bool {
     name.contains("_f64")
         && !name.starts_with("v_cmp_")
         && !name.starts_with("v_cmpx_")
-        && !matches!(name, "v_cvt_f32_f64" | "v_cvt_i32_f64" | "v_cvt_u32_f64" | "v_frexp_exp_i32_f64")
+        && !matches!(name, "v_cvt_f32_f64" | "v_cvt_i32_f64" | "v_cvt_u32_f64" | "v_frexp_exp_i32_f64" | "v_trig_preop_f64")
 }
 
 /// HLSL expression converting float expression `e` to a 16-bit half (`0..=0xFFFF`).
@@ -631,6 +633,7 @@ impl Em {
             ps_writes_mask: false,
             uses_lds: false,
             uses_scratch: false,
+            uses_trig_preop: false,
             x64_words: 1,
             mask_whole_live: BTreeMap::new(),
             upper: None,
@@ -3744,6 +3747,14 @@ impl Em {
             "v_lshlrev_b64" => format!("({} << ({} & 63u))", u64v(1), lo_hi[0].0),
             "v_lshrrev_b64" => format!("({} >> ({} & 63u))", u64v(1), lo_hi[0].0),
             "v_ashrrev_i64" => format!("(uint64_t)((int64_t){} >> ({} & 63u))", u64v(1), lo_hi[0].0),
+            "v_trig_preop_f64" => {
+                if m.omod != 0 || m.clamp {
+                    return Err("v_trig_preop_f64 with an output modifier");
+                }
+                self.uses_trig_preop = true;
+                // only the exponent of S0 is read, so ABS / NEG do not matter
+                format!("trig_preop({}, {})", lo_hi[0].1, lo_hi[1].0)
+            }
             "v_mad_u64_u32" | "v_mad_i64_i32" => {
                 let p = if name == "v_mad_u64_u32" {
                     format!("((uint64_t){} * (uint64_t){})", lo_hi[0].0, lo_hi[1].0)
@@ -5000,6 +5011,9 @@ impl Em {
         if self.uses_scratch {
             h.push_str(PRELUDE_SCRATCH);
         }
+        if self.uses_trig_preop {
+            h.push_str(&trig_preop_prelude());
+        }
         if self.dynamic_f16_rm {
             h.push_str("static uint xcl_fp16_rm = 0u;\n");
         }
@@ -6116,6 +6130,50 @@ fn d16_merge(v: &str, raw: &str, n: u32, signed: bool, half: u32) -> String {
         _ => val,
     }
 }
+
+/// `v_trig_preop_f64`: the 53 bits of 2/pi that start `shift` bits below b1200, times
+/// 2^(-53 - shift), plus 2^128 when the exponent of S0 is at least 1968, where
+/// `shift = S1[4:0] * 53`, plus `exp(S0) - 1077` when that exponent is above 1077 (RDNA2
+/// ISA). The product is exact (the table ends at b17, so no bit falls below 2^-1074), so
+/// the double is built from integers. Measured on an RDNA2 gfx1036.
+fn trig_preop_prelude() -> String {
+    let words: Vec<String> = TRIG_PREOP_2_OVER_PI.iter().map(|w| format!("0x{w:08X}u")).collect();
+    format!(
+        r#"static const uint TRIG_2_OVER_PI[{n}] = {{ {} }};
+uint trig_word(uint i) {{ return select(i < {n}u, TRIG_2_OVER_PI[min(i, {m}u)], 0u); }}
+uint64_t trig_preop(uint s0_hi, uint s1) {{
+    uint e = (s0_hi >> 20) & 0x7FFu;
+    uint sh = (s1 & 31u) * 53u + select(e > 1077u, e - 1077u, 0u);
+    int sc = select(e >= 1968u, 75, -53) - (int)sh;
+    uint w = sh >> 5, b = sh & 31u;
+    uint t0 = trig_word(w), t1 = trig_word(w + 1u), t2 = trig_word(w + 2u);
+    uint a = (t0 << b) | ((t1 >> 1) >> (31u - b)), c = (t1 << b) | ((t2 >> 1) >> (31u - b));
+    uint vh = a >> 11, vl = (a << 21) | (c >> 11);
+    uint64_t v = ((uint64_t)vh << 32) | (uint64_t)vl;
+    int n = select(vh != 0u, 32 + (int)firstbithigh(vh), (int)firstbithigh(vl));
+    int e2 = n + sc;
+    bool normal = e2 >= -1022;
+    int k = select(normal, 52 - n, sc + 1074);
+    uint64_t l = v << (uint64_t)((uint)k & 63u), r = v >> (uint64_t)((uint)(-k) & 63u);
+    uint64_t m = select(k >= 0, l, select(-k < 64, r, (uint64_t)0));
+    // a zero window (shift >= 1184) has e2 < -1022 and comes out of the denormal form as 0
+    return select(normal, ((uint64_t)(uint)(e2 + 1023) << 52) | (m & 0xFFFFFFFFFFFFFull), m);
+}}
+"#,
+        words.join(", "),
+        n = TRIG_PREOP_2_OVER_PI.len(),
+        m = TRIG_PREOP_2_OVER_PI.len() - 1
+    )
+}
+
+/// The fraction bits of 2/pi that `v_trig_preop_f64` reads, b1200 (the first after the point)
+/// down to b17, most significant first. The gfx1036 returns zeros for b16..b0.
+pub(crate) const TRIG_PREOP_2_OVER_PI: [u32; 37] = [
+    0xA2F9836E, 0x4E441529, 0xFC2757D1, 0xF534DDC0, 0xDB629599, 0x3C439041, 0xFE5163AB, 0xDEBBC561, 0xB7246E3A, 0x424DD2E0,
+    0x06492EEA, 0x09D1921C, 0xFE1DEB1C, 0xB129A73E, 0xE88235F5, 0x2EBB4484, 0xE99C7026, 0xB45F7E41, 0x3991D639, 0x835339F4,
+    0x9C845F8B, 0xBDF9283B, 0x1FF897FF, 0xDE05980F, 0xEF2F118B, 0x5A0A6D1F, 0x6D367ECF, 0x27CB09B7, 0x4F463F66, 0x9E5FEA2D,
+    0x7527BAC7, 0xEBE5F17B, 0x3D0739F7, 0x8A5292EA, 0x6BFB5FB1, 0x1F8D5D08, 0x56033046,
+];
 
 /// Per-lane private memory of scratch_* (static = thread-private in HLSL; 4 KB per lane).
 const PRELUDE_SCRATCH: &str = r#"

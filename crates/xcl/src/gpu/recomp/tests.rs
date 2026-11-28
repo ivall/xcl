@@ -1132,6 +1132,118 @@ fn f64_roots(wave64: bool) {
     assert!(bad.is_empty(), "wave{lanes}:\n{}", bad.join("\n"));
 }
 
+/// `v_trig_preop_f64` (S0, S1) → result, measured on an RDNA2 gfx1036 (Radeon iGPU, HIP). The
+/// rows cover S0 exponents up to and past 1077 and 1968, NaN / inf / negative S0, S1 with bits
+/// above [4:0], zero results (the window past the table), denormal results and windows that
+/// reach the end of the hardware's table (b17).
+const TRIG_PREOP_RDNA2: [[u64; 3]; 64] = [
+    [0x7cf123456789abcd, 0x00000005, 0x0000000000000000],
+    [0x7d5123456789abcd, 0x00000004, 0x00aa10ac06608c00],
+    [0xfd10000000005555, 0x00000005, 0x0000000000000000],
+    [0x8400c6fa74beb8ae, 0x688af7b3, 0x00ff17b3d0739f78],
+    [0x00039c7ad0cf26b9, 0x29d1556a, 0x1ec8135a2fbf209c],
+    [0xfff6d15c28c4c757, 0xffffffe3, 0x012aba10ac066088],
+    [0x7bc0000000005555, 0x00000004, 0x02311f8d5d085603],
+    [0xa36ee3eb2ad33454, 0x3e9397c3, 0x35f3c439041fe516],
+    [0xfe30000000005555, 0x00000004, 0x0000580cc1180000],
+    [0x7c20000000005555, 0x00000000, 0x0f18fd9a797fa8b5],
+    [0x7da0000000005555, 0x00000000, 0x0d997fa8b5d49eeb],
+    [0xdb495bce98e0848b, 0x84382365, 0x17608bf177bf2507],
+    [0x7b00000000005555, 0x00000004, 0x02f5fb11f8d5d085],
+    [0x7b0ddb53b7d64c3d, 0x00000005, 0x0000180cc1180000],
+    [0x7b00000000005555, 0x00000002, 0x098f2f8bd9e839ce],
+    [0xffb0000000005555, 0x00000001, 0x083b3d0739f78a52],
+    [0xfc50000000005555, 0x00000004, 0x01af1aba10ac0660],
+    [0xfdd0000000005555, 0x00000000, 0x0d57fa8b5d49eeb0],
+    [0xccbad29d5644a528, 0xb98d92f1, 0x00000000005e294a],
+    [0x7e7123456789abcd, 0x00000004, 0x0000080cc1180000],
+    [0x7ec0000000005555, 0x00000004, 0x0000000cc1180000],
+    [0x7cc123456789abcd, 0x00000004, 0x012aba10ac06608c],
+    [0x7f9123456789abcd, 0x00000004, 0x0000000001180000],
+    [0x7de123456789abcd, 0x00000004, 0x0001580cc1180000],
+    [0x0002f273319e70c3, 0x00000000, 0x3fe45f306dc9c882],
+    [0x80069e880ac2d426, 0x00000002, 0x394a6ee06db14acc],
+    [0x000dee014709d7fd, 0x00000015, 0x0000000000000000],
+    [0x80024e23b6e62dcb, 0x00000016, 0x0000000000000000],
+    [0x999f919275185ba1, 0x6e84eeb4, 0x000000000000294a],
+    [0x2accbeb57d0e7eb3, 0x4651513a, 0x0000000000000000],
+    [0xa9ad789b77bfb85e, 0x81037655, 0x0000000000000000],
+    [0x4366b711acc929de, 0x00000005, 0x2f42371d2126e970],
+    [0xc36ca5d5a2fdf398, 0x00000000, 0x3fc17cc1b727220a],
+    [0xcb07fb9c25cecdcf, 0x00000011, 0x0000f41ce7de294a],
+    [0x4363f77e06a26789, 0x00000015, 0x0000000000000000],
+    [0xc36c18a2b3786189, 0x00000016, 0x0000000000000000],
+    [0x4368966afa02fa69, 0xffffffe3, 0x35ce21c820ff28b0],
+    [0x7af3c9a8da6091c9, 0xffffffe3, 0x0000000001de294a],
+    [0x599ed57effe819d5, 0x39d272f8, 0x0000000000000000],
+    [0xdb13fce4a7087ca3, 0x287d0037, 0x0000000000000000],
+    [0x7b0cae0559eebce6, 0xffffffe3, 0x064bc529497535fd],
+    [0xfb0b31cb10c632f1, 0x00000020, 0x10374f463f669e5f],
+    [0xfb3403ad530e178f, 0xf1321dc5, 0x0000000cc1180000],
+    [0x7b3d03b8e7c459c9, 0x4f229637, 0x0000000000000000],
+    [0xfb0629a6ca876f6e, 0x33a8008f, 0x0000000000000000],
+    [0x7ff3fa01314903b7, 0x00000001, 0x07f3d0739f78a529],
+    [0xfffa97b158e5a673, 0x00000000, 0x0b43dd63f5f2f8bd],
+    [0x7ff123456789abcd, 0x00000004, 0x0000000000080000],
+    [0x7ff3eeac59b732cb, 0x00000015, 0x0000000000000000],
+    [0xfff7a8bc73cdbfdc, 0x00000005, 0x0000000000000000],
+    [0x7b00000000005555, 0x00000019, 0x0000000000000000],
+    [0xf35f1337656a5f06, 0x91890b73, 0x0000000000000000],
+    [0xfbf0000000005555, 0x0000000a, 0x0000000000000000],
+    [0xfef0000000005555, 0x00000017, 0x0000000000000000],
+    [0x708251e0152c4fb9, 0x00000015, 0x0000000000000000],
+    [0x7da0000000005555, 0x0000000b, 0x0000000000000000],
+    [0x7d04bf147c026ad5, 0x00000015, 0x0000000000000000],
+    [0xfb90000000005555, 0x0000000e, 0x0000000000000000],
+    [0xfe30000000005555, 0x0000000b, 0x0000000000000000],
+    [0x44cb1a43d8986a1e, 0x0000001f, 0x0000000000000000],
+    [0x7d40000000005555, 0x00000011, 0x0000000000000000],
+    [0xaf48f4a2a702f9ce, 0x4ad6eb2f, 0x0e26b414da3eda6c],
+    [0xc34940811959a65a, 0xffffffe3, 0x35f3c439041fe516],
+    [0xfb1c5a0d1d20125e, 0x00000000, 0x101d3d18fd9a797e],];
+
+/// v_trig_preop_f64 in both backends against the gfx1036's results.
+#[test]
+fn gpu_trig_preop_f64_matches_rdna2() {
+    if !gpu_ready() {
+        return;
+    }
+    let code = prog(&[("V_TRIG_PREOP_F64", "ENC_VOP3", &[("VDST", 10), ("SRC0", V + 1), ("SRC1", V + 3)], None)]);
+    let wave64 = true;
+    let mut st = KernelState::default();
+    for (l, r) in st.vgpr.iter_mut().take(64).enumerate() {
+        let [s0, s1, _] = TRIG_PREOP_RDNA2[l];
+        (r[1], r[2], r[3]) = (s0 as u32, (s0 >> 32) as u32, s1 as u32);
+    }
+    for direct in [false, true] {
+        let dxil = if direct {
+            let o = crate::gpu::dxil::kernel::KernelOptions { wave64, split: !gpu_waves().contains(&true), mem_windows: 1, sampler_base: 0 };
+            crate::gpu::dxil::kernel::translate(&code, o).unwrap_or_else(|e| panic!("direct DXIL: {e}"))
+        } else {
+            let t = translate(&code, &Options { wave64, split_wave64: !gpu_waves().contains(&true), ..Default::default() }).unwrap();
+            assert!(t.complete(), "{:?}
+{}", t.unsupported_why, t.hlsl);
+            super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}
+{}", t.hlsl))
+        };
+        let r = runner::run(&dxil, &st, &[]).unwrap();
+        for (l, [s0, s1, want]) in TRIG_PREOP_RDNA2.iter().enumerate() {
+            let got = r.vgpr[l][10] as u64 | (r.vgpr[l][11] as u64) << 32;
+            assert_eq!(got, *want, "direct={direct} lane {l}: v_trig_preop_f64({s0:#018x}, {s1:#010x})");
+        }
+    }
+}
+
+/// An output modifier on v_trig_preop_f64 is refused (not measured).
+#[test]
+fn trig_preop_f64_with_omod_is_refused() {
+    let code = prog(&[("V_TRIG_PREOP_F64", "ENC_VOP3", &[("VDST", 10), ("SRC0", V + 1), ("SRC1", V + 3), ("OMOD", 1)], None)]);
+    let t = translate(&code, &Options::default()).unwrap();
+    assert!(!t.complete());
+    let o = crate::gpu::dxil::kernel::KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 };
+    assert!(crate::gpu::dxil::kernel::translate(&code, o).is_err());
+}
+
 /// v_ldexp_f64 = x · 2^n, rounded once, for every i32 n: results that over- or underflow,
 /// denormal results, exponents beyond the f32 range of 2^n.
 #[test]
