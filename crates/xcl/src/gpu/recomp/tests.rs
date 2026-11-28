@@ -1238,6 +1238,95 @@ fn gpu_valu_float_and_int() {
     }
 }
 
+/// The VOP1 bit scans and reversal against the ISA's pseudo-code: v_ffbh_u32 and v_ffbl_b32
+/// count from the top and from the bottom (-1 for 0), v_ffbh_i32 finds the first bit that
+/// differs from the sign bit (-1 for 0 and -1), v_bfrev_b32 and v_not_b32. Sources are a VGPR,
+/// an SGPR, the inline constant 0 and a literal.
+#[test]
+fn gpu_vop1_bit_scans_and_reverse() {
+    for wave64 in gpu_waves() {
+        vop1_bit_scans_and_reverse(wave64);
+    }
+}
+
+fn vop1_bit_scans_and_reverse(wave64: bool) {
+    const EDGES: [u32; 20] = [
+        0, 1, 2, 3, 0xF, 0x8000, 0x1_0000, 0x4000_0000, 0x7FFF_FFFF, 0x8000_0000, 0x8000_0001,
+        0xBFFF_FFFF, 0xC000_0000, 0xF000_0000, 0xFFFF_FFFE, 0xFFFF_FFFF, 0x1234_5678, 0xDEAD_BEEF,
+        0x0000_0100, 0xFFFF_FEFF,
+    ];
+    let vop1 = |name, vdst: u64, src0: u64| (name, "ENC_VOP1", vec![("VDST", vdst), ("SRC0", src0)]);
+    let list = [
+        vop1("V_FFBH_U32", 1, V),
+        vop1("V_FFBL_B32", 2, V),
+        vop1("V_FFBH_I32", 3, V),
+        vop1("V_BFREV_B32", 4, V),
+        vop1("V_NOT_B32", 5, V),
+        vop1("V_FFBH_I32", 6, 4),   // s4
+        vop1("V_FFBH_U32", 7, 128), // inline 0
+        vop1("V_FFBL_B32", 8, 128),
+        vop1("V_FFBH_U32", 9, 255),  // literal
+        vop1("V_FFBL_B32", 10, 255), // literal
+        vop1("V_BFREV_B32", 11, 255),
+    ];
+    let mut p = Vec::new();
+    for (name, enc, fields) in &list {
+        let literal = fields.contains(&("SRC0", 255)).then_some(0x0008_0010u32);
+        p.extend(encode(name, enc, fields, literal).unwrap_or_else(|x| panic!("{name}: {x}")));
+    }
+    p.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+
+    // the ISA's loops, not the closed forms the emitter uses
+    let ffbh_u = |x: u32| (0..32).find(|i| x >> (31 - i) & 1 == 1).unwrap_or(u32::MAX);
+    let ffbl = |x: u32| (0..32).find(|i| x >> i & 1 == 1).unwrap_or(u32::MAX);
+    let ffbh_i = |x: u32| (1..32).find(|i| x >> (31 - i) & 1 != x >> 31).unwrap_or(u32::MAX);
+    let bfrev = |x: u32| (0..32).fold(0, |d, i| d | (x >> i & 1) << (31 - i));
+
+    let mut st = KernelState::default();
+    st.sgpr[4] = 0xFFFF_0000;
+    let mut x = 0x2545_F491u32;
+    let inputs: Vec<u32> = (0..st.vgpr.len())
+        .map(|l| {
+            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            // the odd lanes past the edges keep only the top bits of the word, so the
+            // scans from the bottom see long runs of zeros too
+            if l < EDGES.len() { EDGES[l] } else if l % 2 == 1 { x & !((1 << (x >> 27)) - 1) } else { x }
+        })
+        .collect();
+    for (r, &v) in st.vgpr.iter_mut().zip(&inputs) {
+        r[0] = v;
+    }
+    let (r, lanes) = run_wave(&p, &st, wave64);
+    let mut bad = Vec::new();
+    for (l, v) in r.vgpr.iter().take(lanes).enumerate() {
+        let x = inputs[l];
+        for (name, got, want) in [
+            ("v_ffbh_u32", v[1], ffbh_u(x)),
+            ("v_ffbl_b32", v[2], ffbl(x)),
+            ("v_ffbh_i32", v[3], ffbh_i(x)),
+            ("v_bfrev_b32", v[4], bfrev(x)),
+            ("v_not_b32", v[5], !x),
+        ] {
+            if got != want {
+                bad.push(format!("lane {l}: {name}({x:#010x}) = {got:#x}, want {want:#x}"));
+            }
+        }
+        for (name, got, want) in [
+            ("v_ffbh_i32(s4)", v[6], ffbh_i(0xFFFF_0000)),
+            ("v_ffbh_u32(0)", v[7], u32::MAX),
+            ("v_ffbl_b32(0)", v[8], u32::MAX),
+            ("v_ffbh_u32(literal)", v[9], ffbh_u(0x0008_0010)),
+            ("v_ffbl_b32(literal)", v[10], ffbl(0x0008_0010)),
+            ("v_bfrev_b32(literal)", v[11], bfrev(0x0008_0010)),
+        ] {
+            if got != want {
+                bad.push(format!("lane {l}: {name} = {got:#x}, want {want:#x}"));
+            }
+        }
+    }
+    assert!(bad.is_empty(), "wave64={wave64}: {} wrong results, first: {:#?}", bad.len(), &bad[..bad.len().min(8)]);
+}
+
 /// Output modifiers each instruction kind applies: omod on f64 (clamp stays in double
 /// precision) and on the f64 → f32 / f32 → f16 conversions, and the integer clamp (saturation) of the
 /// unsigned adds, the packed 16-bit adds and the integer dot products.
