@@ -5414,6 +5414,59 @@ fn vs_system_values_in_isg1_registers() {
     assert!(t.hlsl.contains("uint v4 = asuint(xi.a0[0]);"), "{}", t.hlsl);
 }
 
+/// Multiple packed ISG1 vertex elements sharing a register emit non-colliding
+/// struct fields and read their declared channels.
+#[test]
+fn vs_packed_isg1_vertex_input_dedup() {
+    use super::VsInterface;
+    let sig_mask = |name: &str, idx: u32, reg: u32, mask: u8| crate::gpu::dxbc::SigElement {
+        name: name.into(),
+        index: idx,
+        system_value: 0,
+        component_type: 3,
+        register: reg,
+        mask,
+        rw_mask: mask,
+        stream: 0,
+    };
+    let vs = VsInterface {
+        inputs: vec![
+            sig_mask("UV", 1, 0, 0x3),
+            sig_mask("UV", 0, 0, 0xC),
+            sig_mask("COLOR", 0, 1, 0xF),
+        ],
+        outputs: vec![crate::gpu::dxbc::SigElement {
+            name: "SV_Position".into(),
+            index: 0,
+            system_value: 1,
+            component_type: 3,
+            register: 0,
+            mask: 0xF,
+            rw_mask: 0xF,
+            stream: 0,
+        }],
+        attr_base: 4,
+        params: None,
+    };
+    let code = prog(&[
+        ("V_ADD_F32", "ENC_VOP2", &[("VDST", 20), ("SRC0", V + 4), ("VSRC1", 5)], None),
+        ("V_ADD_F32", "ENC_VOP2", &[("VDST", 21), ("SRC0", V + 6), ("VSRC1", 7)], None),
+        ("V_ADD_F32", "ENC_VOP2", &[("VDST", 22), ("SRC0", V + 8), ("VSRC1", 9)], None),
+    ]);
+    let t = translate(&code, &Options { mode: Mode::Vertex(vs), wave64: true, ..Default::default() }).unwrap();
+    assert!(t.hlsl.contains("float4 a0 : UV1;"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("float4 a0_1 : UV0;"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("float4 a1 : COLOR0;"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("uint v4 = asuint(xi.a0[0]);"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("uint v5 = asuint(xi.a0[1]);"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("uint v6 = asuint(xi.a0_1[2]);"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("uint v7 = asuint(xi.a0_1[3]);"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("uint v8 = asuint(xi.a1[0]);"), "{}", t.hlsl);
+    if super::dxc::location().is_ok() {
+        super::dxc::compile(&t.hlsl, "main", "vs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+    }
+}
+
 #[test]
 #[ignore]
 fn probe_standard_swizzle_support() {

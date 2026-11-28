@@ -137,6 +137,11 @@ impl VsInterface {
     pub fn input_vgpr(&self, register: u32) -> Option<u64> {
         fetched_registers(&self.inputs).iter().position(|&r| r == register).map(|k| self.attr_base + 4 * k as u64)
     }
+
+    /// The place in `ranked(inputs, false)` to read channel `chan` of ISG1 register `register`.
+    pub fn input_slot(&self, register: u32, chan: usize) -> Option<usize> {
+        vs_input_slot(self, register, chan)
+    }
 }
 
 /// The ISG1 registers the console's fetch shader loads, in the order of their VGPRs (four
@@ -460,6 +465,31 @@ pub fn vs_param_register(vs: &VsInterface, n: usize) -> Option<u32> {
         Some(t) => t.get(n).copied(),
         None => param_registers(&vs.outputs, true).get(n).copied(),
     }
+}
+
+/// Field names of the PC vertex input struct (`XclIn`): `a{e.register}` when unique, deduplicated
+/// with `_{dup}` suffixes when multiple packed ISG1 vertex elements share a register.
+pub fn vs_input_names(inputs: &[SigElement]) -> Vec<String> {
+    let ranked_inputs = ranked(inputs, false);
+    let mut counts = BTreeMap::new();
+    let mut names = Vec::with_capacity(ranked_inputs.len());
+    for e in ranked_inputs {
+        let n = counts.entry(e.register).or_insert(0usize);
+        names.push(if *n == 0 {
+            format!("a{}", e.register)
+        } else {
+            format!("a{}_{}", e.register, *n)
+        });
+        *n += 1;
+    }
+    names
+}
+
+/// The place in `ranked(inputs, false)` to read channel `chan` of ISG1 register `register`
+/// from: an element at that register (the one declaring `chan`, if any).
+pub fn vs_input_slot(vs: &VsInterface, register: u32, chan: usize) -> Option<usize> {
+    let all = ranked(&vs.inputs, false);
+    all.iter().position(|e| e.register == register && e.mask >> chan & 1 == 1).or_else(|| all.iter().position(|e| e.register == register))
 }
 
 /// Hardware order and VGPR sizes of the PS inputs enabled in SPI_PS_INPUT_ENA (bit → size):
@@ -1832,8 +1862,10 @@ mod attribute_tests {
         let ps = PsInterface { inputs: sig.clone(), ..Default::default() };
         assert_eq!((ps_attribute_slot(&ps, 0, 0), ps_attribute_slot(&ps, 0, 3), ps_attribute_slot(&ps, 1, 0)), (Some(0), Some(1), Some(2)));
         assert_eq!((0..4).map(|j| ps_slot_attribute(&ps, j)).collect::<Vec<_>>(), [Some(0), Some(0), Some(1), Some(2)]);
-        let vs = VsInterface { outputs: sig, ..Default::default() };
+        let vs = VsInterface { inputs: sig.clone(), outputs: sig, ..Default::default() };
         assert_eq!((vs_param_register(&vs, 1), vs_param_register(&vs, 3)), (Some(1), None));
+        assert_eq!(vs_input_names(&vs.inputs), ["a0", "a0_1", "a1", "a2"]);
+        assert_eq!((vs.input_slot(0, 0), vs.input_slot(0, 3), vs.input_slot(1, 0)), (Some(0), Some(1), Some(2)));
         // the console's table: a Fortnite VS whose SV_Position register is param 1
         let mut f = vec![0u8; 0x400];
         f[0x10] = 5;

@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
-use super::{elements_at, param_registers, ps_attribute_slot, ps_input_vgpr, ps_slot_attribute, ranked, vs_param_register, Mode, MsInterface, Options, KERNEL_EXPORTS, KERNEL_LANES, KERNEL_SCC_SLOT, KERNEL_SGPRS, KERNEL_SPLIT_MAGIC, KERNEL_SPLIT_SGPRS, KERNEL_VGPRS, MESH_HEADER};
+use super::{elements_at, param_registers, ps_attribute_slot, ps_input_vgpr, ps_slot_attribute, ranked, vs_input_names, vs_param_register, Mode, MsInterface, Options, KERNEL_EXPORTS, KERNEL_LANES, KERNEL_SCC_SLOT, KERNEL_SGPRS, KERNEL_SPLIT_MAGIC, KERNEL_SPLIT_SGPRS, KERNEL_VGPRS, MESH_HEADER};
 use super::upper_lanes::Read;
 use crate::gpu::dxbc::SigElement;
 use crate::gpu::rdna2::{self, Decoded, Encoding, Operand, Variant};
@@ -5068,9 +5068,11 @@ impl Em {
             }
             Mode::Vertex(vs) => {
                 h.push_str("struct XclIn {\n");
-                let inputs: Vec<&SigElement> = vs.inputs.iter().filter(|e| e.system_value == 0 && !e.name.starts_with("SV_")).collect();
-                for e in &inputs {
-                    let _ = writeln!(h, "    {}4 a{} : {};", hlsl_type(e), e.register, e.semantic());
+                let inputs = ranked(&vs.inputs, false);
+                let names = vs_input_names(&vs.inputs);
+                for (k, e) in inputs.iter().enumerate() {
+                    let name = &names[k];
+                    let _ = writeln!(h, "    {}4 {name} : {};", hlsl_type(e), e.semantic());
                 }
                 h.push_str("    uint xcl_vid : SV_VertexID;\n    uint xcl_iid : SV_InstanceID;\n};\n");
                 out_struct(&mut h, "XclOut", &vs.outputs);
@@ -5096,9 +5098,19 @@ impl Em {
                         if e.system_value == 6 { "xi.xcl_vid" } else { "xi.xcl_iid" }.to_string()
                     } else {
                         // the fetch shader's VGPRs: four per register the program reads (`fetched_registers`)
-                        inputs
+                        super::fetched_registers(&vs.inputs)
                             .iter()
-                            .find_map(|e| vs.input_vgpr(e.register).filter(|&b| v >= b && v < b + 4).map(|b| format!("asuint(xi.a{}[{}])", e.register, v - b)))
+                            .find_map(|&r| {
+                                let b = vs.input_vgpr(r)?;
+                                if v >= b && v < b + 4 {
+                                    let chan = (v - b) as usize;
+                                    let slot = vs.input_slot(r, chan)?;
+                                    let name = &names[slot];
+                                    Some(format!("asuint(xi.{name}[{chan}])"))
+                                } else {
+                                    None
+                                }
+                            })
                             .unwrap_or_else(|| "0u".into())
                     };
                     let _ = writeln!(h, "    uint v{v} = {init};");
@@ -6240,7 +6252,7 @@ uint fmt_encode(uint x, uint info, uint c) {
     uint ty = (info >> 3) & 7u; uint w = (info >> (8u + 6u * c)) & 63u; float f = asfloat(x);
     float maxu = w >= 32u ? 4294967295.0f : (float)((1u << w) - 1u);
     float maxs = w >= 32u ? 2147483647.0f : (float)((1u << (w - 1u)) - 1u);
-    if (ty == 0u) return (uint)round(saturate(f) * maxu);
+    if (ty == 0u) return (uint)round(clamp(f, 0.0f, 1.0f) * maxu);
     if (ty == 1u) return (uint)(int)round((isnan(f) ? 0.0f : clamp(f, -1.0f, 1.0f)) * maxs);
     if (ty == 2u) return (uint)f;
     if (ty == 3u) return (uint)(int)f;
