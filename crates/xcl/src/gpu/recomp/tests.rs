@@ -2336,6 +2336,75 @@ fn gpu_ps_p0_reads_flat_integer_selectors() {
     }
 }
 
+#[test]
+fn gpu_ps_interp_f16() {
+    if !gpu_ready() {
+        return;
+    }
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_FORMAT_R32G32_FLOAT};
+
+    let h = half_bits;
+    let vs_code = draw_passthrough_vs();
+    // Draw 1: v_interp_p1ll_f16 + v_interp_p2_f16 (low half, OP_SEL=0) preserves v4.hi,
+    // and v_interp_p1lv_f16 + v_interp_p2_f16 (high half, OP_SEL[3]=1) preserves v5.lo.
+    let ps_halves = prog(&[
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", 255)], Some(h(0.125) | (h(0.875) << 16))),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 5), ("SRC0", 255)], Some(h(0.375) | (h(0.0) << 16))),
+        ("V_INTERP_P1LL_F16", "ENC_VOP3", &[("VDST", 8), ("SRC0", 0), ("SRC1", V)], None),
+        ("V_INTERP_P2_F16", "ENC_VOP3", &[("VDST", 4), ("SRC0", 0), ("SRC1", V + 1), ("SRC2", V + 8), ("OP_SEL", 0)], None),
+        ("V_INTERP_P1LV_F16", "ENC_VOP3", &[("VDST", 8), ("SRC0", 1 << 6), ("SRC1", V), ("SRC2", V + 8)], None),
+        ("V_INTERP_P2_F16", "ENC_VOP3", &[("VDST", 5), ("SRC0", 1 << 6), ("SRC1", V + 1), ("SRC2", V + 8), ("OP_SEL", 8)], None),
+        ("V_CVT_F32_F16", "ENC_VOP3", &[("VDST", 10), ("SRC0", V + 4), ("OP_SEL", 0)], None),
+        ("V_CVT_F32_F16", "ENC_VOP3", &[("VDST", 11), ("SRC0", V + 4), ("OP_SEL", 1)], None),
+        ("V_CVT_F32_F16", "ENC_VOP3", &[("VDST", 12), ("SRC0", V + 5), ("OP_SEL", 0)], None),
+        ("V_CVT_F32_F16", "ENC_VOP3", &[("VDST", 13), ("SRC0", V + 5), ("OP_SEL", 1)], None),
+        ("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 10), ("VSRC1", 11), ("VSRC2", 12), ("VSRC3", 13), ("DONE", 1), ("VM", 1)], None),
+    ]);
+    // Draw 2: pack channels 2 and 3 into low and high halves of v6, and verify an EXEC=0
+    // v_interp_p2_f16 leaves both halves of v7 untouched.
+    let ps_pack_and_exec = prog(&[
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 6), ("SRC0", 255)], Some(0)),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 7), ("SRC0", 255)], Some(h(0.625) | (h(0.125) << 16))),
+        ("V_INTERP_P1LL_F16", "ENC_VOP3", &[("VDST", 8), ("SRC0", 2 << 6), ("SRC1", V)], None),
+        ("V_INTERP_P2_F16", "ENC_VOP3", &[("VDST", 6), ("SRC0", 2 << 6), ("SRC1", V + 1), ("SRC2", V + 8), ("OP_SEL", 0)], None),
+        ("V_INTERP_P1LV_F16", "ENC_VOP3", &[("VDST", 8), ("SRC0", 3 << 6), ("SRC1", V), ("SRC2", V + 8)], None),
+        ("V_INTERP_P2_F16", "ENC_VOP3", &[("VDST", 6), ("SRC0", 3 << 6), ("SRC1", V + 1), ("SRC2", V + 8), ("OP_SEL", 8)], None),
+        ("S_AND_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 40), ("SSRC0", 128)], None),
+        ("V_INTERP_P2_F16", "ENC_VOP3", &[("VDST", 7), ("SRC0", 0), ("SRC1", V + 1), ("SRC2", V + 8), ("OP_SEL", 0)], None),
+        ("V_INTERP_P2_F16", "ENC_VOP3", &[("VDST", 7), ("SRC0", 1 << 6), ("SRC1", V + 1), ("SRC2", V + 8), ("OP_SEL", 8)], None),
+        ("S_MOV_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 40)], None),
+        ("V_CVT_F32_F16", "ENC_VOP3", &[("VDST", 10), ("SRC0", V + 6), ("OP_SEL", 0)], None),
+        ("V_CVT_F32_F16", "ENC_VOP3", &[("VDST", 11), ("SRC0", V + 6), ("OP_SEL", 1)], None),
+        ("V_CVT_F32_F16", "ENC_VOP3", &[("VDST", 12), ("SRC0", V + 7), ("OP_SEL", 0)], None),
+        ("V_CVT_F32_F16", "ENC_VOP3", &[("VDST", 13), ("SRC0", V + 7), ("OP_SEL", 1)], None),
+        ("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 10), ("VSRC1", 11), ("VSRC2", 12), ("VSRC3", 13), ("DONE", 1), ("VM", 1)], None),
+    ]);
+    let compile = |code: &[u8], mode: Mode, profile: &str| {
+        let t = translate(code, &runner::options(mode)).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        super::dxc::compile(&t.hlsl, "main", profile, &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl))
+    };
+    let vs = compile(&vs_code, Mode::Vertex(draw_vsi()), "vs_6_6");
+    let layout = [
+        runner::VertexElement { semantic: "POSITION", index: 0, format: DXGI_FORMAT_R32G32_FLOAT, offset: 0 },
+        runner::VertexElement { semantic: "COLOR", index: 0, format: DXGI_FORMAT_R32G32B32A32_FLOAT, offset: 8 },
+    ];
+    let vertices: Vec<f32> = [[-1.0, -1.0], [-1.0, 3.0], [3.0, -1.0]]
+        .into_iter()
+        .flat_map(|[x, y]| [x, y, 0.25, 0.5, 0.75, 1.0])
+        .collect();
+    for (name, ps_code, expected) in [
+        ("halves preserved", ps_halves.as_slice(), [0.25, 0.875, 0.375, 0.5]),
+        ("pack and EXEC", ps_pack_and_exec.as_slice(), [0.75, 1.0, 0.625, 0.125]),
+    ] {
+        let ps = compile(ps_code, Mode::Pixel(draw_psi()), "ps_6_6");
+        let pixels = runner::draw(&vs, &ps, &layout, &vertices, 24, &[], &[], 16, [-1.0; 4]).unwrap();
+        for (i, pixel) in pixels.iter().enumerate() {
+            assert_eq!(*pixel, expected, "{name}, pixel {i}");
+        }
+    }
+}
+
 /// Draw console wave64 VS + PS (`vs` None: position and COLOR passed through; `ps` None:
 /// COLOR interpolated) with triangles given in pixels of a 16 × 16 target, cleared to -1.
 /// Translated for this adapter (`runner::options`: on a GPU with 32-lane waves only, the
