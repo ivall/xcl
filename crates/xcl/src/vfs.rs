@@ -545,6 +545,14 @@ impl Vfs {
                 Decision::Use(p)
             }
             Target::Game { rel } => {
+                // a plain read: only `read_path_rel` asks the file system (titles open their files
+                // for reading thousands of times; each probe below costs about as much as the open)
+                if !Self::is_write(access, disposition, flags) && disposition != OPEN_ALWAYS {
+                    return match self.read_path_rel(&rel) {
+                        Some(p) => Decision::Use(p),
+                        None => Decision::Fail(ERROR_FILE_NOT_FOUND),
+                    };
+                }
                 let in_ov = self.visible_in_overlay(&rel);
                 let in_orig = self.visible_in_original(&rel);
                 let visible = in_ov || in_orig;
@@ -842,6 +850,29 @@ mod tests {
         // CREATE_NEW on an existing file fails
         assert_eq!(v.open_decision("G:\\data\\hello.txt", 0x4000_0000, CREATE_NEW, 0), Decision::Fail(ERROR_FILE_EXISTS));
         assert_eq!(v.redirected_writes(), vec!["data\\hello.txt".to_string(), "data\\new.bin".to_string()]);
+    }
+
+    #[test]
+    fn reads_take_the_original_and_read_only_open_always_still_creates() {
+        let f = Fixture::new("rdonly");
+        let v = &f.vfs;
+        let data = f.game().join("data");
+        // a plain read of a missing file names the original: the open itself reports the error
+        assert_eq!(
+            v.open_decision("G:\\data\\missing.bin", 0x8000_0000, OPEN_EXISTING, 0),
+            Decision::Use(data.join("missing.bin").to_string_lossy().to_string())
+        );
+        // OPEN_ALWAYS reads an existing file where it is …
+        assert_eq!(
+            v.open_decision("G:\\data\\hello.txt", 0x8000_0000, OPEN_ALWAYS, 0),
+            Decision::Use(data.join("hello.txt").to_string_lossy().to_string())
+        );
+        // … and creates a missing one in the overlay even without write access
+        let d = v.open_decision("G:\\data\\created.bin", 0x8000_0000, OPEN_ALWAYS, 0);
+        let Decision::Use(p) = d else { panic!("{d:?}") };
+        assert!(p.contains("overlay"), "{p}");
+        assert!(!data.join("created.bin").exists());
+        assert_eq!(v.redirected_writes(), vec!["data\\created.bin".to_string()]);
     }
 
     #[test]
