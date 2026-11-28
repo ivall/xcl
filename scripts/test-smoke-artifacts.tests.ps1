@@ -8,7 +8,7 @@ $gameDir = Join-Path $fixture 'MockGame'
 $null = New-Item -ItemType Directory -Path $gameDir
 $runDir = Join-Path $fixture 'run'
 $null = New-Item -ItemType Directory -Path $runDir
-$mockLog = Join-Path $runDir 'mock.log'
+$mockLog = Join-Path $runDir 'xcl.log'
 $mockReport = Join-Path $runDir 'report.json'
 $outDir1 = Join-Path $fixture 'artifacts1'
 $outDir2 = Join-Path $fixture 'artifacts2'
@@ -51,6 +51,21 @@ exit /b 0
     $smokeBlock = $output1 -join "`n"
     if ($smokeBlock -notmatch 'xcl-smoke v1') { throw "smoke block missing header: $smokeBlock" }
     if ($smokeBlock -notmatch 'gpu: Mock Synthetic Adapter') { throw "smoke block missing mock gpu: $smokeBlock" }
+
+    # The title's original logs directory is also a valid artifact destination.
+    $logBefore = Get-Content -LiteralPath $mockLog -Raw
+    $reportBefore = Get-Content -LiteralPath $mockReport -Raw
+    foreach ($destination in @((Join-Path $runDir '.'), (Join-Path $fixture 'RUN'))) {
+        $inPlace = & $runner -Game $gameDir -Xcl $mockXcl -Seconds 5 -OutDir $destination -Title 'InPlace'
+        $inPlaceManifest = Get-Content -LiteralPath (Join-Path $runDir 'manifest.json') -Raw -Encoding utf8 | ConvertFrom-Json
+        if ($inPlaceManifest.title -ne 'InPlace' -or ($inPlace -join "`n") -notmatch 'title: InPlace') {
+            throw 'In-place artifact run did not produce its manifest and smoke block.'
+        }
+    }
+    if ((Get-Content -LiteralPath $mockLog -Raw) -ne $logBefore -or
+        (Get-Content -LiteralPath $mockReport -Raw) -ne $reportBefore) {
+        throw 'In-place artifact run changed the original log or report.'
+    }
 
     # Run 2: remove report.json to test missing report case; reuse $outDir1 to verify stale report.json is purged
     Remove-Item -LiteralPath $mockReport -Force
