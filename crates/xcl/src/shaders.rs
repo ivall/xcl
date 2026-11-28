@@ -4145,6 +4145,49 @@ mod tests {
     }
 
     #[test]
+    fn direct_dump_does_not_publish_a_manifest_for_a_missing_artifact() {
+        struct Temp(std::path::PathBuf);
+        impl Drop for Temp {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let root = Temp(std::env::temp_dir().join(format!("xcl-direct-dump-write-{}", std::process::id())));
+        let _ = std::fs::remove_dir_all(&root.0);
+        std::fs::create_dir_all(root.0.join("sample.guest.bin")).unwrap();
+        let err = write_direct_dump(&root.0, "sample", b"guest", &Ok(vec![1, 2, 3]), &serde_json::json!({ "schema_version": 1 })).unwrap_err();
+        assert!(err.contains("sample.guest.bin"), "{err}");
+        assert!(!root.0.join("sample.direct.dxil").exists());
+        assert!(!root.0.join("sample.manifest.json").exists(), "a manifest must not advertise artifacts that were not saved");
+    }
+
+    #[test]
+    fn direct_dump_invalidates_an_old_manifest_before_replacing_artifacts() {
+        struct Temp(std::path::PathBuf);
+        impl Drop for Temp {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let root = Temp(std::env::temp_dir().join(format!("xcl-direct-dump-replace-{}", std::process::id())));
+        let _ = std::fs::remove_dir_all(&root.0);
+        std::fs::create_dir_all(&root.0).unwrap();
+        let old_manifest = serde_json::json!({ "schema_version": 1, "generation": "old" });
+        write_direct_dump(&root.0, "sample", b"guest", &Ok(vec![1, 2, 3]), &old_manifest).unwrap();
+        assert!(root.0.join("sample.manifest.json").is_file());
+
+        // A directory makes the replacement error artifact unwritable. The previous manifest
+        // must already be gone, or it would still authenticate the old DXIL after this failure.
+        std::fs::create_dir(root.0.join("sample.direct.err.txt")).unwrap();
+        let new_manifest = serde_json::json!({ "schema_version": 1, "generation": "new" });
+        let err = write_direct_dump(&root.0, "sample", b"guest", &Err("new failure".into()), &new_manifest).unwrap_err();
+        assert!(err.contains("sample.direct.err.txt"), "{err}");
+        assert!(!root.0.join("sample.manifest.json").exists(), "a failed replacement must invalidate the previous manifest");
+    }
+
+    #[test]
     fn hlsl_export_is_ordered_and_exact_hash_selects_one_record() {
         struct Temp(std::path::PathBuf);
         impl Drop for Temp {
@@ -4310,6 +4353,33 @@ fn name_hash(name: &str) -> u64 {
     h
 }
 
+/// Invalidate an earlier generation, write the required artifacts, then publish the new manifest.
+fn write_direct_dump(
+    dir: &std::path::Path,
+    prefix: &str,
+    guest: &[u8],
+    result: &Result<Vec<u8>, String>,
+    manifest: &serde_json::Value,
+) -> Result<(), String> {
+    let path = |suffix: &str| dir.join(format!("{prefix}.{suffix}"));
+    let manifest_path = path("manifest.json");
+    match std::fs::remove_file(&manifest_path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("could not invalidate {}: {e}", manifest_path.display())),
+    }
+    let write = |suffix: &str, bytes: &[u8]| {
+        let path = path(suffix);
+        std::fs::write(&path, bytes).map_err(|e| format!("could not write {}: {e}", path.display()))
+    };
+    write("guest.bin", guest)?;
+    match result {
+        Ok(dxil) => write("direct.dxil", dxil)?,
+        Err(e) => write("direct.err.txt", e.as_bytes())?,
+    }
+    std::fs::write(&manifest_path, manifest.to_string()).map_err(|e| format!("could not write {}: {e}", manifest_path.display()))
+}
+
 /// `--direct [--sample N] [--seed S] [--validate] [--compare] [--split 0|1] [--windows W]`:
 /// every program of a seeded sample of N records (default 200 programs' worth; `--sample 0` =
 /// all) through the direct DXIL translator; per-stage outcomes, a ranked histogram of what it
@@ -4420,15 +4490,35 @@ fn direct_sweep(input: &Input, opts: &ShadersOptions, t0: std::time::Instant) ->
                                 Err(e) => *lanes_why.lock().unwrap().entry(survey_key(&e)).or_default() += 1,
                             }
                         }
+                        let prefix = format!("{blob_hash:016x}_f{fi}_{:x}", p.offset);
                         let dump = |suffix: &str, bytes: &[u8]| {
                             if let Some(d) = &dump_dir {
-                                let _ = std::fs::write(d.join(format!("{blob_hash:016x}_f{fi}_{:x}.{suffix}", p.offset)), bytes);
+                                let path = d.join(format!("{prefix}.{suffix}"));
+                                if let Err(e) = std::fs::write(&path, bytes) {
+                                    eprintln!("direct: could not write {}: {e}", path.display());
+                                }
                             }
                         };
-                        dump("guest.bin", code);
-                        match &r {
-                            Ok(dxil) => dump("direct.dxil", dxil),
-                            Err(e) => dump("direct.err.txt", e.as_bytes()),
+                        if let Some(dir) = &dump_dir {
+                            let manifest = serde_json::json!({
+                                "schema_version": 1,
+                                "backend": "direct-dxil",
+                                "record_hash": format!("{blob_hash:016x}"),
+                                "fssm_index": fi,
+                                "program_offset": p.offset,
+                                "stage": coverage::stage_name(&mode),
+                                "wave64": wave64,
+                                "split_wave64": o.split,
+                                "memory_windows": windows,
+                                "validation_requested": validate,
+                                "guest_fnv64": format!("{:016x}", shader::fnv64(code)),
+                                "dxil_fnv64": r.as_ref().ok().map(|bytes| format!("{:016x}", shader::fnv64(bytes))),
+                                "translation_wall_us": time.as_micros() as u64,
+                                "error": r.as_ref().err(),
+                            });
+                            if let Err(e) = write_direct_dump(dir, &prefix, code, &r, &manifest) {
+                                eprintln!("direct: {e}");
+                            }
                         }
                         let hlsl_size = (compare && r.is_ok())
                             .then(|| {
