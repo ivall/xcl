@@ -8613,8 +8613,6 @@ fn gpu_nonfused_mad_and_mac_prevent_fma_contraction() {
         ("V_MADMK_F32", "ENC_VOP2", &[("VDST", 13), ("SRC0", V + 0), ("VSRC1", 2)], Some(0x3F80_0001)),
         ("V_MADAK_F32", "ENC_VOP2", &[("VDST", 14), ("SRC0", V + 0), ("VSRC1", 1)], Some(0xFF7F_FFFF)),
         ("V_MADAK_F32", "ENC_VOP2", &[("VDST", 15), ("SRC0", V + 0), ("VSRC1", 1)], Some(0xBF80_0002)),
-        // Fused control on the exact same inputs proves the backend has hardware FMA and `precise` mattered.
-        ("V_FMA_F32", "ENC_VOP3", &[("VDST", 16), ("SRC0", V + 0), ("SRC1", V + 1), ("SRC2", V + 2)], None),
     ]);
     let opt = Options { wave64: false, hw_wave: 32, ..Options::default() };
     let t = translate(&code, &opt).unwrap();
@@ -8642,7 +8640,6 @@ fn gpu_nonfused_mad_and_mac_prevent_fma_contraction() {
     assert_eq!(v0[12], 0x7F80_0000, "v_mad_f32 overflow must not fuse");
     assert_eq!(v0[13], 0x7F80_0000, "v_madmk_f32 overflow must not fuse");
     assert_eq!(v0[14], 0x7F80_0000, "v_madak_f32 overflow must not fuse");
-    assert_eq!(v0[16], 0x73FF_FFFF, "v_fma_f32 overflow control should stay fused");
 
     let v1 = &r.vgpr[1];
     assert_eq!(v1[10], 0x0000_0000, "v_mac_f32 (VOP2) cancellation must not fuse");
@@ -8650,7 +8647,18 @@ fn gpu_nonfused_mad_and_mac_prevent_fma_contraction() {
     assert_eq!(v1[12], 0x0000_0000, "v_mad_f32 cancellation must not fuse");
     assert_eq!(v1[13], 0x0000_0000, "v_madmk_f32 cancellation must not fuse");
     assert_eq!(v1[15], 0x0000_0000, "v_madak_f32 cancellation must not fuse");
-    assert_eq!(v1[16], 0x2880_0000, "v_fma_f32 cancellation control should stay fused");
+
+    // Fused control on the exact same inputs proves the backend has hardware FMA and `precise` mattered.
+    // It runs as its own program: with the non-fused ops above in the same shader, RADV (Mesa 26.2,
+    // through vkd3d-proton) merges the fma's a * b with their identical `precise` products and rounds
+    // it twice, so the control failed there although a lone v_fma_f32 is fused (#472).
+    let code = prog(&[("V_FMA_F32", "ENC_VOP3", &[("VDST", 16), ("SRC0", V + 0), ("SRC1", V + 1), ("SRC2", V + 2)], None)]);
+    let t = translate(&code, &opt).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap();
+    let r = runner::run(&dxil, &st, &[]).unwrap();
+    assert_eq!(r.vgpr[0][16], 0x73FF_FFFF, "v_fma_f32 overflow control should stay fused");
+    assert_eq!(r.vgpr[1][16], 0x2880_0000, "v_fma_f32 cancellation control should stay fused");
 }
 
 #[test]
