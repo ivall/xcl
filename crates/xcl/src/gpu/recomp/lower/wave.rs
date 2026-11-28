@@ -73,6 +73,9 @@ impl<I: Ir> Lower<'_, I> {
 
     /// A 64-bit scalar operand as numbers, also where it holds a mask.
     fn words(&mut self, b: usize, d: &Decoded, code: u64) -> R<[I::V; 2]> {
+        if !self.wave64 && matches!(code, 0..=106) {
+            return Ok([self.word(b, d, code)?, self.word(b, d, code + 1)?]);
+        }
         match self.mask_reg(b, code) {
             Some((r, false)) => self.mask_words(b, r, false),
             Some((_, true)) => Err("a 64-bit operand across two masks".into()),
@@ -305,7 +308,7 @@ impl<I: Ir> Lower<'_, I> {
         let wmask = if self.wave64 { 63 } else { 31 };
         match name {
             "V_READFIRSTLANE_B32" => {
-                let v = self.src(b, d, s0)?;
+                let v = self.word(b, d, s0)?;
                 let r = if s0 >= 256 {
                     let e = self.exec_words(b, false)?;
                     let l = self.first_set(e, 0);
@@ -317,7 +320,7 @@ impl<I: Ir> Lower<'_, I> {
             }
             "V_READLANE_B32" => {
                 self.all_lanes(b, "v_readlane")?;
-                let (v, sel) = (self.src(b, d, s0)?, self.word(b, d, s1)?);
+                let (v, sel) = (self.word(b, d, s0)?, self.word(b, d, s1)?);
                 let m = self.c(wmask);
                 let l = self.ir.bin(Bin::And, sel, m);
                 let r = self.ir.read_lane(v, l);
@@ -336,10 +339,11 @@ impl<I: Ir> Lower<'_, I> {
                 self.ssa.write(b, Var::V(vdst as u16), v);
             }
             "V_MBCNT_LO_U32_B32" | "V_MBCNT_HI_U32_B32" => {
-                // mbcnt_hi counts the upper lanes' own half only (0 below lane 32); mbcnt_lo
-                // gives the upper lanes all of the lower half
-                let hi_half = name == "V_MBCNT_HI_U32_B32";
-                let (m, add) = (self.word_in(b, d, s0, hi_half)?, self.src(b, d, s1)?);
+                // mbcnt_hi counts the upper lanes' own half only (0 below lane 32), so ballot_half
+                // is only valid when SRC0 is the upper dword of a wave64 mask; a low-half mask
+                // dword (e.g. vcc_lo / exec_lo) needs lanes 0..31's ballot on lanes 32..63.
+                let hi_half = name == "V_MBCNT_HI_U32_B32" && matches!(self.mask_reg(b, s0), Some((_, true)));
+                let (m, add) = (self.word_in(b, d, s0, hi_half)?, self.word(b, d, s1)?);
                 // the lanes below this one, in this half of the mask
                 let me = self.lane();
                 let (c31, c32, one, z, all) = (self.c(31), self.c(32), self.c(1), self.c(0), self.c(u32::MAX));
@@ -461,10 +465,12 @@ impl<I: Ir> Lower<'_, I> {
             _ => return Ok(false),
         };
         // only where the source is a mask: numbers take the usual path
-        if self.mask_reg(b, s0).is_none() {
+        let b64 = name.ends_with("_B64");
+        let has_mask = self.mask_reg(b, s0).is_some()
+            || (b64 && !self.wave64 && matches!(s0, 0..=106) && self.mask_reg(b, s0 + 1).is_some());
+        if !has_mask {
             return Ok(false);
         }
-        let b64 = name.ends_with("_B64");
         let w = if b64 {
             self.words(b, d, s0)?
         } else {
@@ -483,7 +489,7 @@ impl<I: Ir> Lower<'_, I> {
                 let r = self.ir.bin(Bin::Add, lo, hi);
                 let z = self.c(0);
                 let c = self.ir.icmp(Cmp::Ne, r, z);
-                self.ssa.write(b, Var::Scc, c);
+                self.write_scc(b, c);
                 r
             }
             MaskOp::Ff(ones) => {
@@ -515,5 +521,123 @@ impl<I: Ir> Lower<'_, I> {
         };
         self.write_num(b, sd, r);
         Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::super::{dxc, lower_dxil, runner, translate, Options};
+    use super::super::tests::{decode, encode_line, gpu_waves, run_mem, state, ENDPGM, I};
+
+    const MBCNT_HI_LOW_MASK: &[I] = &[
+        ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 144), ("VSRC1", 0)]), // vcc_lo = 0xFFFF, vcc_hi = 0
+        ("V_MBCNT_HI_U32_B32", "ENC_VOP3", &[("VDST", 2), ("SRC0", 106), ("SRC1", 128)]),
+        ("V_MBCNT_HI_U32_B32", "ENC_VOP3", &[("VDST", 3), ("SRC0", 193), ("SRC1", 106)]),
+        ENDPGM,
+    ];
+
+    const WAVE32_B64_MIXED_MASK: &[I] = &[
+        ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 138), ("VSRC1", 0)]), // vcc_lo = 0x3FF (10 bits)
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 106)]),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 1), ("SSRC0", 193)]), // s1 = 0xFFFF_FFFF (32 bits)
+        ("S_BCNT1_I32_B64", "ENC_SOP1", &[("SDST", 2), ("SSRC0", 0)]),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 4), ("SSRC0", 128)]), // s4 = 0
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 5), ("SSRC0", 106)]), // s5 = 0x3FF (10 bits)
+        ("S_BCNT1_I32_B64", "ENC_SOP1", &[("SDST", 6), ("SSRC0", 4)]),
+        ("S_FF1_I32_B64", "ENC_SOP1", &[("SDST", 7), ("SSRC0", 4)]),
+        ENDPGM,
+    ];
+
+    const READLANE_OF_MASK: &[I] = &[
+        ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 140), ("VSRC1", 0)]), // vcc_lo = 0xFFF
+        ("V_READFIRSTLANE_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 106)]),
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 3), ("SRC0", 106), ("SRC1", 128)]),
+        ENDPGM,
+    ];
+
+    #[test]
+    fn mbcnt_hi_of_low_mask_and_mask_addend_on_cpu() {
+        let (s, v) = state(64);
+        let (_, v, _) = run_mem(MBCNT_HI_LOW_MASK, true, &s, &v, &[]);
+        for l in 0..64usize {
+            let want_v2 = if l < 32 { 0 } else { (l - 32).min(16) as u32 };
+            let want_v3 = if l < 32 { 0xFFFF } else { (l - 32) as u32 + 0xFFFF };
+            assert_eq!(v[l][2], want_v2, "lane {l}: v_mbcnt_hi(vcc_lo, 0)");
+            assert_eq!(v[l][3], want_v3, "lane {l}: v_mbcnt_hi(-1, vcc_lo)");
+        }
+    }
+
+    #[test]
+    fn wave32_b64_mask_counts_preserve_independent_high_sgpr_on_cpu() {
+        let (s, v) = state(32);
+        let (s, _, _) = run_mem(WAVE32_B64_MIXED_MASK, false, &s, &v, &[]);
+        assert_eq!(s[2], 42, "s_bcnt1_b64(mask=10 bits, num=32 bits)");
+        assert_eq!(s[6], 10, "s_bcnt1_b64(num=0, mask=10 bits)");
+        assert_eq!(s[7], 32, "s_ff1_b64(num=0, mask=0x3FF)");
+    }
+
+    #[test]
+    fn readfirstlane_and_readlane_accept_mask_sgpr_on_cpu() {
+        let (s, v) = state(32);
+        let (s, _, _) = run_mem(READLANE_OF_MASK, false, &s, &v, &[]);
+        assert_eq!(s[2], 0xFFF, "v_readfirstlane of vcc_lo");
+        assert_eq!(s[3], 0xFFF, "v_readlane of vcc_lo");
+    }
+
+    #[test]
+    fn bcnt_scc_written_in_partial_block_is_detected_as_stale() {
+        let lines: &[I] = &[
+            ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 144), ("VSRC1", 0)]),
+            ("S_AND_SAVEEXEC_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 106)]),
+            ("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 128), ("SSRC1", 128)]),
+            ("S_CBRANCH_EXECZ", "ENC_SOPP", &[("SIMM16", 2)]),
+            ("S_BCNT1_I32_B32", "ENC_SOP1", &[("SDST", 2), ("SSRC0", 126)]),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 129)]),
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 0)]),
+            ("S_CSELECT_B32", "ENC_SOP2", &[("SDST", 4), ("SSRC0", 138), ("SSRC1", 139)]),
+            ENDPGM,
+        ];
+        let err = lower_dxil::kernel(&decode(lines), false).err().expect("stale SCC from partial S_BCNT1 must be refused");
+        assert!(err.contains("written while some lanes were elsewhere"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn gpu_wave_fixes_agree_with_hlsl() {
+        if !gpu_waves() || dxc::location().is_err() {
+            runner::skip_test(if !gpu_waves() { "no GPU with 32-lane waves" } else { "no DXC" });
+            return;
+        }
+        let check = |name: &str, lines: &[I], wave64: bool, sregs: &[usize], vregs: &[usize]| {
+            let lanes = if wave64 { 64 } else { 32 };
+            let insts = decode(lines);
+            let bytes: Vec<u8> = lines.iter().flat_map(encode_line).collect();
+            let (s, v) = state(lanes);
+            let mut st = runner::KernelState::default();
+            st.sgpr.copy_from_slice(&s);
+            for (l, regs) in v.iter().enumerate() {
+                st.vgpr[l][..regs.len()].copy_from_slice(regs);
+            }
+            let (dxil, _) = if wave64 {
+                lower_dxil::kernel_split(&insts).unwrap_or_else(|e| panic!("{name}: {e}"))
+            } else {
+                lower_dxil::kernel(&insts, false).unwrap_or_else(|e| panic!("{name}: {e}"))
+            };
+            let hlsl_t = translate(&bytes, &Options { wave64, split_wave64: wave64, ..Default::default() }).unwrap();
+            assert!(hlsl_t.complete(), "{name}: {:?}", hlsl_t.unsupported_why);
+            let hlsl_dxil = dxc::compile(&hlsl_t.hlsl, "main", "cs_6_6", &[]).unwrap();
+            let got = runner::run(&dxil, &st, &[]).unwrap();
+            let want = runner::run(&hlsl_dxil, &st, &[]).unwrap();
+            for &r in sregs {
+                assert_eq!(got.sgpr[r], want.sgpr[r], "{name}: s{r}");
+            }
+            for l in 0..lanes {
+                for &r in vregs {
+                    assert_eq!(got.vgpr[l][r], want.vgpr[l][r], "{name}: lane {l} v{r}");
+                }
+            }
+        };
+        check("mbcnt_hi_low_mask", MBCNT_HI_LOW_MASK, true, &[], &[2, 3]);
+        check("wave32_b64_mixed_mask", WAVE32_B64_MIXED_MASK, false, &[2, 6, 7], &[]);
+        check("readlane_of_mask", READLANE_OF_MASK, false, &[2, 3], &[]);
     }
 }
