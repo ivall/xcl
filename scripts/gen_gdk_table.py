@@ -8,8 +8,17 @@ import io, os, re, sys
 
 src = io.open(sys.argv[1], encoding='utf-8').read()
 origin = re.search(r'Source\s*:\s*(\S+)', src)
-rows = re.findall(r'\w+\((\w+), "([0-9A-Fa-f-]{36})", "([0-9A-Fa-f-]{36})", (\d+)\)', src)
+# Preserve quoted fields so comment markers inside a malformed GUID reach row parsing.
+src = re.sub(r'("(?:[^"\\\r\n]|\\[^\r\n])*")|/\*.*?\*/|//[^\n]*',
+             lambda match: match.group(1) or ' ', src, flags=re.S)
+rows = re.findall(r'\w+\((\w+), "([^"\r\n]*)", "([^"\r\n]*)", (\d+)\)', src)
 assert rows, 'no rows'
+guid = re.compile(r'[0-9A-Fa-f]{8}(?:-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}')
+for name, cls, iface, _ in rows:
+    if not guid.fullmatch(cls):
+        sys.exit(f'{name}: invalid class GUID {cls!r}')
+    if not guid.fullmatch(iface):
+        sys.exit(f'{name}: invalid interface GUID {iface!r}')
 hexg = lambda g: '0x' + g.replace('-', '').lower()
 OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'crates', 'xcl', 'src', 'hle', 'xgameruntime', 'gdk_table.rs')
 with io.open(OUT, 'w', encoding='utf-8', newline='\n') as f:
