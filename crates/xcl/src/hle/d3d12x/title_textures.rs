@@ -4767,6 +4767,20 @@ mod tests {
 
     #[test]
     fn stream_recheck_schedule_catches_late_writes_and_resets_milestones() {
+        // A concurrent queue refresh treats every pending key as a live ID3D12Resource.
+        // Give this fixture its own texture table while it advances the frame milestones.
+        let exact = [
+            "--exact",
+            "hle::d3d12x::title_textures::tests::stream_recheck_schedule_catches_late_writes_and_resets_milestones",
+        ];
+        if !std::env::args_os().skip(1).eq(exact) {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(exact).output().unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(output.status.success() && stdout.contains("1 passed;"),
+                "{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
+            return;
+        }
         let desc = console_desc(3, 256, 256, 1, 1, 28, 0x109); // 256 KiB RGBA8
         let tex = Arc::new(xg::Texture::new(&desc).expect("layout"));
         let size = tex.size() as usize;
