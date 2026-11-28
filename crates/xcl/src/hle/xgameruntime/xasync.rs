@@ -318,12 +318,12 @@ pub unsafe extern "system" fn XAsyncComplete(b: *mut XAsyncBlock, result: HRESUL
         let mut g = s.inner.lock().unwrap();
         g.phase = if cleanup_now { Phase::Consumed } else { Phase::Done };
     }
+    s.cv.notify_all();
     if cb != 0 {
         if let Some(q) = taskqueue::queue_from(queue_ptr) {
             let _ = taskqueue::submit_now(&q, PORT_COMPLETION, Item { cb: completion_cb as usize, ctx: b as usize });
         }
     }
-    s.cv.notify_all();
 }
 
 pub unsafe extern "system" fn XAsyncGetStatus(b: *mut XAsyncBlock, wait: bool) -> HRESULT {
@@ -1222,6 +1222,59 @@ mod tests {
             assert_eq!(XAsyncGetStatus(&mut b_err, false), S_OK);
             assert_eq!(ctx_err.cleanup_calls.load(Ordering::SeqCst), 1);
             assert_eq!(ctx_err.cb_calls.load(Ordering::SeqCst), 1);
+
+            taskqueue::XTaskQueueTerminate(q, true, std::ptr::null_mut(), 0);
+            taskqueue::XTaskQueueCloseHandle(q);
+        }
+    }
+
+    /// `XAsyncComplete` must wake threads blocked in `XAsyncGetStatus(b, true)` before running
+    /// a `MODE_IMMEDIATE` completion callback synchronously on the completing thread; otherwise
+    /// a callback that synchronises with the waiting thread deadlocks deterministically.
+    #[test]
+    fn complete_wakes_waiters_before_immediate_completion_callback() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        struct WaitCtx {
+            rx: Mutex<Option<mpsc::Receiver<()>>>,
+            woke: std::sync::atomic::AtomicBool,
+        }
+        unsafe extern "system" fn cb_waits_for_waiter(b: *mut XAsyncBlock) {
+            let ctx = &*((*b).context as *const WaitCtx);
+            let rx = ctx.rx.lock().unwrap().take().unwrap();
+            if rx.recv_timeout(Duration::from_secs(1)).is_ok() {
+                ctx.woke.store(true, Ordering::SeqCst);
+            }
+        }
+
+        unsafe {
+            let mut q = std::ptr::null_mut();
+            assert_eq!(taskqueue::XTaskQueueCreate(taskqueue::MODE_MANUAL, taskqueue::MODE_IMMEDIATE, &mut q), S_OK);
+            let (tx, rx) = mpsc::channel();
+            let ctx = WaitCtx { rx: Mutex::new(Some(rx)), woke: std::sync::atomic::AtomicBool::new(false) };
+            let mut b = Box::new(std::mem::zeroed::<XAsyncBlock>());
+            b.queue = q;
+            b.context = &ctx as *const WaitCtx as *mut c_void;
+            b.callback = cb_waits_for_waiter as usize;
+            assert_eq!(XAsyncBegin(&mut *b, std::ptr::null_mut(), std::ptr::null(), std::ptr::null(), begins_without_work as usize), S_OK);
+
+            let (started_tx, started_rx) = mpsc::channel();
+            let b_addr = &mut *b as *mut XAsyncBlock as usize;
+            let waiter = std::thread::spawn(move || {
+                let _ = started_tx.send(());
+                let hr = XAsyncGetStatus(b_addr as *mut XAsyncBlock, true);
+                let _ = tx.send(());
+                hr
+            });
+            started_rx.recv().unwrap();
+            // Give the waiter thread a moment to enter `s.cv.wait(g)`.
+            std::thread::sleep(Duration::from_millis(20));
+
+            XAsyncComplete(&mut *b, S_OK, 0);
+            assert_eq!(waiter.join().unwrap(), S_OK);
+            assert!(ctx.woke.load(Ordering::SeqCst), "MODE_IMMEDIATE callback timed out waiting for XAsyncGetStatus waiter to wake");
 
             taskqueue::XTaskQueueTerminate(q, true, std::ptr::null_mut(), 0);
             taskqueue::XTaskQueueCloseHandle(q);
