@@ -1526,6 +1526,50 @@ fn gpu_memory_and_exports() {
     }
 }
 
+/// RDNA2 ISA 7.2.1 discards each S_LOAD address component's low two bits
+/// before addition. Adding first can turn those discarded bits into a dword carry.
+#[test]
+fn gpu_smem_aligns_each_address_component() {
+    if !gpu_ready() {
+        return;
+    }
+    let arena = crate::gpu::uma::Uma::with_windows(2, 1 << 20).unwrap();
+    let (w0, w1) = (arena.window(0).0 as u64, arena.window(1).0 as u64);
+    for w in [w0, w1] {
+        for i in 0..64u64 {
+            unsafe { *((w + 0x100 + 4 * i) as *mut u32) = 0xCAFE_0000 + i as u32; }
+        }
+    }
+    for (windows, base) in [(1, 0x100u64), (2, w1 + 0x100)] {
+        for (name, count) in [("S_LOAD_DWORD", 1), ("S_LOAD_DWORDX2", 2),
+            ("S_LOAD_DWORDX4", 4), ("S_LOAD_DWORDX8", 8), ("S_LOAD_DWORDX16", 16)] {
+            let code = prog(&[
+                (name, "ENC_SMEM", &[("SDATA", 16), ("SBASE", 0), ("OFFSET", 3), ("SOFFSET", 8)], None),
+                (name, "ENC_SMEM", &[("SDATA", 32), ("SBASE", 0), ("OFFSET", 6), ("SOFFSET", 9)], None),
+                (name, "ENC_SMEM", &[("SDATA", 48), ("SBASE", 0), ("OFFSET", 0x1FFFFF), ("SOFFSET", 10)], None), // -1 rounds down to -4
+                (name, "ENC_SMEM", &[("SDATA", 64), ("SBASE", 0), ("OFFSET", 0x1FFFFC), ("SOFFSET", 11)], None), // aligned negative offset
+                (name, "ENC_SMEM", &[("SDATA", 80), ("SBASE", 0), ("OFFSET", 4), ("SOFFSET", 125)], None), // null offset control
+            ]);
+            let t = translate(&code, &on_gpu(Options { mem_windows: windows, ..Default::default() })).unwrap();
+            assert!(t.complete(), "{:?}", t.unsupported_why);
+            let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap();
+            for low in 0..4u64 {
+                let mut st = KernelState::default();
+                st.sgpr[0..2].copy_from_slice(&[(base + low) as u32, ((base + low) >> 32) as u32]);
+                st.sgpr[8..12].copy_from_slice(&[3, 2, 11, 8]);
+
+                let r = runner::run_in_arena(&dxil, &st, &arena).unwrap();
+                for (dst, first) in [(16, 0), (32, 1), (48, 1), (64, 1), (80, 1)] {
+                    for i in 0..count {
+                        assert_eq!(r.sgpr[dst + i], 0xCAFE_0000 + first + i as u32,
+                            "{name}, windows {windows}, base low bits {low}, s{}", dst + i);
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Multi-dword loads as the emitter groups them (four dwords per memory access, bounds checks
 /// without branches): an unaligned `s_load`, `s_buffer_load`s that straddle num_records, and
 /// vector buffer loads with lanes past the end and inactive lanes (which keep their registers).

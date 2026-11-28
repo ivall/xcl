@@ -1994,19 +1994,21 @@ impl Em {
                 }
             }
         } else {
-            let imm = ((imm << 11) as i32 >> 11) as u32; // 21-bit signed
+            // RDNA2 ISA 7.2.1: each address component ignores its low two bits,
+            // before addition; otherwise discarded bits can carry into the address.
+            let imm = (((imm << 11) as i32 >> 11) as u32) & !3; // 21-bit signed
             let b = self.sreg(sbase);
             let hi = self.sreg(sbase + 1);
             // the dwords are contiguous: Load2 / Load4 (one window switch per four dwords)
             if self.opt.mem_windows > 1 {
                 self.line(&format!(
-                    "uint64_t {t}_ea = ((((uint64_t){hi}) << 32) | (uint64_t){b}) + (uint64_t)(int64_t)(int){} + (uint64_t){soff};",
+                    "uint64_t {t}_ea = ((((uint64_t){hi}) << 32) | (uint64_t)({b} & ~3u)) + (uint64_t)(int64_t)(int){} + (uint64_t)({soff} & ~3u);",
                     hex(imm)
                 ));
                 self.window_read(&format!("(uint)({t}_ea >> 32)"));
                 self.line(&format!("uint {t}_a = (uint){t}_ea & ~3u;"));
             } else {
-                self.line(&format!("uint {t}_a = ({b} + {} + {soff}) & ~3u;", hex(imm)));
+                self.line(&format!("uint {t}_a = ({b} & ~3u) + {} + ({soff} & ~3u);", hex(imm)));
             }
             match count {
                 1 => {
