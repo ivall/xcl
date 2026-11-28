@@ -963,6 +963,40 @@ pub(super) fn bound_pso(this: *mut c_void) -> usize {
     with(this, |s| s.pso)
 }
 
+/// Remap any superseded targets named in the first 256 slots of each descriptor table in `layout`
+/// / `args`. Only called when `placements::any_superseded()` is true.
+unsafe fn note_superseded_in_tables(u: &crate::gpu::uma::Uma, layout: Option<&Layout>, args: &[u8]) {
+    let Some(layout) = layout else { return };
+    const TABLE_SLOTS: usize = 256;
+    let mut table = [0u8; TABLE_SLOTS * 32];
+    for p in &layout.params {
+        let Param::Table { at } = *p else { continue };
+        let at = at as usize;
+        let Some(word) = args.get(at..at + 4) else { continue };
+        let offset = u32::from_le_bytes(word.try_into().unwrap()) as usize;
+        if offset == 0 {
+            continue;
+        }
+        let addr = u.base() + offset;
+        if u.in_committed_window(addr, table.len()) {
+            std::ptr::copy_nonoverlapping(addr as *const u8, table.as_mut_ptr(), table.len());
+        } else {
+            table.fill(0);
+            super::title_textures::copy_readable(addr, &mut table);
+        }
+        for slot in table.chunks_exact(32) {
+            let index = u32::from_le_bytes(slot[..4].try_into().unwrap());
+            if slot[15] >> 4 < 8 || index == 0 {
+                continue;
+            }
+            let res = super::console_heap::named_by_index(index);
+            if res != 0 && res != super::console_heap::GONE {
+                super::placements::note_use(res);
+            }
+        }
+    }
+}
+
 /// `XCL_DUMP_TARGETS`: the resources the first 16 slots of each descriptor table of `this`'s
 /// graphics arguments name, each once (as `trace_reads_of_watched` reads them).
 pub(super) fn table_resources(this: *mut c_void) -> Vec<usize> {
@@ -4417,6 +4451,9 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
         (layout.clone(), args.clone(), s.heaps)
     });
     want_root_views(layout.as_deref(), &args, super::view_want::Path::RootView);
+    if super::placements::any_superseded() {
+        note_superseded_in_tables(u, layout.as_deref(), &args);
+    }
     // 32-bit console addresses: window 0; pieces of the list's arena (not a 64 KiB grain each)
     let copy = |bytes: &[u8]| -> Result<usize, String> {
         let p = with(this, |s| s.arena.take(u, bytes.len().max(16), 256, &mut s.uma)).ok_or_else(|| {
