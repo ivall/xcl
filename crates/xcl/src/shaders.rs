@@ -1999,30 +1999,35 @@ mod pipeline_cap_tests {
             dispatch_remap: None,
         };
 
-        pipelines.max_dxil = max_piece;
+        // a cap that lets every piece and the whole form through
+        pipelines.max_dxil = max_piece.max(whole.len());
         pipelines.make(&compiled);
         let p0_path = scratch.0.join(driver_cache::name_for(&piece0, 0, true));
         let p1_path = scratch.0.join(driver_cache::name_for(&piece1, 0, true));
         let whole_path = scratch.0.join(driver_cache::name_for(&whole, 0, false));
+        let whole_chain_path = scratch.0.join(driver_cache::name_for(&whole, 0, true));
         assert_eq!(pipelines.split_programs.load(Ordering::Relaxed), 1);
         assert_eq!(pipelines.split_pieces.load(Ordering::Relaxed), 2);
-        assert_eq!(pipelines.made.load(Ordering::Relaxed), 2);
+        // both pieces and the whole form, all under the dispatch-chain root signature: the runtime
+        // builds the whole form there too (`Chain::whole`, `.chain.pso`)
+        assert_eq!(pipelines.made.load(Ordering::Relaxed), 3);
         assert_eq!(pipelines.refused.load(Ordering::Relaxed), 0);
         assert_eq!(pipelines.reused.load(Ordering::Relaxed), 0);
         assert_eq!(pipelines.capped.load(Ordering::Relaxed), 0);
         assert!(p0_path.is_file() && p0_path.metadata().unwrap().len() > 0, "piece 0 .chain.pso missing");
         assert!(p1_path.is_file() && p1_path.metadata().unwrap().len() > 0, "piece 1 .chain.pso missing");
+        assert!(whole_chain_path.is_file() && whole_chain_path.metadata().unwrap().len() > 0, "whole form .chain.pso missing");
         assert!(!whole_path.exists(), "unsplit whole .pso should not be written for a split compute program");
 
-        // Second pass reuses both cached piece blobs.
+        // Second pass reuses all three cached blobs.
         pipelines.make(&compiled);
-        assert_eq!(pipelines.reused.load(Ordering::Relaxed), 2);
-        assert_eq!(pipelines.made.load(Ordering::Relaxed), 4);
+        assert_eq!(pipelines.reused.load(Ordering::Relaxed), 3);
+        assert_eq!(pipelines.made.load(Ordering::Relaxed), 6);
         assert_eq!(pipelines.refused.load(Ordering::Relaxed), 0);
 
         // Runtime-side check: the dispatch-chain root signature accepts each cached .chain.pso blob.
         let chain_rs = recomp::pso::dispatch_chain_root_signature(&pipelines.dev, &[]).expect("dispatch chain RS");
-        for (dxil, path) in [(&piece0, &p0_path), (&piece1, &p1_path)] {
+        for (dxil, path) in [(&piece0, &p0_path), (&piece1, &p1_path), (&whole, &whole_chain_path)] {
             let blob = std::fs::read(path).expect("read cached .chain.pso");
             let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 pRootSignature: std::mem::ManuallyDrop::new(Some(chain_rs.clone())),
@@ -2041,12 +2046,13 @@ mod pipeline_cap_tests {
         std::fs::write(&p1_path, b"corrupt chain blob").expect("corrupt piece1 blob");
         pipelines.max_dxil = piece1.len() - 1;
         let reused_before = pipelines.reused.load(Ordering::Relaxed);
+        let capped_before = pipelines.capped.load(Ordering::Relaxed);
         pipelines.make(&compiled);
         assert!(!p1_path.exists(), "rejected over-cap .chain.pso should be removed");
-        assert_eq!(pipelines.capped.load(Ordering::Relaxed), 1);
-        if piece0.len() <= pipelines.max_dxil {
-            assert_eq!(pipelines.reused.load(Ordering::Relaxed), reused_before + 1);
-        }
+        assert_eq!(pipelines.capped.load(Ordering::Relaxed), capped_before + 1);
+        // the whole form's blob is good: reused, cap or not
+        let piece0_reused = usize::from(piece0.len() <= pipelines.max_dxil);
+        assert_eq!(pipelines.reused.load(Ordering::Relaxed), reused_before + piece0_reused + 1);
     }
 }
 
@@ -2102,7 +2108,8 @@ impl Pipelines {
     /// The compute pipeline of `c` (made and released). When direct translation split the program
     /// into a dispatch chain of at least two pieces, each piece is built and cached under the
     /// dispatch-chain root signature (`.chain.pso`) as the runtime does (`dispatch_chain::build`),
-    /// instead of the unsplit whole container.
+    /// and so is the whole program: the runtime builds it under that root signature too
+    /// (`Chain::whole`), on the title's thread, for what the pieces cannot run (an ExecuteIndirect).
     fn make(&self, c: &recomp::pso::Compiled) {
         self.make_selected(c, false, None);
     }
@@ -2126,6 +2133,7 @@ impl Pipelines {
                         self.make_one(&c.dxil, &c.samplers, root, None);
                     }
                 }
+                self.make_one(&c.dxil, &c.samplers, true, None);
                 return;
             }
         }
