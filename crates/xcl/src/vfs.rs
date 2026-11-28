@@ -53,6 +53,7 @@ const TRUNCATE_EXISTING: u32 = 5;
 const GENERIC_WRITE: u32 = 0x4000_0000;
 const WRITE_ACCESS: u32 = GENERIC_WRITE
     | 0x1000_0000 // GENERIC_ALL
+    | 0x0200_0000 // MAXIMUM_ALLOWED: asks for every right the ACL grants, write among them
     | 0x0000_0002 // FILE_WRITE_DATA / ADD_FILE
     | 0x0000_0004 // FILE_APPEND_DATA / ADD_SUBDIRECTORY
     | 0x0000_0010 // FILE_WRITE_EA
@@ -842,6 +843,26 @@ mod tests {
         // CREATE_NEW on an existing file fails
         assert_eq!(v.open_decision("G:\\data\\hello.txt", 0x4000_0000, CREATE_NEW, 0), Decision::Fail(ERROR_FILE_EXISTS));
         assert_eq!(v.redirected_writes(), vec!["data\\hello.txt".to_string(), "data\\new.bin".to_string()]);
+    }
+
+    /// MAXIMUM_ALLOWED asks for every right the ACL grants; on a writable game folder that
+    /// includes write, so the open must go through the overlay like an explicit write (#2682).
+    #[test]
+    fn a_maximum_allowed_open_takes_the_write_path() {
+        let f = Fixture::new("maxal");
+        let v = &f.vfs;
+        let orig = f.game().join("data").join("hello.txt");
+        let Decision::Use(ov) = v.open_decision("G:\\data\\hello.txt", 0x0200_0000, OPEN_EXISTING, 0) else {
+            panic!("MAXIMUM_ALLOWED + OPEN_EXISTING must be a write open")
+        };
+        assert!(ov.contains("overlay"), "writes through MAXIMUM_ALLOWED must land in the overlay: {ov}");
+        assert_eq!(std::fs::read(&ov).unwrap(), b"original");
+        assert_eq!(std::fs::read(&orig).unwrap(), b"original", "the original must be untouched");
+        // and a read-only bit stays on the read path
+        assert_eq!(
+            v.open_decision("G:\\data\\gone.txt", 0x8000_0000, OPEN_EXISTING, 0),
+            Decision::Use(f.game().join("data").join("gone.txt").to_string_lossy().to_string())
+        );
     }
 
     #[test]
