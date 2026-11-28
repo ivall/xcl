@@ -302,7 +302,17 @@ fn run_with_ui(target: &Path, args: &[String], menu: bool) -> i32 {
             return 2;
         }
     };
-    let data_dir = data_root().join(&title);
+    let mut data_dir = data_root().join(&title);
+    // The host starts in the game directory and uses these paths from the launcher.
+    if data_dir.is_relative() {
+        data_dir = match std::path::absolute(&data_dir) {
+            Ok(dir) => dir,
+            Err(e) => {
+                eprintln!("xcl: resolving data directory {}: {e}", data_dir.display());
+                return 2;
+            }
+        };
+    }
     let mut config = match Config::load_or_create(&data_dir.join("xcl.toml")) {
         Ok(c) => c,
         Err(e) => {

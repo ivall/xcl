@@ -169,7 +169,8 @@ fn test_title_runs_and_game_folder_is_untouched() {
         .arg(&game)
         .arg("--")
         .arg("--hello")
-        .env("XCL_DATA_ROOT", &data)
+        .current_dir(&*root)
+        .env("XCL_DATA_ROOT", "data")
         // the shader dumps and their translation, which the report's shader counts come from
         .env("XCL_DUMP_SHADERS", "1")
         .output()
@@ -204,6 +205,7 @@ fn test_title_runs_and_game_folder_is_untouched() {
     // (2b) MicrosoftGame.config (tests/data/testgame): PLS quota and the title memory mode
     assert!(stdout.contains("MicrosoftGame.Config: title memory Advanced, PLS 2048 MB"), "launcher: {stdout}");
     let boot: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(data.join("XCL.TestTitle").join("cache").join("boot.json")).unwrap()).unwrap();
+    assert_eq!(Path::new(boot["data_dir"].as_str().unwrap()), data.join("XCL.TestTitle"));
     let c = &boot["config"];
     assert_eq!((c["pls_mb"].as_u64(), c["title_memory"].as_str(), c["uma_mb"].as_u64()), (Some(2048), Some("advanced"), Some(4095)));
 
