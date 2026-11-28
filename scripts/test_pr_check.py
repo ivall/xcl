@@ -50,6 +50,10 @@ class TestOnlyApprovalTests(unittest.TestCase):
 
 
 class BannedModelTests(unittest.TestCase):
+    def test_hidden_model_example_does_not_count_as_ai_disclosure(self):
+        body = "<!--\n**AI use**\n- Qwen wrote the code\n-->\n" + BODY
+        self.assertEqual([], check(body, HEAD, [changed("README.md")], lambda _: True))
+
     def ai_use(self, line):
         body = BODY.replace("**AI use**\nNone\n", "**AI use**\n" + line + "\n")
         return check(body, HEAD, [changed("README.md")], lambda _: True)
@@ -77,18 +81,70 @@ class SmokeBlockTests(unittest.TestCase):
         blocks = smoke_blocks(body)
         self.assertEqual(["1111111aaaa", "1234567890"], [b["commit"] for b in blocks])
         files = [changed("crates/xcl/src/hle/d3d12x/vram.rs")]
-        self.assertEqual([], check(BODY + body, HEAD, files, lambda sha: sha == "1111111aaaa"))
+        description = BODY.replace("**Not tested**\n", "**Regression run**\n" + body + "**Not tested**\n")
+        self.assertEqual([], check(description, HEAD, files, lambda sha: sha == "1111111aaaa"))
 
     def test_blocks_in_separate_fences_stay_separate(self):
         body = ("```\nxcl-smoke v1\ncommit: 1111111aaaa\ntitle: G\n```\ntext\n"
                 "```\nxcl-smoke v1\ncommit: 1234567890\ntitle: G\n```\n")
         self.assertEqual(["1111111aaaa", "1234567890"], [b["commit"] for b in smoke_blocks(body)])
 
+    def test_blocks_under_not_tested_do_not_count_as_regression_runs(self):
+        run = "title: G\nseconds: 60\nframes shown: 100\ndevice removals: 0\ncrashes: 0\n"
+        blocks = ("```\nxcl-smoke v1\ncommit: 1111111aaaa\n" + run + "```\n"
+                  "```\nxcl-smoke v1\ncommit: 1234567890\n" + run + "```\n")
+        files = [changed("crates/xcl/src/hle/d3d12x/vram.rs")]
+        for section in ("", "**Regression run**\n", "**Regression run**\nPending\n"):
+            with self.subTest(section=section):
+                body = BODY.replace("**Not tested**\n", section + "**Not tested**\n" + blocks)
+                problems = check(body, HEAD, files, lambda sha: sha == "1111111aaaa")
+                self.assertEqual(2, len(problems))
+                self.assertTrue(all("Regression run" in problem for problem in problems))
+
+    def test_commented_smoke_heading_or_blocks_do_not_count(self):
+        run = "title: G\nseconds: 60\nframes shown: 100\ndevice removals: 0\ncrashes: 0\n"
+        blocks = ("```\nxcl-smoke v1\ncommit: 1111111aaaa\n" + run + "```\n"
+                  "```\nxcl-smoke v1\ncommit: 1234567890\n" + run + "```\n")
+        files = [changed("crates/xcl/src/hle/d3d12x/vram.rs")]
+        for regression in (
+            "<!--\n**Regression run**\n-->\n" + blocks,
+            "**Regression run**\n<!--\n" + blocks + "-->\n",
+        ):
+            with self.subTest(regression=regression):
+                description = BODY.replace("**Not tested**\n", regression + "**Not tested**\n")
+                problems = check(description, HEAD, files, lambda sha: sha == "1111111aaaa")
+                self.assertEqual(2, len(problems))
+                self.assertTrue(all("Regression run" in problem for problem in problems))
+
+    def test_commented_heading_does_not_end_regression_section(self):
+        run = "title: G\nseconds: 60\nframes shown: 100\ndevice removals: 0\ncrashes: 0\n"
+        blocks = ("``````\nxcl-smoke v1\ncommit: 1111111aaaa\n" + run + "``````\n"
+                  "``````\nxcl-smoke v1\ncommit: 1234567890\n" + run + "``````\n")
+        regression = "**Regression run**\n<!--\n**Not tested**\n-->\n" + blocks
+        description = BODY.replace("**Not tested**\n", regression + "**Not tested**\n")
+        files = [changed("crates/xcl/src/hle/d3d12x/vram.rs")]
+        self.assertEqual([], check(description.replace("\n", "\r\n"), HEAD, files,
+                                   lambda sha: sha == "1111111aaaa"))
+
+    def test_fenced_template_headings_do_not_define_sections(self):
+        run = "title: G\nseconds: 60\nframes shown: 100\ndevice removals: 0\ncrashes: 0\n"
+        blocks = ("```\nxcl-smoke v1\ncommit: 1111111aaaa\n" + run + "```\n"
+                  "```\nxcl-smoke v1\ncommit: 1234567890\n" + run + "```\n")
+        files = [changed("crates/xcl/src/hle/d3d12x/vram.rs")]
+        for heading, count in (("```\n**Regression run**\n```\n", 2),
+                               ("**Regression run**\n~~~markdown\n**Not tested**\n~~~~\n", 0)):
+            with self.subTest(heading=heading):
+                description = BODY.replace("**Not tested**\n", heading + blocks + "**Not tested**\n")
+                problems = check(description, HEAD, files, lambda sha: sha == "1111111aaaa")
+                self.assertEqual(count, len(problems), problems)
+                self.assertTrue(all("Regression run" in problem for problem in problems))
+
     def smoke_problems(self, main_run, pr_run):
         body = ("```\nxcl-smoke v1\ncommit: 1111111aaaa\n" + main_run + "```\n"
                 "```\nxcl-smoke v1\ncommit: 1234567890\n" + pr_run + "```\n")
         files = [changed("crates/xcl/src/hle/d3d12x/vram.rs")]
-        return check(BODY + body, HEAD, files, lambda sha: sha == "1111111aaaa")
+        description = BODY.replace("**Not tested**\n", "**Regression run**\n" + body + "**Not tested**\n")
+        return check(description, HEAD, files, lambda sha: sha == "1111111aaaa")
 
     def test_blocks_with_only_commit_lines_fail(self):
         problems = self.smoke_problems("", "")
@@ -102,8 +158,16 @@ class SmokeBlockTests(unittest.TestCase):
         self.assertIn("the PR's regression run (`xcl-smoke` block of commit 1234567890) "
                       "has a non-numeric `frames shown`: many", problems)
 
+    def test_comment_markup_in_fenced_title_stays_literal(self):
+        run = "seconds: 60\nframes shown: 100\ndevice removals: 0\ncrashes: 0\n"
+        problems = self.smoke_problems("title: G\n" + run, "title: G <!-- suffix -->\n" + run)
+        self.assertIn("the main and PR regression runs are not of the same title for the same time", problems)
+
 
 class TemplatePlaceholderTests(unittest.TestCase):
+    def test_utf8_bom_does_not_hide_first_template_heading(self):
+        self.assertEqual([], check("\ufeff" + BODY, HEAD, [changed("README.md")], lambda _: True))
+
     def test_untouched_pr_template_fails_all_required_sections(self):
         template = Path(__file__).resolve().parent.parent / ".github" / "pull_request_template.md"
         body = template.read_text(encoding="utf-8")
@@ -128,6 +192,17 @@ class TemplatePlaceholderTests(unittest.TestCase):
             "**AI use**\n"
             "- none\n"
         )
+        self.assertEqual([], check(body, HEAD, [changed("README.md")], lambda _: True))
+
+    def test_inline_comment_marker_does_not_hide_template(self):
+        preamble = "The docs discuss `<!--` syntax.\n\n"
+        body = preamble + BODY
+        self.assertEqual([], check(body, HEAD, [changed("README.md")], lambda _: True))
+        self.assertEqual([], check(preamble + BODY.replace("Retail titles", "<!-- reminder -->\nRetail titles"),
+                                   HEAD, [changed("README.md")], lambda _: True))
+
+    def test_standalone_triple_backtick_inline_code_does_not_hide_template(self):
+        body = "```xcl --version```\n\n" + BODY
         self.assertEqual([], check(body, HEAD, [changed("README.md")], lambda _: True))
 
     def test_bare_bullets_and_html_comments_only_fail(self):

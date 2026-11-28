@@ -82,18 +82,43 @@ def builds_runtime(path):
     return path.startswith("crates/xcl/data/") or path in RUNTIME_BUILD
 
 
+FENCED_CODE = (
+    # A backtick fence's info string cannot contain a backtick.
+    r"(?P<code>^ {0,3}(?=~|`+[^`\n]*\n)(?P<fence>(?P<marker>[`~])(?P=marker){2,})[^\n]*\n"
+    r".*?(?:^ {0,3}(?P=fence)(?P=marker)*[ \t]*(?=\n|\Z)|\Z))"
+)
+
+
+def without_html_comments(body):
+    """Drop HTML comments while keeping comment-like text inside code."""
+    inline_code = r"(?P<inline>(?<!`)(?P<ticks>`+)(?!`)[^\n]*?(?<!`)(?P=ticks)(?!`))"
+    return re.sub(
+        FENCED_CODE + "|" + inline_code + r"|<!--.*?(?:-->|\Z)",
+        lambda m: m.group("code") or m.group("inline") or "",
+        body,
+        flags=re.M | re.S,
+    )
+
+
+def section_text(body, section):
+    """The text between visible template headings, including any fenced content."""
+    headings = "|".join(re.escape(h) for h in HEADINGS)
+    pattern = FENCED_CODE + r"|^\*\*(?P<heading>" + headings + r")\*\*[ \t]*(?:\n|\Z)"
+    start = None
+    for match in re.finditer(pattern, body, re.M | re.S):
+        heading = match.group("heading")
+        if heading is None:
+            continue
+        if start is not None:
+            return body[start:match.start()]
+        if heading == section:
+            start = match.end()
+    return body[start:] if start is not None else ""
+
+
 def section_has_content(body, section):
     """True when `**section**` exists and has at least one non-placeholder line."""
-    next_heading = "|".join(re.escape(h) for h in HEADINGS)
-    m = re.search(
-        r"\*\*" + re.escape(section) + r"\*\*[ \t]*\n(.*?)(?=\n\*\*(?:" + next_heading + r")\*\*|\Z)",
-        body,
-        re.S,
-    )
-    if not m:
-        return False
-    text = re.sub(r"<!--.*?-->", "", m.group(1), flags=re.S)
-    for raw in text.splitlines():
+    for raw in section_text(body, section).splitlines():
         line = re.sub(r"^\s*[-*•]+\s*", "", raw).strip()
         if line and line not in TEMPLATE_PLACEHOLDERS:
             return True
@@ -104,14 +129,14 @@ def check(body, head, files, is_main_ancestor, *, test_only=False):
     """The problems (empty: mergeable as far as this check goes). `files`: (path, status, binary,
     size) with `size` a function giving the file's bytes; `is_main_ancestor(sha)`: whether the
     commit is on main."""
-    body = body.replace("\r\n", "\n")
+    body = body.removeprefix("\ufeff").replace("\r\n", "\n")
+    visible_body = without_html_comments(body)
     problems = []
     for section in SECTIONS:
-        if not section_has_content(body, section):
+        if not section_has_content(visible_body, section):
             problems.append(f"the **{section}** section is missing or empty")
 
-    ai = re.search(r"\*\*AI use\*\*(.*?)(\n\*\*|\Z)", body, re.S)
-    banned = re.findall(BANNED_MODELS, ai.group(1), re.I) if ai else []
+    banned = re.findall(BANNED_MODELS, section_text(visible_body, "AI use"), re.I)
     if banned:
         problems.append("**AI use** names a model this repository does not accept for code ("
                         + ", ".join(sorted({b.lower() for b in banned})) + "): see CONTRIBUTING.md")
@@ -128,7 +153,7 @@ def check(body, head, files, is_main_ancestor, *, test_only=False):
             problems.append(f"`{path}` is a binary file outside tests/data/ or over 1 MB")
 
     if not test_only and any(runtime(p) or builds_runtime(p) for p, *_ in files):
-        blocks = smoke_blocks(body)
+        blocks = smoke_blocks(section_text(visible_body, "Regression run"))
         mine = [b for b in blocks if len(b.get("commit", "")) >= 7 and head.startswith(b["commit"].split()[0])]
         clean = [b for b in mine if "uncommitted" not in b.get("commit", "")]
         base = [b for b in blocks if b not in mine and len(b.get("commit", "").split()[0] if b.get("commit") else "") >= 7]
