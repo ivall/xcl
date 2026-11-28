@@ -3,6 +3,7 @@
 //! processors, so SMT does not matter). Plain text search –
 //! the file is small XML and only these elements matter.
 
+use std::borrow::Cow;
 use std::path::Path;
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -37,8 +38,20 @@ fn element<'a>(xml: &'a str, name: &str) -> Option<&'a str> {
     None
 }
 
+fn text<'a>(xml: &'a str, name: &str) -> Option<Cow<'a, str>> {
+    let raw = element(xml, name)?;
+    if !raw.contains('&') {
+        return Some(Cow::Borrowed(raw));
+    }
+    let mut value = crate::launcher::xml_unescape(raw);
+    let leading = value.len() - value.trim_start().len();
+    value.replace_range(..leading, "");
+    value.truncate(value.trim_end().len());
+    Some(Cow::Owned(value))
+}
+
 pub fn parse(xml: &str) -> Manifest {
-    let pls = element(xml, "PersistentLocalStorage").and_then(|section| element(section, "SizeMB"));
+    let pls = element(xml, "PersistentLocalStorage").and_then(|section| text(section, "SizeMB"));
     let languages = element(xml, "Resources")
         .map(|section| {
             crate::launcher::xml_attrs(section, "Resource", "Language")
@@ -50,9 +63,9 @@ pub fn parse(xml: &str) -> Manifest {
         .unwrap_or_default();
     Manifest {
         pls_mb: pls.and_then(|v| v.parse().ok()),
-        anaconda_memory: element(xml, "XboxAnacondaTitleMemory").map(str::to_string),
-        lockhart_memory: element(xml, "XboxLockhartTitleMemory").map(str::to_string),
-        title_id: element(xml, "TitleId").map(str::to_string),
+        anaconda_memory: text(xml, "XboxAnacondaTitleMemory").map(Cow::into_owned),
+        lockhart_memory: text(xml, "XboxLockhartTitleMemory").map(Cow::into_owned),
+        title_id: text(xml, "TitleId").map(Cow::into_owned),
         languages,
     }
 }
@@ -86,6 +99,22 @@ mod tests {
         assert_eq!(m.pls_mb, Some(2048));
         assert_eq!((m.anaconda_memory.as_deref(), m.lockhart_memory.as_deref()), (Some("Advanced"), Some("Advanced")));
         assert_eq!(parse("<Game/>"), Manifest::default());
+    }
+
+    #[test]
+    fn text_settings_decode_character_references() {
+        let xml = r#"<Game>
+  <PersistentLocalStorage><SizeMB>&#x20;&#53;12&#x20;</SizeMB></PersistentLocalStorage>
+  <XboxAnacondaTitleMemory>&#65;dvanced</XboxAnacondaTitleMemory>
+  <XboxLockhartTitleMemory>Stand&#97;rd</XboxLockhartTitleMemory>
+  <TitleId>&#x20;1234&#x41;BCD&#x20;</TitleId>
+</Game>"#;
+        let m = parse(xml);
+        assert_eq!(m.pls_mb, Some(512));
+        assert_eq!(m.anaconda_memory.as_deref(), Some("Advanced"));
+        assert_eq!(m.lockhart_memory.as_deref(), Some("Standard"));
+        assert_eq!(m.title_id.as_deref(), Some("1234ABCD"));
+        assert_eq!(parse("<Game><TitleId>&#x20;&#9;</TitleId></Game>").title_id.as_deref(), Some(""));
     }
 
     #[test]

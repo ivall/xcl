@@ -46,9 +46,9 @@ pub(crate) fn xml_attrs(xml: &str, tag: &str, attr: &str) -> Vec<String> {
     out
 }
 
-/// An attribute value with XML's character references replaced: the five named ones
+/// An XML value with character references replaced: the five named ones
 /// ("Ratchet &amp; Clank") and numeric ones (`&#39;`, `&#x27;`). Anything else stays as written.
-fn xml_unescape(v: &str) -> String {
+pub(crate) fn xml_unescape(v: &str) -> String {
     let mut out = String::with_capacity(v.len());
     let mut rest = v;
     while let Some(i) = rest.find('&') {
