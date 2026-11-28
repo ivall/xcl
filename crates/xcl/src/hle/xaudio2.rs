@@ -1457,6 +1457,26 @@ mod tests {
         }
     }
 
+    /// How long the voice tests wait for their buffers to start and end. On an idle PC they
+    /// play in well under a second; a busy one (a parallel test run, a build) can take
+    /// several (3 s was not enough, #1487).
+    const PLAYBACK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// Why to skip a voice test whose mastering voice took `opened` to create: such an
+    /// audio device (a sleeping Bluetooth or virtual output as the default, seen at 56 s)
+    /// takes as long again to play the first buffers, which is the device, not XAudio2's
+    /// shims. `None` for a device that opened in time.
+    fn slow_audio_device(opened: std::time::Duration) -> Option<String> {
+        (opened > std::time::Duration::from_secs(10)).then(|| format!("the default audio device took {:.1} s to open", opened.as_secs_f32()))
+    }
+
+    #[test]
+    fn slow_audio_devices_are_skipped_not_failed() {
+        assert_eq!(slow_audio_device(std::time::Duration::from_millis(40)), None);
+        assert_eq!(slow_audio_device(std::time::Duration::from_secs(56)).as_deref(), Some("the default audio device took 56.0 s to open"));
+        assert!(PLAYBACK_WAIT >= std::time::Duration::from_secs(10));
+    }
+
     #[test]
     fn opus_source_voice_decodes_and_manages_lifetime() {
         if !opus::is_available() {
@@ -1504,10 +1524,19 @@ mod tests {
             let vt_eng = vtable(eng);
             let create_master: CreateMasteringVoiceFn = std::mem::transmute(vt_eng.add(ENGINE_CREATE_MASTERING_VOICE).read());
             let mut master: *mut c_void = std::ptr::null_mut();
+            let opened = std::time::Instant::now();
             if create_master(eng, &mut master, 0, 0, 0, std::ptr::null(), std::ptr::null(), AUDIO_CATEGORY_GAME_EFFECTS) < 0 {
                 let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(vt_eng.add(2).read());
                 release(eng);
                 eprintln!("skipping: no audio device");
+                return;
+            }
+            if let Some(why) = slow_audio_device(opened.elapsed()) {
+                let destroy_master: DestroyVoiceFn = std::mem::transmute(vtable(master).add(VOICE_DESTROY).read());
+                destroy_master(master);
+                let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(vt_eng.add(2).read());
+                release(eng);
+                crate::gpu::recomp::runner::skip_test(&why);
                 return;
             }
 
@@ -1578,7 +1607,7 @@ mod tests {
 
             let t0 = std::time::Instant::now();
             while (ENDED.load(Ordering::SeqCst) != CTX1 + CTX2 || STREAM_END.load(Ordering::SeqCst) == 0)
-                && t0.elapsed() < std::time::Duration::from_secs(3)
+                && t0.elapsed() < PLAYBACK_WAIT
             {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
@@ -1651,10 +1680,19 @@ mod tests {
             let vt_eng = vtable(eng);
             let create_master: CreateMasteringVoiceFn = std::mem::transmute(vt_eng.add(ENGINE_CREATE_MASTERING_VOICE).read());
             let mut master: *mut c_void = std::ptr::null_mut();
+            let opened = std::time::Instant::now();
             if create_master(eng, &mut master, 0, 0, 0, std::ptr::null(), std::ptr::null(), AUDIO_CATEGORY_GAME_EFFECTS) < 0 {
                 let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(vt_eng.add(2).read());
                 release(eng);
                 eprintln!("skipping: no audio device");
+                return;
+            }
+            if let Some(why) = slow_audio_device(opened.elapsed()) {
+                let destroy_master: DestroyVoiceFn = std::mem::transmute(vtable(master).add(VOICE_DESTROY).read());
+                destroy_master(master);
+                let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(vt_eng.add(2).read());
+                release(eng);
+                crate::gpu::recomp::runner::skip_test(&why);
                 return;
             }
 
@@ -1730,7 +1768,7 @@ mod tests {
 
             let t0 = std::time::Instant::now();
             while (ENDED.load(Ordering::SeqCst) != CTX_VALID + CTX_BAD || STREAM_END.load(Ordering::SeqCst) < 2)
-                && t0.elapsed() < std::time::Duration::from_secs(3)
+                && t0.elapsed() < PLAYBACK_WAIT
             {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
