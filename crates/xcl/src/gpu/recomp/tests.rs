@@ -1526,6 +1526,78 @@ fn gpu_memory_and_exports() {
     }
 }
 
+/// Packed 16-bit integer VOP3P instructions no other GPU test runs (mul_lo, the three shifts,
+/// u16 / i16 min and max, mad without clamp), each half against the ISA's pseudo-code, on the
+/// usual half selection (op_sel 0, op_sel_hi 1) and with the halves swapped (op_sel 1,
+/// op_sel_hi 0: the low result reads the high halves and the other way round).
+#[test]
+fn gpu_packed_16_bit_integer() {
+    if !gpu_ready() {
+        return;
+    }
+    let hs = |x: u32| x as u16 as i16 as i32;
+    let ops: &[(&str, &dyn Fn(u32, u32, u32) -> u32)] = &[
+        ("V_PK_MUL_LO_U16", &|a, b, _| a.wrapping_mul(b)),
+        ("V_PK_LSHLREV_B16", &|a, b, _| b << (a & 15)),
+        ("V_PK_LSHRREV_B16", &|a, b, _| b >> (a & 15)),
+        ("V_PK_ASHRREV_I16", &|a, b, _| (hs(b) >> (a & 15)) as u32),
+        ("V_PK_MAX_U16", &|a, b, _| a.max(b)),
+        ("V_PK_MIN_U16", &|a, b, _| a.min(b)),
+        ("V_PK_MAX_I16", &|a, b, _| hs(a).max(hs(b)) as u32),
+        ("V_PK_MIN_I16", &|a, b, _| hs(a).min(hs(b)) as u32),
+        ("V_PK_MAD_U16", &|a, b, c| a.wrapping_mul(b).wrapping_add(c)),
+        ("V_PK_MAD_I16", &|a, b, c| (hs(a) * hs(b) + hs(c)) as u32),
+    ];
+    let inputs: [(u32, u32, u32); 8] = [
+        (0x0003_0011, 0x8001_FFFF, 0x7FFF_0001),
+        (0xFFFF_0001, 0x7FFF_8000, 0x8000_FFFF),
+        (0x000F_0010, 0x1234_8421, 0x0000_0000),
+        (0x8000_7FFF, 0x8000_7FFF, 0xFFFF_FFFF),
+        (0x0102_FF00, 0x00FF_0101, 0x1111_2222),
+        (0, 0, 0),
+        (0xFFFF_FFFF, 0xFFFF_FFFF, 0x0001_0001),
+        (0x0021_0005, 0xA5A5_5A5A, 0x4000_C000),
+    ];
+    // (op_sel, op_sel_hi) for sources 0 and 1 (bits 0 / 1), and source 2's op_sel_hi
+    let sels: [(u64, u64, u64); 2] = [(0, 3, 1), (3, 0, 0)];
+    let mut parts = Vec::new();
+    for (s, &(sel, sel_hi, sel_hi2)) in sels.iter().enumerate() {
+        for (i, (n, _)) in ops.iter().enumerate() {
+            let vdst = 10 + (s * ops.len() + i) as u64;
+            let sel2 = if s == 1 { 4 } else { 0 }; // source 2's op_sel (bit 2)
+            parts.push(ins(
+                n,
+                "ENC_VOP3P",
+                &[("VDST", vdst), ("SRC0", V + 1), ("SRC1", V + 2), ("SRC2", V + 3), ("OP_SEL", sel | sel2), ("OP_SEL_HI", sel_hi), ("OP_SEL_HI_2", sel_hi2)],
+                None,
+            ));
+        }
+    }
+    let mut st = KernelState::default();
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        (r[1], r[2], r[3]) = inputs[l % inputs.len()];
+    }
+    let r = runner::run_code(&program_of(&parts), &st, &[]).unwrap();
+    let half = |x: u32, hi: bool| if hi { x >> 16 } else { x & 0xFFFF };
+    let mut bad = Vec::new();
+    for (l, v) in r.vgpr.iter().enumerate().take(inputs.len()) {
+        let (a, b, c) = inputs[l];
+        for (s, _) in sels.iter().enumerate() {
+            // swapped: the low result reads the high halves, the high result the low ones
+            let (lo_from_hi, hi_from_hi) = if s == 0 { (false, true) } else { (true, false) };
+            for (i, (n, reference)) in ops.iter().enumerate() {
+                let lo = reference(half(a, lo_from_hi), half(b, lo_from_hi), half(c, lo_from_hi)) & 0xFFFF;
+                let hi = reference(half(a, hi_from_hi), half(b, hi_from_hi), half(c, hi_from_hi)) & 0xFFFF;
+                let (got, want) = (v[10 + s * ops.len() + i], lo | hi << 16);
+                if got != want {
+                    bad.push(format!("{n}{} a={a:#010x} b={b:#010x} c={c:#010x}: got {got:#010x}, want {want:#010x}", if s == 1 { " (swapped)" } else { "" }));
+                }
+            }
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
 /// Multi-dword loads as the emitter groups them (four dwords per memory access, bounds checks
 /// without branches): an unaligned `s_load`, `s_buffer_load`s that straddle num_records, and
 /// vector buffer loads with lanes past the end and inactive lanes (which keep their registers).
