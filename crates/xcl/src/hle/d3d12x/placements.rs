@@ -61,6 +61,16 @@ impl Desc {
     pub(super) fn of(d: &D3D12_RESOURCE_DESC) -> Desc {
         Desc { width: d.Width, height: d.Height, depth: d.DepthOrArraySize, mips: d.MipLevels, format: d.Format.0, flags: d.Flags.0 }
     }
+
+    /// Whether a reserved texture of this description has the texels of one of `other`'s on the
+    /// same tiles: the same size and levels and a texel of the same size (e.g. R9G9B9E5 sampled
+    /// over an R32_UINT UAV target).
+    pub(super) fn same_texels(&self, other: &Desc) -> bool {
+        let plain = |f: i32| !matches!(f, 0 | 5..=8 | 66 | 68..=84 | 94..=99) && f < 100;
+        let texel = |f: i32| super::targets::texel_bytes(windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(f));
+        (self.width, self.height, self.depth, self.mips) == (other.width, other.height, other.depth, other.mips)
+            && (self.format == other.format || (plain(self.format) && plain(other.format) && texel(self.format) == texel(other.format)))
+    }
 }
 
 impl std::fmt::Display for Desc {
@@ -225,7 +235,8 @@ impl Registry {
         let mut out = Placed { seq: self.seq, remap, ..Default::default() };
         for &(o, overlap) in &found {
             let Some(old) = self.live.get_mut(&o) else { continue };
-            let retired = retire && supersedes(overlap, old.kind, old.backing, old.released, old.mapped);
+            let same_view = p.desc.format != 0 && p.va == old.va && p.desc.same_texels(&old.desc);
+            let retired = retire && !same_view && supersedes(overlap, old.kind, old.backing, old.released, old.mapped);
             if look {
                 out.cases.push(Case {
                     old: o,
@@ -527,7 +538,12 @@ pub(super) unsafe fn unmap_if_superseded(res: &ID3D12Resource) {
     }
 }
 
-/// The title uses `res` (a barrier, a copy): a superseded target goes back on the shared pages –
+/// Whether any live target is currently superseded (`SUPERSEDED != 0`).
+pub(super) fn any_superseded() -> bool {
+    SUPERSEDED.load(Ordering::Relaxed) != 0
+}
+
+/// The title uses `res` (a barrier, a copy, or a descriptor table): a superseded target goes back on the shared pages –
 /// on the console the title may use both over one memory when it knows they share it. Logged
 /// once for each pair (the first 64). The work recorded now waits for the mapping
 /// (`vram::before_execute` at its submit).
@@ -777,5 +793,40 @@ mod tests {
         assert!(r.release(1).is_empty() && superseded(&r).is_empty());
         assert!(r.use_again(1).is_empty(), "released");
         assert!(r.remove(3).unwrap().is_empty());
+    }
+
+    /// A sampled alias at the same address with the same texels (e.g. R9G9B9E5 over an R32_UINT
+    /// UAV target) must not supersede the target even when their owned page ranges differ by a
+    /// trailing page.
+    #[test]
+    fn same_address_same_texels_alias_pair_does_not_supersede() {
+        let mut r = Registry::default();
+        let at = 0x10_7720_7400usize;
+        let p0 = at.next_multiple_of(K64);
+        let d = |format: i32, flags: i32| Desc { width: 640, height: 360, depth: 1, mips: 1, format, flags };
+        let out_uav = r.place(1, at, (p0, p0 + 14 * K64), Backing::Pages(1), Kind::Target, d(42, 4), Instant::now(), false, true);
+        assert!(out_uav.victims.is_empty());
+        let out_srv = r.place(2, at, (p0, p0 + 15 * K64), Backing::Pages(1), Kind::Sampled, d(67, 0), Instant::now(), false, true);
+        assert!(out_srv.victims.is_empty(), "same-VA same-texels alias must not supersede its UAV target");
+        assert!(!r.superseded(1));
+        assert_eq!(r.unmapped, 0);
+    }
+
+    /// A target superseded by a newer overlapping placement at another address is remapped when
+    /// used again (e.g. via descriptor-table binding).
+    #[test]
+    fn superseded_target_remaps_on_use_again() {
+        let mut r = Registry::default();
+        let at = 0x10_b69b_c200usize;
+        let p0 = at.next_multiple_of(K64);
+        let d = |format: i32| Desc { width: 480, height: 272, depth: 1, mips: 1, format, flags: 4 };
+        r.place(10, at, (p0, p0 + 7 * K64), Backing::Pages(1), Kind::Target, d(24), Instant::now(), false, true);
+        let out = r.place(11, at - 0x7_f800, (p0 - 7 * K64, p0 + K64), Backing::Pages(1), Kind::Target, d(42), Instant::now(), false, true);
+        assert_eq!(out.victims, vec![10]);
+        assert!(r.superseded(10));
+        assert_eq!(r.unmapped, 1);
+        assert_eq!(r.use_again(10), vec![11]);
+        assert!(!r.superseded(10));
+        assert_eq!(r.unmapped, 0);
     }
 }
