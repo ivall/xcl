@@ -2336,6 +2336,129 @@ fn gpu_ps_p0_reads_flat_integer_selectors() {
     }
 }
 
+/// `v_interp_mov_f32` with P10 (`VSRC = 0`), P20 (`VSRC = 1`) and P0 (`VSRC = 2`) via SM 6.1+
+/// `GetAttributeAtVertex`, plus a mixed shader that reads the same attribute through both
+/// `v_interp_mov_f32` P10/P20 and `v_interp_p1_f32`/`v_interp_p2_f32` (`SV_Barycentrics`).
+#[test]
+fn gpu_ps_interp_mov_p10_p20() {
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_FORMAT_R32G32_FLOAT};
+    // invalid VSRC = 3 stays unsupported
+    let bad = prog(&[
+        ("V_INTERP_MOV_F32", "ENC_VINTRP", &[("VDST", 4), ("VSRC", 3), ("ATTR", 0), ("ATTRCHAN", 0)], None),
+        ("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 4), ("VSRC1", 4), ("VSRC2", 4), ("VSRC3", 4), ("DONE", 1), ("VM", 1)], None),
+    ]);
+    let bad_t = translate(&bad, &Options { mode: Mode::Pixel(draw_psi()), ..Default::default() }).unwrap();
+    assert!(!bad_t.complete(), "VSRC=3 must stay unsupported");
+
+    if !gpu_ready() {
+        return;
+    }
+    let compile = |code: &[u8], mode: Mode, profile: &str| {
+        let t = translate(code, &runner::options(mode)).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        super::dxc::compile(&t.hlsl, "main", profile, &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl))
+    };
+    let vs = compile(&draw_passthrough_vs(), Mode::Vertex(draw_vsi()), "vs_6_6");
+    let layout = [
+        runner::VertexElement { semantic: "POSITION", index: 0, format: DXGI_FORMAT_R32G32_FLOAT, offset: 0 },
+        runner::VertexElement { semantic: "COLOR", index: 0, format: DXGI_FORMAT_R32G32B32A32_FLOAT, offset: 8 },
+    ];
+    // triangle covering the entire 16x16 target with distinct per-vertex attributes v0, v1, v2
+    let v0 = [1.5f32, 2.0, -3.0, 0.25];
+    let v1 = [4.5f32, -1.0, 5.0, 1.25];
+    let v2 = [-2.5f32, 6.0, 1.0, 0.75];
+    let verts: Vec<f32> = [([-1.0f32, -1.0], v0), ([-1.0, 3.0], v1), ([3.0, -1.0], v2)]
+        .into_iter()
+        .flat_map(|([x, y], c)| [x, y, c[0], c[1], c[2], c[3]])
+        .collect();
+
+    // 1. pure v_interp_mov_f32: r = P0.x, g = P10.x (v1.x - v0.x), b = P20.x (v2.x - v0.x), a = P20.y (v2.y - v0.y)
+    let ps_mov = prog(&[
+        ("V_INTERP_MOV_F32", "ENC_VINTRP", &[("VDST", 4), ("VSRC", 2), ("ATTR", 0), ("ATTRCHAN", 0)], None),
+        ("V_INTERP_MOV_F32", "ENC_VINTRP", &[("VDST", 5), ("VSRC", 0), ("ATTR", 0), ("ATTRCHAN", 0)], None),
+        ("V_INTERP_MOV_F32", "ENC_VINTRP", &[("VDST", 6), ("VSRC", 1), ("ATTR", 0), ("ATTRCHAN", 0)], None),
+        ("V_INTERP_MOV_F32", "ENC_VINTRP", &[("VDST", 7), ("VSRC", 1), ("ATTR", 0), ("ATTRCHAN", 1)], None),
+        ("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 4), ("VSRC1", 5), ("VSRC2", 6), ("VSRC3", 7), ("DONE", 1), ("VM", 1)], None),
+    ]);
+    let psb = compile(&ps_mov, Mode::Pixel(draw_psi()), "ps_6_6");
+    let pixels = runner::draw(&vs, &psb, &layout, &verts, 24, &[], &[], 16, [-99.0; 4]).unwrap();
+    let want = [v0[0], v1[0] - v0[0], v2[0] - v0[0], v2[1] - v0[1]];
+    for (i, p) in pixels.iter().enumerate() {
+        assert_eq!(*p, want, "pixel {i}: v_interp_mov P0/P10/P20");
+    }
+
+    // 2. mixed attribute: v_interp_p1/p2 (interpolated) + v_interp_mov P10/P20 on ATTR 0
+    let ps_mixed = prog(&[
+        ("V_INTERP_P1_F32", "ENC_VINTRP", &[("VDST", 4), ("VSRC", 0), ("ATTR", 0), ("ATTRCHAN", 0)], None),
+        ("V_INTERP_P2_F32", "ENC_VINTRP", &[("VDST", 4), ("VSRC", 1), ("ATTR", 0), ("ATTRCHAN", 0)], None),
+        ("V_INTERP_MOV_F32", "ENC_VINTRP", &[("VDST", 5), ("VSRC", 0), ("ATTR", 0), ("ATTRCHAN", 0)], None),
+        ("V_INTERP_MOV_F32", "ENC_VINTRP", &[("VDST", 6), ("VSRC", 1), ("ATTR", 0), ("ATTRCHAN", 0)], None),
+        ("V_INTERP_MOV_F32", "ENC_VINTRP", &[("VDST", 7), ("VSRC", 2), ("ATTR", 0), ("ATTRCHAN", 0)], None),
+        ("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 4), ("VSRC1", 5), ("VSRC2", 6), ("VSRC3", 7), ("DONE", 1), ("VM", 1)], None),
+    ]);
+    let psb_mixed = compile(&ps_mixed, Mode::Pixel(draw_psi()), "ps_6_6");
+    let mixed = runner::draw(&vs, &psb_mixed, &layout, &verts, 24, &[], &[], 16, [-99.0; 4]).unwrap();
+    let mut saw_varying = false;
+    for (i, p) in mixed.iter().enumerate() {
+        assert_eq!([p[1], p[2], p[3]], [v1[0] - v0[0], v2[0] - v0[0], v0[0]], "pixel {i}: mixed P10/P20/P0");
+        // interpolated channel must stay within [min(v0.x, v1.x, v2.x), max(v0.x, v1.x, v2.x)] and vary across pixels
+        assert!(p[0] >= -2.51 && p[0] <= 4.51, "pixel {i}: interpolated value {} out of range", p[0]);
+        if (p[0] - mixed[0][0]).abs() > 0.1 {
+            saw_varying = true;
+        }
+    }
+    assert!(saw_varying, "mixed attribute p2 interpolation did not vary across pixels");
+
+    // 3. manual P0 + I * P10 + J * P20 using the I / J barycentric VGPRs (v0 / v1) must match
+    // hardware v_interp_p1_f32 / v_interp_p2_f32 across all 256 pixels
+    let ps_manual = prog(&[
+        ("V_INTERP_MOV_F32", "ENC_VINTRP", &[("VDST", 5), ("VSRC", 2), ("ATTR", 0), ("ATTRCHAN", 0)], None),
+        ("V_INTERP_MOV_F32", "ENC_VINTRP", &[("VDST", 6), ("VSRC", 0), ("ATTR", 0), ("ATTRCHAN", 0)], None),
+        ("V_INTERP_MOV_F32", "ENC_VINTRP", &[("VDST", 7), ("VSRC", 1), ("ATTR", 0), ("ATTRCHAN", 0)], None),
+        ("V_FMAC_F32", "ENC_VOP2", &[("VDST", 5), ("SRC0", V + 0), ("VSRC1", 6)], None),
+        ("V_FMAC_F32", "ENC_VOP2", &[("VDST", 5), ("SRC0", V + 1), ("VSRC1", 7)], None),
+        ("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 5), ("VSRC1", 5), ("VSRC2", 5), ("VSRC3", 5), ("DONE", 1), ("VM", 1)], None),
+    ]);
+    let ps_ref = prog(&[
+        ("V_INTERP_P1_F32", "ENC_VINTRP", &[("VDST", 5), ("VSRC", 0), ("ATTR", 0), ("ATTRCHAN", 0)], None),
+        ("V_INTERP_P2_F32", "ENC_VINTRP", &[("VDST", 5), ("VSRC", 1), ("ATTR", 0), ("ATTRCHAN", 0)], None),
+        ("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 5), ("VSRC1", 5), ("VSRC2", 5), ("VSRC3", 5), ("DONE", 1), ("VM", 1)], None),
+    ]);
+    let psb_manual = compile(&ps_manual, Mode::Pixel(draw_psi()), "ps_6_6");
+    let psb_ref = compile(&ps_ref, Mode::Pixel(draw_psi()), "ps_6_6");
+    let manual_px = runner::draw(&vs, &psb_manual, &layout, &verts, 24, &[], &[], 16, [-99.0; 4]).unwrap();
+    let ref_px = runner::draw(&vs, &psb_ref, &layout, &verts, 24, &[], &[], 16, [-99.0; 4]).unwrap();
+    for (i, (got, exp)) in manual_px.iter().zip(&ref_px).enumerate() {
+        assert!((got[0] - exp[0]).abs() < 1e-4, "pixel {i}: P0 + I*P10 + J*P20 = {}, ref = {}", got[0], exp[0]);
+    }
+
+    // 4. SV_Barycentrics preserves the pair's interpolation modifier (noperspective / centroid),
+    // and conflicting modes in one PS are refused instead of silently falling back
+    for (ena, want_decl) in [(0x20u32, "noperspective float3 xcl_bary : SV_Barycentrics;"), (0x4u32, "centroid float3 xcl_bary : SV_Barycentrics;")] {
+        let mut psi = draw_psi();
+        psi.input_ena = ena;
+        let t = translate(&ps_mixed, &Options { mode: Mode::Pixel(psi.clone()), ..Default::default() }).unwrap();
+        assert!(t.complete(), "ena {ena:#x}: {:?}", t.unsupported_why);
+        assert!(t.hlsl.contains(want_decl), "ena {ena:#x} missing `{want_decl}`:\n{}", t.hlsl);
+        super::dxc::compile(&t.hlsl, "main", "ps_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+        let tm = translate(&ps_manual, &Options { mode: Mode::Pixel(psi), ..Default::default() }).unwrap();
+        assert!(tm.complete(), "manual ena {ena:#x}: {:?}", tm.unsupported_why);
+        assert!(tm.hlsl.contains(want_decl), "manual ena {ena:#x} missing `{want_decl}`:\n{}", tm.hlsl);
+        super::dxc::compile(&tm.hlsl, "main", "ps_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", tm.hlsl));
+    }
+    let mut psi_conflict = draw_psi();
+    psi_conflict.input_ena = 0x2 | 0x20; // persp_center in v0..v1, linear_center in v2..v3
+    let ps_conflict = prog(&[
+        ("V_INTERP_P1_F32", "ENC_VINTRP", &[("VDST", 4), ("VSRC", 0), ("ATTR", 0), ("ATTRCHAN", 0)], None),
+        ("V_INTERP_P2_F32", "ENC_VINTRP", &[("VDST", 4), ("VSRC", 1), ("ATTR", 0), ("ATTRCHAN", 0)], None),
+        ("V_INTERP_MOV_F32", "ENC_VINTRP", &[("VDST", 5), ("VSRC", 0), ("ATTR", 0), ("ATTRCHAN", 0)], None),
+        ("V_FMAC_F32", "ENC_VOP2", &[("VDST", 5), ("SRC0", V + 2), ("VSRC1", 4)], None),
+        ("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 5), ("VSRC1", 5), ("VSRC2", 5), ("VSRC3", 5), ("DONE", 1), ("VM", 1)], None),
+    ]);
+    let tc = translate(&ps_conflict, &Options { mode: Mode::Pixel(psi_conflict), ..Default::default() }).unwrap();
+    assert!(!tc.complete(), "conflicting SV_Barycentrics modes must be refused");
+}
+
 /// Draw console wave64 VS + PS (`vs` None: position and COLOR passed through; `ps` None:
 /// COLOR interpolated) with triangles given in pixels of a 16 × 16 target, cleared to -1.
 /// Translated for this adapter (`runner::options`: on a GPU with 32-lane waves only, the

@@ -1717,6 +1717,10 @@ fn translate_inner(code: &[u8], opt: &Options) -> Result<Translation, String> {
         .unwrap_or(0);
     if let Mode::Pixel(ps) = &opt.mode {
         em.ps_modes = emit::ps_attr_modes(&insts, ps.input_ena);
+        em.ps_vertex_attrs = emit::ps_vertex_attrs(&insts);
+        if !em.ps_vertex_attrs.is_empty() {
+            em.ps_bary_reads = emit::ps_bary_reads(&insts, ps.input_ena);
+        }
     }
     let mut body = String::new();
     let mut blocks = 0usize;

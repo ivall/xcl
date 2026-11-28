@@ -33,6 +33,16 @@ pub(super) struct Em {
     dpp_enable: Option<String>,
     /// PS: interpolation modifier per attribute ("", "centroid", "nointerpolation" …)
     pub ps_modes: BTreeMap<u32, String>,
+    /// PS: attributes read through `v_interp_mov_f32` P10 / P20 (forced `nointerpolation` for
+    /// `GetAttributeAtVertex`; any `v_interp_p2_*` on them interpolates via `SV_Barycentrics`)
+    pub ps_vertex_attrs: BTreeSet<u32>,
+    /// PS: `(base_vgpr, mode)` of barycentric `(I, J)` input pairs read outside `v_interp_*`
+    pub ps_bary_reads: Vec<(u64, &'static str)>,
+    /// PS: `SV_Barycentrics` interpolation modifier (`""`, `"centroid"`, `"noperspective"`, …)
+    /// when needed for `I`/`J` VGPR init or a mixed `P10`/`P20` + `p2` attribute
+    ps_bary_mode: Option<&'static str>,
+    /// PS: base VGPR of the `(I, J)` pair populated from `xi.xcl_bary.yz` at shader entry
+    ps_bary_vgpr: Option<u64>,
     /// PS: an export controlling pixel survival (VM=1, or DONE=1 fallback) was emitted
     ps_done: bool,
     /// PS: program has at least one EXP with VM=1 (pixel survival follows VM rather than DONE)
@@ -626,6 +636,10 @@ impl Em {
             tmp: 0,
             dpp_enable: None,
             ps_modes: BTreeMap::new(),
+            ps_vertex_attrs: BTreeSet::new(),
+            ps_bary_reads: Vec::new(),
+            ps_bary_mode: None,
+            ps_bary_vgpr: None,
             ps_done: false,
             has_ps_vm: false,
             ps_writes_mask: false,
@@ -2478,36 +2492,82 @@ impl Em {
         }
     }
 
+    /// Record the `SV_Barycentrics` interpolation modifier needed by this PS; DXIL allows only
+    /// one `SV_Barycentrics` input, so conflicting modifiers are rejected.
+    fn require_bary_mode(&mut self, mode: &'static str) -> Result<(), &'static str> {
+        match self.ps_bary_mode {
+            None => {
+                self.ps_bary_mode = Some(mode);
+                Ok(())
+            }
+            Some(prev) if prev == mode => Ok(()),
+            Some(_) => Err("multiple SV_Barycentrics modes"),
+        }
+    }
+
     /// v_interp_*: attributes come interpolated from the PC rasteriser (PS mode).
     fn interp(&mut self, d: &Decoded, name: &str) -> Result<(), &'static str> {
         let Mode::Pixel(ps) = &self.opt.mode else { return Err("interpolation outside PS") };
+        let input_ena = ps.input_ena;
         let (vdst, ij, attr, chan) = Self::interp_fields(d);
         let Some(slot) = ps_attribute_slot(ps, attr as usize, chan as usize) else {
             return Err("attribute outside ISG1");
         };
         let src = format!("xi.a{slot}[{chan}]");
         let act = self.act();
+        let interp_float = |em: &mut Self| -> Result<String, &'static str> {
+            if em.ps_vertex_attrs.contains(&(attr as u32)) {
+                let mode = PS_BARY_PAIRS
+                    .iter()
+                    .find_map(|&(bit, m)| ps_input_vgpr(input_ena, bit).filter(|&b| ij == b || ij == b + 1).map(|_| m))
+                    .ok_or("v_interp_p2 barycentrics mode")?;
+                em.require_bary_mode(mode)?;
+                Ok(format!(
+                    "(xi.xcl_bary.x * (float)GetAttributeAtVertex(xi.a{slot}, 0u)[{chan}] + xi.xcl_bary.y * (float)GetAttributeAtVertex(xi.a{slot}, 1u)[{chan}] + xi.xcl_bary.z * (float)GetAttributeAtVertex(xi.a{slot}, 2u)[{chan}])"
+                ))
+            } else {
+                Ok(format!("(float){src}"))
+            }
+        };
         match name {
             "v_interp_p1_f32" | "v_interp_p1ll_f16" | "v_interp_p1lv_f16" => {
                 self.line("/* first half of the interpolation – p2 produces the value */");
             }
             "v_interp_p2_f32" => {
                 let v = self.vreg(vdst);
+                let val = interp_float(self)?;
                 // P2 supplies a floating-point interpolation result.
-                self.line(&format!("{v} = select({act}, asuint((float){src}), {v});"));
+                self.line(&format!("{v} = select({act}, asuint({val}), {v});"));
             }
             "v_interp_mov_f32" => {
-                if ij != 2 {
-                    return Err("v_interp_mov p10/p20");
+                if ij == 0 || ij == 1 {
+                    // if the shader also reads an I/J barycentric VGPR pair outside v_interp_*
+                    // (e.g. manual P0 + I * P10 + J * P20), populate that pair from SV_Barycentrics
+                    match self.ps_bary_reads.as_slice() {
+                        [] => {}
+                        &[(base, mode)] => {
+                            self.require_bary_mode(mode)?;
+                            self.ps_bary_vgpr = Some(base);
+                        }
+                        _ => return Err("multiple SV_Barycentrics modes"),
+                    }
                 }
                 let v = self.vreg(vdst);
-                // P0 loads the parameter word, including integer selector bits (#249).
-                self.line(&format!("{v} = select({act}, asuint({src}), {v});"));
+                let expr = match ij {
+                    // P10 = P1 - P0, P20 = P2 - P0 (SM 6.1+ GetAttributeAtVertex)
+                    0 => format!("asuint(asfloat(asuint(GetAttributeAtVertex(xi.a{slot}, 1u)[{chan}])) - asfloat(asuint(GetAttributeAtVertex(xi.a{slot}, 0u)[{chan}])))"),
+                    1 => format!("asuint(asfloat(asuint(GetAttributeAtVertex(xi.a{slot}, 2u)[{chan}])) - asfloat(asuint(GetAttributeAtVertex(xi.a{slot}, 0u)[{chan}])))"),
+                    // P0 loads the parameter word, including integer selector bits (#249).
+                    2 => format!("asuint({src})"),
+                    _ => return Err("v_interp_mov"),
+                };
+                self.line(&format!("{v} = select({act}, {expr}, {v});"));
             }
             "v_interp_p2_f16" => {
                 let v = self.vreg(vdst);
+                let val = interp_float(self)?;
                 let hi = rdna2::field_value(d.enc, &d.words, "OP_SEL").unwrap_or(0) >> 3 & 1 == 1;
-                let h = to_f16_expr(self.dynamic_f16_rm, &format!("(float){src}"));
+                let h = to_f16_expr(self.dynamic_f16_rm, &val);
                 let e = if hi { format!("({v} & 0xFFFFu) | ({h} << 16)") } else { format!("({v} & 0xFFFF0000u) | {h}") };
                 self.line(&format!("{v} = select({act}, {e}, {v});"));
             }
@@ -5419,6 +5479,13 @@ impl Em {
                 if ps.input_ena >> 14 & 1 == 1 {
                     h.push_str("    uint xcl_cov : SV_Coverage;\n");
                 }
+                if let Some(mode) = self.ps_bary_mode {
+                    if mode.is_empty() {
+                        h.push_str("    float3 xcl_bary : SV_Barycentrics;\n");
+                    } else {
+                        let _ = writeln!(h, "    {mode} float3 xcl_bary : SV_Barycentrics;");
+                    }
+                }
                 h.push_str("};\nstruct XclOut {\n");
                 for e in &ps.outputs {
                     match e.system_value {
@@ -5451,7 +5518,11 @@ impl Em {
                 h.push_str("    uint scc = 0u;\n    { uint2 e0 = ballot(true); exec_lo = e0.x; exec_hi = e0.y; }\n");
                 let sys = |bit: u32| ps_input_vgpr(ps.input_ena, bit);
                 for &v in &self.vgprs {
-                    let init = if Some(v) == sys(8) {
+                    let init = if self.ps_bary_vgpr == Some(v) {
+                        "asuint(xi.xcl_bary.y)"
+                    } else if self.ps_bary_vgpr.is_some_and(|b| v == b + 1) {
+                        "asuint(xi.xcl_bary.z)"
+                    } else if Some(v) == sys(8) {
                         "asuint(xi.xcl_pos.x)"
                     } else if Some(v) == sys(9) {
                         "asuint(xi.xcl_pos.y)"
@@ -5717,6 +5788,15 @@ fn out_comps(e: &SigElement) -> usize {
     }
 }
 
+const PS_BARY_PAIRS: [(u32, &str); 6] = [
+    (0, "sample"),
+    (1, ""),
+    (2, "centroid"),
+    (4, "noperspective sample"),
+    (5, "noperspective"),
+    (6, "noperspective centroid"),
+];
+
 /// Interpolation modifier of every PS attribute from the I/J pair its v_interp uses.
 pub fn ps_attr_modes(insts: &[Decoded], ena: u32) -> BTreeMap<u32, String> {
     let mut out = BTreeMap::new();
@@ -5729,7 +5809,7 @@ pub fn ps_attr_modes(insts: &[Decoded], ena: u32) -> BTreeMap<u32, String> {
         let mode = if name == "v_interp_mov_f32" {
             "nointerpolation"
         } else {
-            let pair = [(0u32, "sample"), (1, ""), (2, "centroid"), (4, "noperspective sample"), (5, "noperspective"), (6, "noperspective centroid")]
+            let pair = PS_BARY_PAIRS
                 .into_iter()
                 .find(|&(bit, _)| ps_input_vgpr(ena, bit).is_some_and(|b| ij == b || ij == b + 1));
             match pair {
@@ -5737,9 +5817,46 @@ pub fn ps_attr_modes(insts: &[Decoded], ena: u32) -> BTreeMap<u32, String> {
                 None => continue,
             }
         };
+        if name == "v_interp_mov_f32" && (ij == 0 || ij == 1) {
+            // GetAttributeAtVertex requires `nointerpolation` even if p1/p2 also reads `attr`
+            out.insert(attr as u32, "nointerpolation".to_string());
+            continue;
+        }
         out.entry(attr as u32).or_insert_with(|| mode.to_string());
     }
     out
+}
+
+/// Attributes read through `v_interp_mov_f32` P10 / P20 (need `nointerpolation` + `GetAttributeAtVertex`).
+pub fn ps_vertex_attrs(insts: &[Decoded]) -> BTreeSet<u32> {
+    let mut out = BTreeSet::new();
+    for d in insts {
+        if d.inst.name.eq_ignore_ascii_case("v_interp_mov_f32") {
+            let (_, ij, attr, _) = Em::interp_fields(d);
+            if ij == 0 || ij == 1 {
+                out.insert(attr as u32);
+            }
+        }
+    }
+    out
+}
+
+/// Enabled barycentric `(I, J)` input VGPR pairs `(base_vgpr, hlsl_mode)` read outside `v_interp_*`.
+pub fn ps_bary_reads(insts: &[Decoded], ena: u32) -> Vec<(u64, &'static str)> {
+    let mut read_vgprs = BTreeSet::new();
+    for d in insts {
+        if !d.inst.name.starts_with("V_INTERP_") {
+            let (r, _) = rdna2::vgpr_uses(d);
+            read_vgprs.extend(r);
+        }
+    }
+    PS_BARY_PAIRS
+        .iter()
+        .filter_map(|&(bit, mode)| {
+            let base = ps_input_vgpr(ena, bit)?;
+            (read_vgprs.contains(&base) || read_vgprs.contains(&(base + 1))).then_some((base, mode))
+        })
+        .collect()
 }
 
 /// `lt` → ("<", signed) for s_cmp_* / s_cmpk_* suffixes like "eq_i32".
