@@ -419,6 +419,23 @@ pub fn enabled() -> bool {
     std::env::var("XCL_PER_LANE").is_ok_and(|v| v == "1")
 }
 
+/// Decoded instruction count at which `compute_with` leaves a compute program to #1426's
+/// compact form (matches `dxil::compact::large`'s 20,000-instruction threshold): the per-lane
+/// form has no compact loop-switch lowering, so giant programs expand to multi-megabyte DXIL
+/// that can OOM driver compilers.
+pub const MAX_INSTS: usize = 20_000;
+
+/// Maximum emitted DXIL container size (bytes) accepted from `compute_with` before falling
+/// back to #1426 (1 MiB).
+pub const MAX_DXIL_BYTES: usize = 1 << 20;
+
+fn check_dxil_size(dxil_bytes: usize) -> Result<(), String> {
+    if dxil_bytes > MAX_DXIL_BYTES {
+        return Err(format!("per-lane DXIL too large ({dxil_bytes} B > {MAX_DXIL_BYTES} B)"));
+    }
+    Ok(())
+}
+
 /// A compute program in its per-lane form with the runtime's options `o` (`pso::direct_compute`):
 /// the container and its static samplers.
 pub fn compute_with(code: &[u8], cs: &super::CsInterface, o: KernelOptions) -> Result<crate::gpu::dxil::kernel::Kernel, String> {
@@ -429,13 +446,16 @@ pub fn compute_with(code: &[u8], cs: &super::CsInterface, o: KernelOptions) -> R
         off += d.len;
         insts.push(d);
     }
+    if insts.len() >= MAX_INSTS {
+        return Err(format!("program too large for the per-lane form ({} instructions >= {MAX_INSTS})", insts.len()));
+    }
     crate::gpu::rdna2::resolve_far_jumps(&mut insts);
     if o.wave64 && o.split {
         refuse_split_real_lds(&insts)?;
     }
     // as `kernel::translate_entry`: a thread with a large stack, a panic is a refusal
     let cs = cs.clone();
-    std::thread::Builder::new()
+    let k = std::thread::Builder::new()
         .name("xcl-per-lane".into())
         .stack_size(256 << 20)
         .spawn(move || {
@@ -447,7 +467,9 @@ pub fn compute_with(code: &[u8], cs: &super::CsInterface, o: KernelOptions) -> R
         .map_err(|e| {
             let msg = e.downcast_ref::<String>().cloned().or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_default();
             format!("the per-lane lowering panicked: {msg}")
-        })?
+        })??;
+    check_dxil_size(k.dxil.len())?;
+    Ok(k)
 }
 
 #[cfg(test)]
@@ -1191,5 +1213,25 @@ mod tests {
                 assert_eq!(gpu[g * 128 + l], if (1..32).contains(&l) { 5 } else { 0 }, "group {g}, lane {l}");
             }
         }
+    }
+
+    #[test]
+    fn compute_with_refuses_giant_programs_for_compact_fallback() {
+        let mut cs = compute_cs();
+        cs.threads = [64, 1, 1];
+        let nop = crate::gpu::rdna2::encode("S_NOP", "ENC_SOPP", &[("SIMM16", 0)], None).unwrap();
+        let end = crate::gpu::rdna2::encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap();
+        let mut code = Vec::with_capacity(super::MAX_INSTS * 4);
+        for _ in 0..super::MAX_INSTS - 1 {
+            code.extend_from_slice(&nop);
+        }
+        code.extend_from_slice(&end);
+        let o = super::KernelOptions { wave64: true, split: true, mem_windows: 1, sampler_base: 0 };
+        let err = super::compute_with(&code, &cs, o).err().expect("program at MAX_INSTS must be refused");
+        assert!(err.contains("program too large for the per-lane form"), "unexpected error: {err}");
+
+        assert!(super::check_dxil_size(super::MAX_DXIL_BYTES).is_ok());
+        let err_sz = super::check_dxil_size(super::MAX_DXIL_BYTES + 1).unwrap_err();
+        assert!(err_sz.contains("per-lane DXIL too large"), "unexpected error: {err_sz}");
     }
 }
