@@ -1146,7 +1146,9 @@ mod tests {
     /// wave64 group reaches (Pipodi's point 5 on #1745): a nested `if` whose condition goes to
     /// `s_and_saveexec`. #1426 would ballot the compare's mask through an exchange, a group
     /// barrier the upper half never reaches. The bridge reads back only each lane's bit, so this
-    /// half's ballot is enough, and the only barrier left is the one at the start.
+    /// half's ballot is enough, and no group barrier appears past the entry block's branch, where
+    /// only one half may be. The barriers are all in the entry block, which every lane of both
+    /// halves reaches.
     #[test]
     fn a_bridged_mask_write_where_one_half_is_elsewhere_meets_no_barrier() {
         let lines: &[I] = &[
@@ -1176,10 +1178,14 @@ mod tests {
             return runner::skip_test("no DXC");
         }
         let text = crate::gpu::dxil::validate::disassemble(&dxil).unwrap();
-        let (_, after_entry) = text.split_once("\n  br ").unwrap_or_else(|| panic!("expected branch in program:\n{text}"));
-        let divergent_barriers = after_entry.lines().filter(|l| l.contains("call void @dx.op.barrier")).count();
+        let barriers = |s: &str| s.lines().filter(|l| l.contains("call void @dx.op.barrier")).count();
+        let (entry, after_entry) = text.split_once("\n  br ").unwrap_or_else(|| panic!("expected branch in program:\n{text}"));
+        // the halves take their console lanes (and exchange the whole-wave EXEC condition of
+        // `s_cbranch_execz`) at group barriers in the entry block, where every lane is: without
+        // one there the program is not the split form this test is about
+        assert!(barriers(entry) >= 1, "no group barrier in the entry block:\n{text}");
         // after the entry whole-wave branch, only one half reaches the body so no group barrier may appear there
-        assert_eq!(divergent_barriers, 0, "group barriers after entry branch:\n{text}");
+        assert_eq!(barriers(after_entry), 0, "group barriers after entry branch:\n{text}");
         if !gpu() {
             return;
         }
