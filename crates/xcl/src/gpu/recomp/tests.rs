@@ -3637,6 +3637,115 @@ fn gpu_packed_math_dots_movrel() {
 }
 
 #[test]
+fn gpu_packed_f16_fma_min_max_dot2c_and_pack() {
+    if !gpu_ready() {
+        return;
+    }
+    let p = prog(&[
+        // v_pk_fma_f16: plain (lo = a.lo*b.lo+c.lo, hi = a.hi*b.hi+c.hi)
+        ("V_PK_FMA_F16", "ENC_VOP3P", &[("VDST", 3), ("SRC0", V), ("SRC1", V + 1), ("SRC2", V + 2), ("OP_SEL_HI", 3), ("OP_SEL_HI_2", 1)], None),
+        // v_pk_fma_f16: swapped halves, per-half neg, clamp -> lo = sat(a.hi*(-b.lo)+c.lo), hi = sat(a.lo*b.hi+(-c.lo))
+        ("V_PK_FMA_F16", "ENC_VOP3P", &[("VDST", 4), ("SRC0", V), ("SRC1", V + 1), ("SRC2", V + 2), ("OP_SEL", 0b001), ("OP_SEL_HI", 0b10), ("OP_SEL_HI_2", 0), ("NEG", 0b010), ("NEG_HI", 0b100), ("CLAMP", 1)], None),
+        // v_pk_min_f16 / v_pk_max_f16: plain
+        ("V_PK_MIN_F16", "ENC_VOP3P", &[("VDST", 5), ("SRC0", V), ("SRC1", V + 1), ("OP_SEL_HI", 3)], None),
+        ("V_PK_MAX_F16", "ENC_VOP3P", &[("VDST", 6), ("SRC0", V), ("SRC1", V + 1), ("OP_SEL_HI", 3)], None),
+        // v_pk_min_f16: lo = sat(min(a.hi, -b.lo)), hi = sat(min(-a.lo, b.hi))
+        ("V_PK_MIN_F16", "ENC_VOP3P", &[("VDST", 7), ("SRC0", V), ("SRC1", V + 1), ("OP_SEL", 0b01), ("OP_SEL_HI", 0b10), ("NEG", 0b10), ("NEG_HI", 0b01), ("CLAMP", 1)], None),
+        // v_pk_max_f16: lo = sat(max(-a.lo, b.lo)), hi = sat(max(a.hi, -b.hi))
+        ("V_PK_MAX_F16", "ENC_VOP3P", &[("VDST", 8), ("SRC0", V), ("SRC1", V + 1), ("OP_SEL_HI", 3), ("NEG", 0b01), ("NEG_HI", 0b10), ("CLAMP", 1)], None),
+        // v_dot2c_f32_f16: accumulate twice into v9
+        ("V_DOT2C_F32_F16", "ENC_VOP2", &[("VDST", 9), ("SRC0", V), ("VSRC1", 1)], None),
+        ("V_DOT2C_F32_F16", "ENC_VOP2", &[("VDST", 9), ("SRC0", V + 2), ("VSRC1", 1)], None),
+        // v_pack_b32_f16: all four OP_SEL[1:0] half pairings
+        ("V_PACK_B32_F16", "ENC_VOP3", &[("VDST", 10), ("SRC0", V), ("SRC1", V + 1), ("OP_SEL", 0b00)], None),
+        ("V_PACK_B32_F16", "ENC_VOP3", &[("VDST", 11), ("SRC0", V), ("SRC1", V + 1), ("OP_SEL", 0b01)], None),
+        ("V_PACK_B32_F16", "ENC_VOP3", &[("VDST", 12), ("SRC0", V), ("SRC1", V + 1), ("OP_SEL", 0b10)], None),
+        ("V_PACK_B32_F16", "ENC_VOP3", &[("VDST", 13), ("SRC0", V), ("SRC1", V + 1), ("OP_SEL", 0b11)], None),
+    ]);
+    let cases: &[(f32, f32, f32, f32, f32, f32, f32)] = &[
+        // (a_lo, a_hi, b_lo, b_hi, c_lo, c_hi, acc0)
+        (1.5, -2.0, 2.0, 0.5, -1.0, 3.0, 10.0),
+        (-0.5, 0.25, -1.5, 2.0, 0.25, -0.5, -2.5),
+        (0.0, 1.0, -0.25, 1.0, 0.5, 0.0, 0.0),
+        (2.5, -0.5, 0.5, -1.5, 1.0, -2.0, 4.25),
+    ];
+    let h = half_bits;
+    let sat = |x: f32| x.clamp(0.0, 1.0);
+    let mut st = KernelState::default();
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        let (al, ah, bl, bh, cl, ch, acc0) = cases[l % cases.len()];
+        r[0] = h(al) | (h(ah) << 16);
+        r[1] = h(bl) | (h(bh) << 16);
+        r[2] = h(cl) | (h(ch) << 16);
+        r[9] = f(acc0);
+    }
+    let r = runner::run_program(&p, &st, &[]).unwrap().0;
+    for l in 0..64usize {
+        let (al, ah, bl, bh, cl, ch, acc0) = cases[l % cases.len()];
+        let v = &r.vgpr[l];
+        assert_eq!(v[3], h(al * bl + cl) | (h(ah * bh + ch) << 16), "lane {l} v_pk_fma_f16");
+        assert_eq!(v[4], h(sat(ah * (-bl) + cl)) | (h(sat(al * bh - cl)) << 16), "lane {l} v_pk_fma_f16 op_sel/neg/clamp");
+        assert_eq!(v[5], h(al.min(bl)) | (h(ah.min(bh)) << 16), "lane {l} v_pk_min_f16");
+        assert_eq!(v[6], h(al.max(bl)) | (h(ah.max(bh)) << 16), "lane {l} v_pk_max_f16");
+        assert_eq!(v[7], h(sat(ah.min(-bl))) | (h(sat((-al).min(bh))) << 16), "lane {l} v_pk_min_f16 op_sel/neg/clamp");
+        assert_eq!(v[8], h(sat((-al).max(bl))) | (h(sat(ah.max(-bh))) << 16), "lane {l} v_pk_max_f16 neg/clamp");
+        let want_dot = acc0 + al * bl + ah * bh + cl * bl + ch * bh;
+        assert_eq!(f32::from_bits(v[9]), want_dot, "lane {l} v_dot2c_f32_f16");
+        assert_eq!(v[10], h(al) | (h(bl) << 16), "lane {l} v_pack_b32_f16 op_sel=00");
+        assert_eq!(v[11], h(ah) | (h(bl) << 16), "lane {l} v_pack_b32_f16 op_sel=01");
+        assert_eq!(v[12], h(al) | (h(bh) << 16), "lane {l} v_pack_b32_f16 op_sel=10");
+        assert_eq!(v[13], h(ah) | (h(bh) << 16), "lane {l} v_pack_b32_f16 op_sel=11");
+    }
+}
+
+#[test]
+fn gpu_f16_fmac_fmamk_fmaak() {
+    if !gpu_ready() {
+        return;
+    }
+    let h = half_bits;
+    let lit_k_mul = 0xDEAD_0000 | h(2.0);
+    let lit_k_add = 0xC0DE_0000 | h(-1.5);
+    let p = prog(&[
+        // VOP2 v_fmac_f16: v2.lo = v0.lo * v1.lo + v2.lo, keeping v2.hi
+        ("V_FMAC_F16", "ENC_VOP2", &[("VDST", 2), ("SRC0", V), ("VSRC1", 1)], None),
+        // VOP3 v_fmac_f16: v3.hi = sat(v0.lo * v1.hi + v3.hi), keeping v3.lo
+        ("V_FMAC_F16", "ENC_VOP3", &[("VDST", 3), ("SRC0", V), ("SRC1", V + 1), ("OP_SEL", 0b1010), ("CLAMP", 1)], None),
+        // VOP2 v_fmamk_f16: v4.lo = v0.lo * K + v1.lo, ignoring K[31:16] and keeping v4.hi
+        ("V_FMAMK_F16", "ENC_VOP2", &[("VDST", 4), ("SRC0", V), ("VSRC1", 1)], Some(lit_k_mul)),
+        // VOP2 v_fmaak_f16: v5.lo = v0.lo * v1.lo + K, ignoring K[31:16] and keeping v5.hi
+        ("V_FMAAK_F16", "ENC_VOP2", &[("VDST", 5), ("SRC0", V), ("VSRC1", 1)], Some(lit_k_add)),
+    ]);
+    let cases: &[(f32, f32, f32, f32, f32)] = &[
+        // (a_lo, b_lo, b_hi, acc_lo, acc_hi)
+        (1.5, 2.0, 0.5, -1.0, 0.25),
+        (-0.5, 1.5, -2.0, 0.75, 0.5),
+        (0.0, -3.0, 4.0, 2.25, -0.25),
+        (2.0, -0.5, 0.25, 1.0, 0.25),
+    ];
+    let sat = |x: f32| x.clamp(0.0, 1.0);
+    let mut st = KernelState::default();
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        let (al, bl, bh, acc_lo, acc_hi) = cases[l % cases.len()];
+        r[0] = h(al) | (h(7.5) << 16);
+        r[1] = h(bl) | (h(bh) << 16);
+        r[2] = h(acc_lo) | (0xBEEF << 16);
+        r[3] = 0xCAFE | (h(acc_hi) << 16);
+        r[4] = h(0.0) | (0xA55A << 16);
+        r[5] = h(0.0) | (0x5AA5 << 16);
+    }
+    let r = runner::run_program(&p, &st, &[]).unwrap().0;
+    for l in 0..64usize {
+        let (al, bl, bh, acc_lo, acc_hi) = cases[l % cases.len()];
+        let v = &r.vgpr[l];
+        assert_eq!(v[2], h(al * bl + acc_lo) | (0xBEEF << 16), "lane {l} v_fmac_f16 (VOP2)");
+        assert_eq!(v[3], 0xCAFE | (h(sat(al * bh + acc_hi)) << 16), "lane {l} v_fmac_f16 (VOP3 op_sel/clamp)");
+        assert_eq!(v[4], h(al * 2.0 + bl) | (0xA55A << 16), "lane {l} v_fmamk_f16");
+        assert_eq!(v[5], h(al * bl - 1.5) | (0x5AA5 << 16), "lane {l} v_fmaak_f16");
+    }
+}
+
+#[test]
 fn dxc_mesh_shader_probe() {
     use super::dxc;
     if dxc::location().is_err() {
