@@ -750,6 +750,27 @@ mod tests {
         assert_eq!(optimal_mode(0, 0, 32, 256, 256), 5);
     }
 
+    #[test]
+    fn optimal_mode_priority_rules() {
+        assert_eq!(optimal_mode(2, 0b111, 32, 256, 256), 24);
+        assert_eq!(optimal_mode(2, 0b101, 32, 256, 256), 10);
+        assert_eq!(optimal_mode(0, 0b101, 32, 256, 256), 27);
+        assert_eq!(optimal_mode(0, 0, 32, 256, 256), 5);
+        assert_eq!(optimal_mode(0, 4, 1, 0x8_0000, 1), 21);
+    }
+
+    #[test]
+    fn optimal_mode_uav_size_threshold() {
+        assert_eq!(optimal_mode(0, 4, 1, 0x7_FFFF, 1), 21);
+        assert_eq!(optimal_mode(0, 4, 1, 0x8_0000, 1), 21);
+        assert_eq!(optimal_mode(0, 4, 1, 0x8_0001, 1), 27);
+    }
+
+    #[test]
+    fn optimal_mode_default_fallback() {
+        assert_eq!(optimal_mode(0, 4, 32, 256, 256), 27);
+    }
+
     fn usages_and_bytes(t: &Texture) -> Vec<(u32, u32)> {
         t.planes.iter().map(|p| (p.usage, if let PlaneKind::Surface(s) = &p.kind { s.bpe } else { 0 })).collect()
     }
