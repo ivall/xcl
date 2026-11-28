@@ -12,13 +12,16 @@
 param(
     [Parameter(Mandatory = $true)][string]$Game,
     [int]$Seconds = 60,
-    [string]$Xcl = (Join-Path $PSScriptRoot '..\target\release\xcl.exe'),
+    [string]$Xcl,
     [string]$Title,
     [string]$OutDir,
     # Additional time for launcher work such as shader preparation before the guest timer starts.
     [ValidateRange(1,86400)][int]$StartupTimeoutSeconds = 120
 )
 $ErrorActionPreference = 'Stop'
+# Windows PowerShell 5.1 leaves $PSScriptRoot empty in this script's parameter defaults when it is
+# started with -File, so the default is set here
+if (-not $Xcl) { $Xcl = Join-Path $PSScriptRoot '..\target\release\xcl.exe' }
 
 if ($PSBoundParameters.ContainsKey('Title')) {
     $Title = $Title.Trim()
