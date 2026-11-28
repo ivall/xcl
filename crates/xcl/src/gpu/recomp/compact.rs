@@ -1,0 +1,606 @@
+//! Compact form of a very large program: every distinct block text is emitted once.
+//!
+//! DXC inlines every function of a cs_6_x target, so HLSL helpers do not share code: the
+//! 3,281 buffer loads of a retail program become 3,281 copies of the format conversion. Here
+//! the program is cut into blocks (at the leaders, and around every instruction whose HLSL is
+//! long), each instruction is emitted by `emit::Em` exactly as in `translate`, with its
+//! temporaries numbered from t1, and blocks with the same text and branch condition share one
+//! `case` of a dispatch loop. A branch goes to the block at an offset from its own: the offset
+//! most of a case's blocks jump by, and for the others the target by block index (`select`),
+//! so the table (`XCL_BT`) only gives every block, in address order, its case; falling through
+//! goes to the next block. The block index is the same in every lane (branch conditions are
+//! wave-uniform), as `pc` of the guarded block chain is, so the split-wave64 halves walk the
+//! same blocks.
+
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::fmt::Write as _;
+
+use super::{emit, prepare, rdna2, Mode, Options, Prepared, Translation, LOOP_GUARD};
+
+/// Programs with fewer instructions keep the normal form (`compact_wanted`).
+pub const COMPACT_MIN_INSTRUCTIONS: usize = 20_000;
+
+/// An instruction whose HLSL is longer than this (bytes) is a block of its own, so the blocks
+/// around it can still be shared when their other instructions differ.
+const HEAVY: usize = 600;
+
+/// Largest table (32-bit words). A static array is constant data for the driver: on an
+/// RTX 5070 Ti, CreateComputePipelineState took 12,288 words and failed with E_OUTOFMEMORY
+/// at 15,360. A table the usual packing makes larger is packed across words; the program falls
+/// back to `translate` only when that is still larger.
+const MAX_TABLE_WORDS: usize = 8192;
+
+/// The compact form pays: at least `COMPACT_MIN_INSTRUCTIONS` instructions, and the distinct
+/// blocks (equal code, branch targets aside) hold under 30 % of them. A function of the code
+/// alone; nothing is emitted.
+pub fn compact_wanted(code: &[u8]) -> bool {
+    // an instruction has at least 4 bytes
+    if code.len() < 4 * COMPACT_MIN_INSTRUCTIONS {
+        return false;
+    }
+    let mut insts = Vec::new();
+    let mut off = 0usize;
+    while off + 4 <= code.len() {
+        let Ok(d) = rdna2::decode(&code[off..], off as u64) else { return false };
+        off += d.len;
+        insts.push(d);
+    }
+    if insts.len() < COMPACT_MIN_INSTRUCTIONS {
+        return false;
+    }
+    rdna2::resolve_far_jumps(&mut insts);
+    let mut leaders = BTreeSet::new();
+    for d in &insts {
+        let t = rdna2::branch_target(d);
+        if t.is_some() || d.inst.flags & rdna2::F_TERMINATOR != 0 {
+            leaders.insert(d.pc + d.len as u64);
+        }
+        leaders.extend(t);
+    }
+    // a block's key: its code, without the last instruction's bytes when that one branches
+    let mut seen: HashSet<(&[u8], &str)> = HashSet::new();
+    let (mut distinct, mut first, mut start) = (0usize, 0usize, 0usize);
+    for (k, d) in insts.iter().enumerate() {
+        let end = d.pc as usize + d.len;
+        if k + 1 < insts.len() && !leaders.contains(&(end as u64)) {
+            continue;
+        }
+        let key = if rdna2::branch_target(d).is_some() { (&code[start..d.pc as usize], d.inst.name) } else { (&code[start..end], "") };
+        if seen.insert(key) {
+            distinct += k + 1 - first;
+        }
+        (first, start) = (k + 1, end);
+    }
+    distinct * 10 < insts.len() * 3
+}
+
+/// `recomp::translate` in the compact form (same contract and output; `Translation::blocks`
+/// is the number of distinct block texts). A program without branches gets `translate`'s
+/// straight-line form; geometry programs (ES → GS through s_setpc) are not supported.
+pub fn translate_compact(code: &[u8], opt: &Options) -> Result<Translation, String> {
+    compact(code, opt, HEAVY, MAX_TABLE_WORDS)
+}
+
+/// One block in address order: its text, and the branch that ends it (condition, empty when
+/// it always jumps; target).
+struct Block {
+    pc: u64,
+    text: String,
+    branch: Option<(String, u64)>,
+}
+
+fn block(pc: u64, mut text: String, flow: emit::Flow) -> Result<Block, String> {
+    let branch = match flow {
+        emit::Flow::Next => None,
+        emit::Flow::Jump(t) => Some((String::new(), t)),
+        emit::Flow::Cond(c, t) => Some((c, t)),
+        emit::Flow::End => {
+            text.push_str("            xcl_nb = 0xFFFFFFFFu;\n");
+            None
+        }
+        emit::Flow::JumpExpr(_) => return Err(format!("+{pc:#x}: compact form: computed jump")),
+    };
+    Ok(Block { pc, text, branch })
+}
+
+/// The HLSL of one instruction without its comment lines; in its own scope when it declares
+/// temporaries (every instruction numbers them from t1).
+fn inst_text(em: &mut emit::Em, d: &rdna2::Decoded, next: u64) -> (String, emit::Flow) {
+    em.reset_temps();
+    let flow = em.inst(d, next);
+    let temps = em.reset_temps();
+    let mut s = String::new();
+    for l in em.take().lines().filter(|l| !l.trim_start().starts_with("//")) {
+        s.push_str(l);
+        s.push('\n');
+    }
+    if temps > 0 && !s.is_empty() {
+        s = format!("            {{\n{s}            }}\n");
+    }
+    (s, flow)
+}
+
+/// The blocks of the program in address order (`heavy`: see `HEAVY`).
+fn blocks(insts: &[rdna2::Decoded], leaders: &BTreeSet<u64>, em: &mut emit::Em, heavy: usize) -> Result<Vec<Block>, String> {
+    em.indent = 3;
+    let mut out = Vec::new();
+    // the open block: its address and text; `dead`: after the block's last instruction
+    let mut open: Option<(u64, String)> = None;
+    let mut dead = false;
+    for (i, d) in insts.iter().enumerate() {
+        if leaders.contains(&d.pc) {
+            if let Some((pc, text)) = open.take() {
+                out.push(block(pc, text, emit::Flow::Next)?);
+            }
+            dead = false;
+        }
+        if dead {
+            continue;
+        }
+        let next = insts.get(i + 1).map(|n| n.pc).unwrap_or(u64::MAX);
+        let (text, flow) = inst_text(em, d, next);
+        if text.len() > heavy && matches!(flow, emit::Flow::Next) {
+            if let Some((pc, text)) = open.take() {
+                out.push(block(pc, text, emit::Flow::Next)?);
+            }
+            out.push(block(d.pc, text, flow)?);
+            continue;
+        }
+        let (pc, mut body) = open.take().unwrap_or((d.pc, String::new()));
+        body.push_str(&text);
+        if matches!(flow, emit::Flow::Next) {
+            open = Some((pc, body));
+        } else {
+            out.push(block(pc, body, flow)?);
+            dead = true;
+        }
+    }
+    if let Some((pc, text)) = open.take() {
+        out.push(block(pc, text, emit::Flow::Next)?);
+    }
+    Ok(out)
+}
+
+/// The setting of `XCL_COMPACT_NEST`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Nest {
+    /// One switch over all cases.
+    Flat,
+    /// Groups of this many cases (a power of two up to `MAX_NEST`).
+    Groups(usize),
+    /// `AUTO_GROUP` cases per group for a program of `NEST_MIN_CASES` cases or more, flat below.
+    Auto,
+}
+
+impl From<usize> for Nest {
+    fn from(p: usize) -> Nest {
+        if p == 0 { Nest::Flat } else { Nest::Groups(p) }
+    }
+}
+
+/// `XCL_COMPACT_NEST=<P>`: the dispatch loop switches in two levels, on `case >> log2(P)` and
+/// then inside the group of P cases (`compact_with`). A power of two up to `MAX_NEST`; `0`: one
+/// switch over all cases; unset or `auto`: groups of `AUTO_GROUP` from `NEST_MIN_CASES` cases
+/// on, one switch below. Anything else warns and keeps `auto`. Read once.
+pub(super) fn nest_from_env() -> Nest {
+    static S: std::sync::OnceLock<Nest> = std::sync::OnceLock::new();
+    *S.get_or_init(|| nest_of(std::env::var("XCL_COMPACT_NEST").ok().as_deref()))
+}
+
+/// The setting for a value of `XCL_COMPACT_NEST` (`None`: unset).
+fn nest_of(v: Option<&str>) -> Nest {
+    let Some(v) = v else { return Nest::Auto };
+    parse_nest(v).unwrap_or_else(|| {
+        crate::xlog_warn!("[SHADER] XCL_COMPACT_NEST={v:?} is not 0, auto or a power of two up to {MAX_NEST} – auto");
+        Nest::Auto
+    })
+}
+
+/// The group size of the two-level dispatch is at most this: a shift of 32 or more is masked
+/// by HLSL to a shift of 0.
+const MAX_NEST: usize = 1 << 16;
+
+/// `XCL_COMPACT_NEST=auto` nests programs of at least this many cases (distinct texts). Measured
+/// on an RTX 4090 with a cold driver: 751 cases 11.6 s flat, 5.9 s nested; 698 cases 9.5 s, 4.8 s;
+/// 2,516 cases 168 s, 36 s. Groups of 16, 32 and 64 tie. 512 is below the smallest program
+/// measured; on RADV the ~700-case ones built up to 28 % slower nested.
+const NEST_MIN_CASES: usize = 512;
+
+/// The group size of `Nest::Auto`.
+const AUTO_GROUP: usize = 32;
+
+fn parse_nest(v: &str) -> Option<Nest> {
+    let v = v.trim();
+    if v.eq_ignore_ascii_case("auto") {
+        return Some(Nest::Auto);
+    }
+    v.parse::<usize>().ok().filter(|&p| p == 0 || (p.is_power_of_two() && p <= MAX_NEST)).map(Nest::from)
+}
+
+/// The group size (0 = flat) for a program of `cases` cases.
+fn resolve_nest(nest: Nest, cases: usize, min_cases: usize) -> usize {
+    match nest {
+        Nest::Flat => 0,
+        Nest::Groups(p) => p,
+        Nest::Auto if cases >= min_cases => AUTO_GROUP,
+        Nest::Auto => 0,
+    }
+}
+
+/// `translate_compact` with the bound `heavy` (`HEAVY`); a table of more than `dense_above`
+/// words is packed across words.
+pub(super) fn compact(code: &[u8], opt: &Options, heavy: usize, dense_above: usize) -> Result<Translation, String> {
+    compact_at(code, opt, heavy, dense_above, nest_from_env(), NEST_MIN_CASES)
+}
+
+/// `compact` with the group size of the two-level dispatch given (0 = flat).
+/// DXC folds the groups' exits back into one merge block with a phi operand per case unless
+/// each group ends in `xcl_nb = min(xcl_nb, n)`, which it cannot see through.
+pub(super) fn compact_with(code: &[u8], opt: &Options, heavy: usize, dense_above: usize, nest: usize) -> Result<Translation, String> {
+    compact_at(code, opt, heavy, dense_above, Nest::from(nest), NEST_MIN_CASES)
+}
+
+/// `compact_with` with the setting (`nest_from_env`): `Nest::Auto` is resolved once the cases
+/// are counted, nesting from `min_cases` cases on.
+fn compact_at(code: &[u8], opt: &Options, heavy: usize, dense_above: usize, nest: Nest, min_cases: usize) -> Result<Translation, String> {
+    if matches!(opt.mode, Mode::Geometry(_)) {
+        return Err("compact form: geometry programs are not supported".into());
+    }
+    let Prepared { insts, leaders, branches, mut em, .. } = prepare(code, opt)?;
+    if branches == 0 {
+        return super::translate_inner(code, opt);
+    }
+    let list = blocks(&insts, &leaders, &mut em, heavy)?;
+    let n = list.len();
+    let at: HashMap<u64, usize> = list.iter().enumerate().map(|(k, b)| (b.pc, k)).collect();
+    // the distinct texts (with the address of the first block of each), keyed on the code and
+    // the branch condition: the target is data, one per block of the text (`targets`)
+    let mut texts: Vec<(String, u64)> = Vec::new();
+    let mut index: HashMap<String, usize> = HashMap::new();
+    let mut conds: Vec<Option<String>> = Vec::new();
+    let mut targets: Vec<Vec<(usize, usize)>> = Vec::new();
+    let mut class = Vec::with_capacity(n);
+    for (k, b) in list.into_iter().enumerate() {
+        let mut key = b.text;
+        let mut to = None;
+        if let Some((cond, t)) = &b.branch {
+            to = Some(*at.get(t).ok_or_else(|| format!("+{:#x}: branch to {t:#x}, which starts no block", b.pc))?);
+            let _ = writeln!(key, "\u{1}{cond}");
+        }
+        let c = match index.get(&key) {
+            Some(&c) => c,
+            None => {
+                index.insert(key.clone(), texts.len());
+                conds.push(b.branch.map(|(cond, _)| cond));
+                targets.push(Vec::new());
+                texts.push((key, b.pc));
+                texts.len() - 1
+            }
+        };
+        if let Some(to) = to {
+            targets[c].push((k, to));
+        }
+        class.push(c as u32);
+    }
+    // a text's branch: the offset most of its blocks jump by, and the target of each other
+    // block by its index (`select`, no branch: the index is wave-uniform)
+    for (c, (text, _)) in texts.iter_mut().enumerate() {
+        let Some(cond) = &conds[c] else { continue };
+        text.truncate(text.rfind('\u{1}').unwrap());
+        let mut count: HashMap<i64, usize> = HashMap::new();
+        for &(k, to) in &targets[c] {
+            *count.entry(to as i64 - k as i64).or_default() += 1;
+        }
+        let d = *count.iter().max_by_key(|&(d, n)| (*n, -d.abs(), *d)).unwrap().0;
+        let off = if d >= 0 { format!("xcl_b + {d}u") } else { format!("xcl_b - {}u", -d) };
+        let nb = if count.len() == 1 {
+            off
+        } else {
+            let _ = writeln!(text, "            uint xcl_t = {off};");
+            let minority: Vec<(usize, usize)> = targets[c].iter().copied().filter(|&(k, to)| to as i64 - k as i64 != d).collect();
+            pick_targets(text, &minority, MAX_SELECTS, 0);
+            "xcl_t".to_string()
+        };
+        let _ = if cond.is_empty() { writeln!(text, "            xcl_nb = {nb};") } else { writeln!(text, "            if ({cond}) xcl_nb = {nb};") };
+    }
+    // the table: the blocks' cases, `per` to a word; past `dense_above` words, packed across
+    // words (`bits` from bit `xcl_b * bits`; one word of padding for the second read)
+    let bits = (usize::BITS - texts.len().saturating_sub(1).leading_zeros()).max(1);
+    let per = (32 / bits) as usize;
+    let mut words: Vec<u32> = class.chunks(per).map(|c| c.iter().enumerate().fold(0u32, |w, (j, &v)| w | v << (j as u32 * bits))).collect();
+    let dense = words.len() > dense_above;
+    if dense {
+        words = vec![0u32; (n * bits as usize).div_ceil(32) + 1];
+        for (b, &v) in class.iter().enumerate() {
+            let p = b * bits as usize;
+            let (w, s) = (p / 32, (p % 32) as u32);
+            words[w] |= v << s;
+            if s + bits > 32 {
+                words[w + 1] |= v >> (32 - s);
+            }
+        }
+    }
+    if words.len() > MAX_TABLE_WORDS {
+        return Err(format!("compact form: {n} blocks of {} texts need a {}-word table (at most {MAX_TABLE_WORDS})", texts.len(), words.len()));
+    }
+    let mut body = String::new();
+    let _ = writeln!(body, "    static const uint XCL_BT[{}] = {{", words.len());
+    for row in words.chunks(16) {
+        let row: Vec<String> = row.iter().map(|v| format!("{v:#x}u")).collect();
+        let _ = writeln!(body, "        {},", row.join(", "));
+    }
+    body.push_str("    };\n    uint xcl_b = 0u;\n    [loop] for (;;) {\n        uint xcl_nb = xcl_b + 1u;\n");
+    let mask = (1u64 << bits) - 1;
+    let selector = if dense {
+        let _ = writeln!(body, "        uint xcl_p = xcl_b * {bits}u;");
+        format!("((XCL_BT[xcl_p >> 5u] >> (xcl_p & 31u)) | ((XCL_BT[(xcl_p >> 5u) + 1u] << 1u) << (31u - (xcl_p & 31u)))) & {mask:#x}u")
+    } else {
+        format!("(XCL_BT[xcl_b / {per}u] >> (xcl_b % {per}u * {bits}u)) & {mask:#x}u")
+    };
+    let nest = resolve_nest(nest, texts.len(), min_cases);
+    if nest > 0 {
+        let _ = writeln!(body, "        uint xcl_c = {selector};");
+        let _ = writeln!(body, "        switch (xcl_c >> {}u) {{", nest.trailing_zeros());
+        for (g, group) in texts.chunks(nest).enumerate() {
+            let _ = writeln!(body, "        case {g}u: switch (xcl_c) {{");
+            for (j, (text, pc)) in group.iter().enumerate() {
+                let _ = write!(body, "        case {}u: {{ // {pc:x}\n{text}        }} break;\n", g * nest + j);
+            }
+            let _ = writeln!(body, "        default: xcl_nb = 0xFFFFFFFFu; break;");
+            let _ = writeln!(body, "        }} xcl_nb = min(xcl_nb, {n}u); break;");
+        }
+    } else {
+        let _ = writeln!(body, "        switch ({selector}) {{");
+        for (k, (text, pc)) in texts.iter().enumerate() {
+            let _ = write!(body, "        case {k}u: {{ // {pc:x}\n{text}        }} break;\n");
+        }
+    }
+    body.push_str("        default: xcl_nb = 0xFFFFFFFFu; break;\n        }\n");
+    let _ = writeln!(body, "        if (xcl_nb >= {n}u) break;");
+    // a back edge spends the loop budget (LOOP_GUARD, 65,536 per lane); once it is spent the
+    // program ends, as in the guarded block chain. The structured form instead leaves the
+    // loop and runs what follows.
+    let _ = writeln!(body, "        if (xcl_nb <= xcl_b) {{ {LOOP_GUARD} }}");
+    body.push_str("        xcl_b = xcl_nb;\n    }\n");
+    let hlsl = em.finish(&body);
+    let static_samplers = em.static_used.clone();
+    let dispatch_remap = em.remap().map(|(ratio, dim, _)| (ratio, dim as u32));
+    Ok(Translation {
+        hlsl,
+        unsupported: em.unsupported,
+        unsupported_why: em.unsupported_why,
+        ignored: em.ignored,
+        instructions: insts.len(),
+        blocks: texts.len(),
+        static_samplers,
+        dispatch_remap,
+    })
+}
+
+/// The most selects a case evaluates for its branch target; a longer list is searched through
+/// a tree on the block index first.
+pub(super) const MAX_SELECTS: usize = 32;
+
+/// The lines that set `xcl_t` for the blocks of `list` (block, target; sorted by block): one
+/// select each, or, past `max`, a `[branch] if (xcl_b < pivot)` that picks the half of the list
+/// holding the block (`xcl_b` is wave-uniform, so is the branch).
+fn pick_targets(text: &mut String, list: &[(usize, usize)], max: usize, depth: usize) {
+    let pad = " ".repeat(12 + 4 * depth);
+    if list.len() <= max {
+        for &(k, to) in list {
+            let _ = writeln!(text, "{pad}xcl_t = select(xcl_b == {k}u, {to}u, xcl_t);");
+        }
+        return;
+    }
+    let mid = (list.len().div_ceil(max) / 2) * max;
+    let _ = writeln!(text, "{pad}[branch] if (xcl_b < {}u) {{", list[mid].0);
+    pick_targets(text, &list[..mid], max, depth + 1);
+    let _ = writeln!(text, "{pad}}} else {{");
+    pick_targets(text, &list[mid..], max, depth + 1);
+    let _ = writeln!(text, "{pad}}}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::runner::{self, KernelState};
+    use super::*;
+    use crate::gpu::rdna2::encode;
+
+    const V: u64 = 256; // VALU source code of v0
+
+    type Inst<'a> = (&'a str, &'a str, &'a [(&'a str, u64)]);
+
+    fn prog(list: &[Inst]) -> Vec<u8> {
+        let mut v = Vec::new();
+        for (n, e, f) in list {
+            v.extend(encode(n, e, f, None).unwrap_or_else(|x| panic!("{n}: {x}")));
+        }
+        v
+    }
+
+    /// A scalar loop, then three exec-guarded regions (the first two with the same code, the
+    /// third skipped: no lane passes its compare).
+    fn guarded() -> Vec<u8> {
+        let mul: Inst = ("V_MUL_LO_U32", "ENC_VOP3", &[("VDST", 2), ("SRC0", V), ("SRC1", V)]);
+        let add: Inst = ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 3), ("SRC0", V + 2), ("VSRC1", 1)]);
+        let save: Inst = ("S_MOV_B64", "ENC_SOP1", &[("SDST", 2), ("SSRC0", 126)]);
+        let restore: Inst = ("S_MOV_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 2)]);
+        prog(&[
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 128)]),             // 0: s0 = 0
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 1), ("SSRC0", 138)]),             // 4: s1 = 10
+            ("S_ADD_U32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 0), ("SSRC1", 1)]),  // 8: s0 += s1
+            ("S_SUB_U32", "ENC_SOP2", &[("SDST", 1), ("SSRC0", 1), ("SSRC1", 129)]), // 12: s1 -= 1
+            ("S_CMP_LG_U32", "ENC_SOPC", &[("SSRC0", 1), ("SSRC1", 128)]),         // 16
+            ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0xFFFC)]),                 // 20: → 8
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 0)]),                // 24: v1 = s0
+            save,                                                                  // 28
+            ("V_CMPX_GT_U32", "ENC_VOPC", &[("SRC0", 148), ("VSRC1", 0)]),         // 32: 20 > v0
+            ("S_CBRANCH_EXECZ", "ENC_SOPP", &[("SIMM16", 3)]),                     // 36: → 52
+            mul,                                                                   // 40
+            add,                                                                   // 48
+            restore,                                                               // 52
+            ("V_CMPX_LT_U32", "ENC_VOPC", &[("SRC0", 158), ("VSRC1", 0)]),         // 56: 30 < v0
+            ("S_CBRANCH_EXECZ", "ENC_SOPP", &[("SIMM16", 3)]),                     // 60: → 76
+            mul,                                                                   // 64
+            add,                                                                   // 72
+            restore,                                                               // 76
+            ("V_CMPX_GT_U32", "ENC_VOPC", &[("SRC0", 128), ("VSRC1", 0)]),         // 80: 0 > v0
+            ("S_CBRANCH_EXECZ", "ENC_SOPP", &[("SIMM16", 1)]),                     // 84: → 92
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", 135)]),              // 88: v4 = 7
+            restore,                                                               // 92
+            ("S_ENDPGM", "ENC_SOPP", &[]),                                         // 96
+        ])
+    }
+
+    /// The two-level dispatch: `ceil(cases / P)` inner switches, every case once, one `min` per
+    /// group; with the nest off the text is the flat one.
+    #[test]
+    fn nested_dispatch_groups_the_cases() {
+        let code = guarded();
+        let opt = Options::default();
+        // every instruction a block of its own: enough cases for several groups
+        let flat = compact_with(&code, &opt, 0, MAX_TABLE_WORDS, 0).unwrap();
+        let cases = flat.hlsl.matches("u: { // ").count();
+        assert!(cases >= 9, "{}", flat.hlsl);
+        assert!(!flat.hlsl.contains("xcl_c") && !flat.hlsl.contains("min(xcl_nb") && flat.hlsl.contains("        switch ((XCL_BT[xcl_b / "), "{}", flat.hlsl);
+        let at = flat.hlsl.find("        if (xcl_nb >= ").unwrap() + "        if (xcl_nb >= ".len();
+        let n: usize = flat.hlsl[at..at + flat.hlsl[at..].find("u) break;").unwrap()].parse().unwrap();
+        for p in [2usize, 4, 8, 16] {
+            let t = compact_with(&code, &opt, 0, MAX_TABLE_WORDS, p).unwrap();
+            let groups = cases.div_ceil(p);
+            let h = &t.hlsl;
+            assert_eq!(h.matches("u: switch (xcl_c) {").count(), groups, "P = {p}: inner switches");
+            assert_eq!(h.matches(&format!("switch (xcl_c >> {}u) {{", p.trailing_zeros())).count(), 1, "P = {p}");
+            assert_eq!(h.matches(&format!("xcl_nb = min(xcl_nb, {n}u); break;")).count(), groups, "P = {p}: min per group");
+            assert_eq!(h.matches("min(xcl_nb").count(), groups, "P = {p}");
+            for k in 0..cases {
+                assert_eq!(h.matches(&format!("        case {k}u: {{ // ")).count(), 1, "P = {p}: case {k}");
+            }
+            assert_eq!(h.matches("u: { // ").count(), cases, "P = {p}");
+            assert_eq!(h.matches("default: xcl_nb = 0xFFFFFFFFu; break;").count(), groups + 1, "P = {p}: a default per group and the outer one");
+            assert!(t.complete() && t.blocks == flat.blocks && t.instructions == flat.instructions, "P = {p}");
+        }
+        // packed across words as well
+        let dense = compact_with(&code, &opt, 0, 0, 4).unwrap();
+        assert!(dense.hlsl.contains("uint xcl_p = xcl_b * ") && dense.hlsl.contains("uint xcl_c = ((XCL_BT[xcl_p >> 5u]"), "{}", dense.hlsl);
+    }
+
+    #[test]
+    fn the_nest_size_is_zero_or_a_power_of_two_up_to_the_limit() {
+        let g = |p| Some(Nest::Groups(p));
+        for (v, want) in [("0", Some(Nest::Flat)), ("1", g(1)), (" 32 ", g(32)), ("65536", g(65536)), ("auto", Some(Nest::Auto)), (" AUTO ", Some(Nest::Auto)), ("131072", None), ("4294967296", None), ("48", None), ("-1", None), ("x", None), ("", None)] {
+            assert_eq!(parse_nest(v), want, "{v:?}");
+        }
+    }
+
+    #[test]
+    fn an_unset_nest_is_auto() {
+        assert_eq!([None, Some("auto"), Some("0"), Some("32"), Some("48")].map(nest_of), [Nest::Auto, Nest::Auto, Nest::Flat, Nest::Groups(32), Nest::Auto]);
+    }
+
+    #[test]
+    fn auto_nest_starts_at_the_case_threshold() {
+        assert_eq!(NEST_MIN_CASES, 512);
+        assert_eq!([(0, Nest::Auto), (511, Nest::Auto), (512, Nest::Auto), (9000, Nest::Auto)].map(|(n, s)| resolve_nest(s, n, NEST_MIN_CASES)), [0, 0, AUTO_GROUP, AUTO_GROUP]);
+        assert_eq!((resolve_nest(Nest::Flat, 9000, 512), resolve_nest(Nest::Groups(4), 1, 512)), (0, 4));
+        let code = guarded();
+        let opt = Options::default();
+        let cases = compact_with(&code, &opt, 0, MAX_TABLE_WORDS, 0).unwrap().hlsl.matches("u: { // ").count();
+        let at = compact_at(&code, &opt, 0, MAX_TABLE_WORDS, Nest::Auto, cases).unwrap();
+        assert!(at.hlsl.contains(&format!("switch (xcl_c >> {}u) {{", AUTO_GROUP.trailing_zeros())) && at.hlsl.matches("u: switch (xcl_c) {").count() == cases.div_ceil(AUTO_GROUP), "{}", at.hlsl);
+        let below = compact_at(&code, &opt, 0, MAX_TABLE_WORDS, Nest::Auto, cases + 1).unwrap();
+        assert!(!below.hlsl.contains("xcl_c") && below.hlsl.contains("        switch ((XCL_BT[xcl_b / "), "{}", below.hlsl);
+        let flat = compact_with(&code, &opt, 0, MAX_TABLE_WORDS, 0).unwrap();
+        assert_eq!(below.hlsl, flat.hlsl);
+    }
+
+    #[test]
+    fn equal_blocks_share_one_case() {
+        let code = guarded();
+        let t = translate_compact(&code, &Options::default()).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        assert!(t.hlsl.contains("(XCL_BT[xcl_b / ") && t.hlsl.contains("static const uint XCL_BT[1]"), "{}", t.hlsl);
+        // blocks: 0, 8, 24, 40, 52, 64, 76, 88, 92; 40 and 64 are the same code
+        assert_eq!(t.blocks, 8, "{}", t.hlsl);
+        assert_eq!(t.hlsl.matches("v3 = select(").count(), 1, "{}", t.hlsl);
+        // branches by offset: the loop's back edge, the skips over two blocks and over one
+        assert!(t.hlsl.contains("xcl_nb = xcl_b + 0u;") && t.hlsl.contains("xcl_nb = xcl_b + 2u;") && t.hlsl.contains("xcl_nb = xcl_b + 1u;"), "{}", t.hlsl);
+        // every instruction a block of its own: the same instruction texts are shared too
+        let each = compact(&code, &Options::default(), 0, MAX_TABLE_WORDS).unwrap();
+        assert!(each.blocks < each.instructions && each.blocks > t.blocks, "{}", each.hlsl);
+        // no branches: the straight-line form of `translate`
+        let line = prog(&[("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 128)])]);
+        assert_eq!(translate_compact(&line, &Options::default()).unwrap().hlsl, super::super::translate(&line, &Options::default()).unwrap().hlsl);
+        if super::super::dxc::location().is_ok() {
+            for o in [Options::default(), Options { split_wave64: true, mem_windows: 4, ..Options::default() }] {
+                let t = translate_compact(&code, &o).unwrap();
+                super::super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+            }
+        }
+    }
+
+    /// A split-wave64 group of 128 threads runs as two 64-thread groups: the compact form is
+    /// remapped like `translate`'s, so the dispatch grid is scaled for it too.
+    #[test]
+    fn the_compact_form_keeps_the_dispatch_remap() {
+        let code = prog(&[("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0)]), ("S_ENDPGM", "ENC_SOPP", &[])]);
+        let cs = super::super::CsInterface::from_rsrc2([128, 1, 1], 0);
+        let opt = Options { mode: Mode::Compute(cs), wave64: true, split_wave64: true, ..Default::default() };
+        let normal = super::super::translate(&code, &opt).unwrap();
+        let t = translate_compact(&code, &opt).unwrap();
+        assert!(t.complete() && t.hlsl != normal.hlsl, "{}", t.hlsl);
+        assert_eq!(normal.dispatch_remap, Some((2, 0)));
+        assert_eq!(t.dispatch_remap, normal.dispatch_remap);
+    }
+
+    #[test]
+    fn compact_is_wanted_for_large_repetitive_programs() {
+        assert!(!compact_wanted(&guarded()));
+        // 20,000 instructions: one guarded block 5,000 times, or 10,000 different blocks
+        let unit = prog(&[
+            ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 3), ("SRC0", V + 2), ("VSRC1", 1)]),
+            ("V_CMPX_GT_U32", "ENC_VOPC", &[("SRC0", 148), ("VSRC1", 0)]),
+            ("S_CBRANCH_EXECZ", "ENC_SOPP", &[("SIMM16", 1)]),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", 135)]),
+        ]);
+        let same: Vec<u8> = unit.iter().copied().cycle().take(unit.len() * 5000).collect();
+        assert!(compact_wanted(&same));
+        assert!(!compact_wanted(&same[..same.len() - 4]));
+        let mut different = Vec::new();
+        for k in 0..10_000u32 {
+            different.extend(encode("S_MOV_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 255)], Some(k)).unwrap());
+            different.extend(encode("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0)], None).unwrap());
+        }
+        assert!(!compact_wanted(&different));
+    }
+
+    /// The compact form ends in the same state as `translate` (both block cuts).
+    #[test]
+    fn gpu_compact_matches_translate() {
+        match (runner::adapter(), runner::wave64_programs_supported(), super::super::dxc::location()) {
+            (Ok(_), Ok(true), Ok(_)) => {}
+            (a, w, d) => {
+                runner::skip_test(if a.is_err() || w.is_err() { "no GPU" } else if d.is_err() { "no DXC" } else { "no wave64" });
+                return;
+            }
+        }
+        let code = guarded();
+        let mem: Vec<u32> = code.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+        let mut st = KernelState::default();
+        for (lane, v) in st.vgpr.iter_mut().enumerate() {
+            v[0] = lane as u32;
+        }
+        let opt = runner::options(Mode::Kernel);
+        let run = |t: Translation| {
+            assert!(t.complete(), "{:?}", t.unsupported_why);
+            let dxil = super::super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+            runner::run(&dxil, &st, &mem).unwrap()
+        };
+        let want = run(super::super::translate(&code, &opt).unwrap());
+        assert_eq!((want.sgpr[0], want.vgpr[5][3], want.vgpr[40][3], want.vgpr[25][3]), (55, 80, 1655, 0));
+        for heavy in [HEAVY, 0] {
+            let got = run(compact(&code, &opt, heavy, MAX_TABLE_WORDS).unwrap());
+            assert_eq!((got.sgpr, got.vgpr, got.scc), (want.sgpr.clone(), want.vgpr.clone(), want.scc), "heavy {heavy}");
+        }
+    }
+}
