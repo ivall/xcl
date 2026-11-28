@@ -13,6 +13,7 @@ pub mod config;
 pub mod disasm;
 pub mod eh;
 pub mod gpu;
+pub mod heap_count;
 pub mod hle;
 pub mod hooks;
 pub mod host;
@@ -36,3 +37,7 @@ pub mod tls;
 pub mod util;
 pub mod vfs;
 pub mod vfs_hooks;
+
+/// XCL's own allocations go through the counters of `heap_count` (`XCL_HEAP_COUNT=1`).
+#[global_allocator]
+static HEAP: heap_count::Counting = heap_count::Counting;
