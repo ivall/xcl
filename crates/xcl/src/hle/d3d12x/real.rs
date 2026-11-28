@@ -1244,16 +1244,20 @@ unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
             v[1 + i] = super::guard::make_split(stub, v[1 + i]);
         }
     }
-    // methods the newer console layout keeps at other slots: picked at each call
+    // methods the newer console layout keeps at other slots, plus older slots whose method
+    // moved away without another shifted method taking their place (#104): picked at each call
     if kind == Kind::CommandList {
-        let older_handlers = console_slots(kind);
-        for (newer, older) in NEWER_LIST_SLOTS {
-            let Some(&(_, f)) = older_handlers.iter().find(|e| e.0 == older) else { continue };
-            if newer >= total {
-                continue;
-            }
-            let pc = if newer < scanned { *ot.add(newer) } else { v[1 + newer] };
-            v[1 + newer] = super::guard::make_layout_split(super::guard::LayoutTargets { older: v[1 + newer], newer: f, pc, newer_layout: &QUEUE_SHIFTED });
+        let orig_slice = std::slice::from_raw_parts(ot, scanned);
+        let entries = plan_newer_list_slots(&console_slots(kind), &v, &pc, orig_slice, public, total, |slot| {
+            stubs::make_stub_info(DLL, &format!("{}::#{slot} (newer layout)", iface.name), 0).0
+        });
+        for e in entries {
+            v[1 + e.slot] = super::guard::make_layout_split(super::guard::LayoutTargets {
+                older: e.older,
+                newer: e.newer,
+                pc: e.pc,
+                newer_layout: &QUEUE_SHIFTED,
+            });
         }
     }
     // XCL_D3D12_TRACE: every public method called from console code is logged
@@ -9726,6 +9730,68 @@ static QUEUE_OLDER: AtomicBool = AtomicBool::new(false);
 /// and #128 Scarlett-only shading-rate/color struct; older #127, two slots before as the others).
 const NEWER_LIST_SLOTS: [(usize, usize); 22] = [(61, 59), (62, 60), (63, 61), (64, 62), (65, 63), (70, 68), (71, 69), (72, 70), (73, 71), (74, 72), (80, 78), (83, 81), (85, 83), (86, 84), (87, 85), (90, 88), (91, 89), (92, 90), (95, 93), (96, 94), (129, 127), (139, 10)];
 
+/// Older command list slots whose console method moved on the newer layout (`NEWER_LIST_SLOTS`)
+/// without another shifted method taking their old index. Slot #10 (`Reset`) stays `Reset` on
+/// both layouts (#139 is an extra Reset overload), so it is not orphaned.
+fn orphaned_older_list_slots() -> Vec<usize> {
+    let mut out = Vec::new();
+    for &(newer, older) in &NEWER_LIST_SLOTS {
+        if newer != older + 2 {
+            continue;
+        }
+        if !NEWER_LIST_SLOTS.iter().any(|&(n, _)| n == older) && !out.contains(&older) {
+            out.push(older);
+        }
+    }
+    out
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ListLayoutSlot {
+    slot: usize,
+    older: usize,
+    newer: usize,
+    pc: usize,
+}
+
+/// Dispatch targets for every `Kind::CommandList` slot that differs between the older and newer
+/// console layouts: the moved slots in `NEWER_LIST_SLOTS` and the older slots left behind.
+fn plan_newer_list_slots(
+    older_handlers: &[(usize, usize)],
+    v: &[usize],
+    pc: &[usize],
+    orig: &[usize],
+    public: usize,
+    total: usize,
+    mut make_stub: impl FnMut(usize) -> usize,
+) -> Vec<ListLayoutSlot> {
+    let pc_target = |slot: usize| -> usize {
+        if slot < public {
+            pc[1 + slot]
+        } else if slot < orig.len() {
+            orig[slot]
+        } else {
+            pc[1 + slot]
+        }
+    };
+    let mut out = Vec::new();
+    for &(newer, older) in &NEWER_LIST_SLOTS {
+        let Some(&(_, f)) = older_handlers.iter().find(|e| e.0 == older) else { continue };
+        if newer >= total {
+            continue;
+        }
+        out.push(ListLayoutSlot { slot: newer, older: v[1 + newer], newer: f, pc: pc_target(newer) });
+    }
+    for slot in orphaned_older_list_slots() {
+        let Some(&(_, f)) = older_handlers.iter().find(|e| e.0 == slot) else { continue };
+        if slot >= total {
+            continue;
+        }
+        out.push(ListLayoutSlot { slot, older: f, newer: make_stub(slot), pc: pc_target(slot) });
+    }
+    out
+}
+
 /// The title called device method `slot`, which only runtimes with the newer layouts have (a retail game
 /// records its first lists before any queue call could tell).
 pub(super) fn note_newer_device_method(slot: usize) {
@@ -10905,6 +10971,89 @@ mod queue_tests {
         }
         assert_eq!(CALLED.load(Ordering::SeqCst), before_called + 1, "original ExecuteCommandLists must still run");
         assert_eq!(crate::hle::d3d12x::present::activity(), activity_before, "own_work submit must bypass present::note_execute");
+    }
+}
+
+#[cfg(test)]
+mod list_layout_tests {
+    use super::*;
+
+    #[test]
+    fn orphaned_older_list_slots_are_stubbed_on_newer_layout_without_touching_reset() {
+        let orphaned = orphaned_older_list_slots();
+        assert_eq!(orphaned, vec![59, 60, 68, 69, 78, 81, 84, 88, 89, 93, 94]);
+        assert!(!orphaned.contains(&10), "Reset stays at #10 on both layouts");
+
+        let handlers = console_slots(Kind::CommandList);
+        let handler_of = |slot: usize| handlers.iter().find(|&&(s, _)| s == slot).map(|&(_, f)| f).unwrap_or_else(|| panic!("missing handler for slot #{slot}"));
+
+        // Exercise all three PC-target bands (< public with an override at #59, public..scanned,
+        // and >= scanned) under both a longer and shorter PC vtable scan.
+        for (public, scanned, total) in [(84usize, 100usize, 155usize), (60, 85, 155)] {
+            let orig: Vec<usize> = (0..scanned).map(|i| 0x1000_0000 + i).collect();
+            let mut pc = vec![0usize; total + 1];
+            for i in 0..public {
+                pc[1 + i] = orig[i];
+            }
+            // Mirror overrides(Kind::CommandList): ExecuteIndirect (#59) has a PC override.
+            pc[1 + 59] = cl_execute_indirect as usize;
+            for i in public..scanned {
+                pc[1 + i] = 0x2000_0000 + i; // guard thunk in the base table
+            }
+            for i in scanned..total {
+                pc[1 + i] = 0x3000_0000 + i; // "(not on PC)" stub in the base table
+            }
+            // Mirror v after console_slots / console_extensions: slots >= scanned hold f directly.
+            let mut v = pc.clone();
+            for &(slot, f) in &handlers {
+                if slot < scanned {
+                    v[1 + slot] = 0x4000_0000 + slot; // make_split(f, ...)
+                } else if slot < total {
+                    v[1 + slot] = f;
+                }
+            }
+
+            let stub_base = 0x5000_0000usize;
+            let entries = plan_newer_list_slots(&handlers, &v, &pc, &orig, public, total, |slot| stub_base + slot);
+
+            // Every shifted slot and every orphaned older slot appears once, with no overlap.
+            assert_eq!(entries.len(), NEWER_LIST_SLOTS.len() + orphaned.len());
+            let mut seen = std::collections::HashSet::new();
+            for e in &entries {
+                assert!(seen.insert(e.slot), "duplicate layout split for slot #{}", e.slot);
+            }
+            assert!(!seen.contains(&10), "Reset (#10) must not be orphaned");
+
+            let expected_pc = |slot: usize| {
+                if slot < public {
+                    pc[1 + slot]
+                } else if slot < scanned {
+                    orig[slot]
+                } else {
+                    pc[1 + slot]
+                }
+            };
+
+            // Shifted slots route newer titles to the moved handler and keep the older slot intact.
+            for &(newer, older) in &NEWER_LIST_SLOTS {
+                let e = entries.iter().find(|e| e.slot == newer).unwrap_or_else(|| panic!("missing newer slot #{newer}"));
+                assert_eq!(e.older, v[1 + newer], "slot #{newer} older target");
+                assert_eq!(e.newer, handler_of(older), "slot #{newer} newer target");
+                assert_eq!(e.pc, expected_pc(newer), "slot #{newer} pc target");
+            }
+
+            // Orphaned older slots keep their handler on the older layout, stub out on the newer
+            // layout, and keep the PC target (including cl_execute_indirect at #59) for non-game calls.
+            for &slot in &orphaned {
+                let e = entries.iter().find(|e| e.slot == slot).unwrap_or_else(|| panic!("missing orphaned slot #{slot}"));
+                assert_eq!(e.older, handler_of(slot), "orphaned slot #{slot} older target");
+                assert_eq!(e.newer, stub_base + slot, "orphaned slot #{slot} must stub on newer layout");
+                assert_ne!(e.newer, handler_of(slot), "orphaned slot #{slot} must not invoke older handler on newer layout");
+                assert_eq!(e.pc, expected_pc(slot), "orphaned slot #{slot} pc target");
+            }
+            let e59 = entries.iter().find(|e| e.slot == 59).unwrap();
+            assert_eq!(e59.pc, cl_execute_indirect as usize, "slot #59 keeps its PC ExecuteIndirect override");
+        }
     }
 }
 
