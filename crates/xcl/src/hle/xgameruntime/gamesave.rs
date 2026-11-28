@@ -264,7 +264,8 @@ unsafe fn delete_path(p: *mut Provider, name: *const u8) -> Result<PathBuf, HRES
     std::path::absolute(pr.root.join(enc(&name))).map_err(|_| E_FAIL)
 }
 
-// A queued delete must not remove a container partway through a blob update.
+// A queued delete must not remove a container partway through a blob update, and a read must not
+// see part of an update or keep open a file it replaces.
 static SAVE_MUTATION: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn delete_container(dir: &Path) {
@@ -411,6 +412,7 @@ pub unsafe extern "system" fn XGameSaveEnumerateBlobInfoByName(c: *mut Container
 /// Blobs `names` (all when empty) laid out as the API returns them: `Blob` array, then the
 /// names and data; pointers stored as offsets from the start (fixed up by the caller).
 fn read_layout(dir: &Path, names: &[String]) -> Result<(Vec<u8>, u32), HRESULT> {
+    let _mutation = SAVE_MUTATION.lock().unwrap_or_else(|e| e.into_inner());
     let all = blobs_of(dir);
     let picked: Vec<(String, PathBuf)> = if names.is_empty() {
         all.into_iter().map(|b| (b.0, b.1)).collect()
@@ -1184,4 +1186,43 @@ mod tests {
         assert_eq!(mixed, 0, "{mixed} of {reads} enumerations mixed submitted updates");
     }
 
+    /// An update replaces its blobs one file at a time: a read in between must not return some of
+    /// them from before the update and some from after it, nor make the update fail by having one
+    /// of the files open.
+    #[test]
+    fn reads_during_an_update_see_all_of_it_or_none() {
+        let root = std::env::temp_dir().join(format!("xcl-gamesave-read-update-{}", std::process::id()));
+        let dir = root.join("slot");
+        let names = ["head".to_string(), "tail".to_string()];
+        let write = |v: u8| {
+            let ops: Vec<_> = names.iter().map(|n| (n.clone(), Some(vec![v; 4096]))).collect();
+            apply(&dir, None, &ops)
+        };
+        assert_eq!(write(0), S_OK);
+        let done = std::sync::atomic::AtomicBool::new(false);
+        let (failed_updates, (reads, mixed, failed_reads)) = std::thread::scope(|s| {
+            let reader = s.spawn(|| {
+                let (mut reads, mut mixed, mut failed) = (0u32, 0u32, 0u32);
+                loop {
+                    reads += 1;
+                    match read_layout(&dir, &names) {
+                        Ok((bytes, 2)) => {
+                            let data_at = |k: usize| k * std::mem::size_of::<Blob>() + std::mem::offset_of!(Blob, data);
+                            let first = |k: usize| bytes[u64::from_le_bytes(bytes[data_at(k)..data_at(k) + 8].try_into().unwrap()) as usize];
+                            mixed += (first(0) != first(1)) as u32;
+                        }
+                        _ => failed += 1,
+                    }
+                    if done.load(Ordering::Relaxed) {
+                        return (reads, mixed, failed);
+                    }
+                }
+            });
+            let failed = (1..=30u8).filter(|&v| write(v) != S_OK).count();
+            done.store(true, Ordering::Relaxed);
+            (failed, reader.join().unwrap())
+        });
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!((failed_updates, mixed, failed_reads), (0, 0, 0), "failed updates, mixed reads, failed reads of {reads}");
+    }
 }
