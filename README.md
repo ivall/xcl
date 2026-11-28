@@ -389,6 +389,25 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 .\scripts\test.ps1                         # cargo build --workspace + cargo test --workspace
 ```
 
+The script sums the reported passed, failed and ignored counts from completed test suites.
+If a run stops early, these totals cover only the suites that printed a result; the script
+preserves Cargo's exit code. A passed count can include tests that skipped their checks,
+as described below. Standalone and inline `SKIPPED` records are counted in both live and saved logs.
+
+To summarize an existing test log without running tests again:
+
+```powershell
+.\scripts\summarize-tests.ps1 -LiteralPath .\test.log
+.\scripts\summarize-tests.ps1 -LiteralPath .\test.log -Json
+```
+
+The report lists completed-suite totals, `SKIPPED` records, explicitly named failed tests
+and sample inputs reported as unset. UTF-8 and UTF-16 logs are supported. A successful
+summary command means the log was read, not that the logged tests passed or that the
+whole run finished. Concatenated runs are summed, not deduplicated. Logs with no completed
+test-suite summaries are rejected. An unmatched suite start warns that the log may be incomplete,
+even when capture began partway through an earlier suite.
+
 Unit tests, an end-to-end test with our own "console title" (`tests/testtitle`) and GPU tests
 (D3D12, SM 6.6; skipped without a GPU / DXC; `XCL_ADAPTER=1` or `XCL_ADAPTER=radeon` picks
 another adapter than the first high-performance one, for titles too). A GPU test that cannot run on
