@@ -267,7 +267,7 @@ fn translate_on_this_thread(
         }
         Entry::Compute(cs) => {
             let (tid, gtid) = lw.setup_lanes_compute(cs.threads, uses_lds);
-            if split && !uses_lds && cs.threads == [64, 1, 1] { split_tid = Some(tid); }
+            if split && !uses_lds && cs.threads.iter().product::<u32>() % 64 == 0 { split_tid = Some(tid); }
             compute_init(&mut lw, cs, tid, gtid);
             cs.threads
         }
