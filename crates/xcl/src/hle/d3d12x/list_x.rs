@@ -5425,6 +5425,7 @@ pub(super) unsafe extern "system" fn ia_set_index_buffer_x(this: *mut c_void, vi
     let s = g.get_or_insert_with(HashMap::new).entry(this as usize).or_default();
     if view.is_null() {
         s.index_buffer = None;
+        s.bindings.index_title = None;
         drop(g);
         return set_index_buffer(this, None);
     }
@@ -8140,6 +8141,41 @@ mod tests {
         }
 
         super::super::bind::forget(list_ptr);
+        on_release(list_ptr as usize);
+        unsafe { windows_sys::Win32::System::Memory::VirtualFree(reserved as *mut c_void, 0, windows_sys::Win32::System::Memory::MEM_RELEASE) };
+    }
+
+    #[test]
+    fn ia_set_index_buffer_null_clears_index_title() {
+        unsafe extern "system" fn fake_set_ib(_this: *mut c_void, _view: *const D3D12_INDEX_BUFFER_VIEW) {}
+        let mut orig_vt = [0usize; 64];
+        orig_vt[43] = fake_set_ib as usize;
+        let mut ext_vt = vec![0usize; 65];
+        ext_vt[0] = orig_vt.as_ptr() as usize;
+        ext_vt[1..].copy_from_slice(&orig_vt);
+        let obj = [unsafe { ext_vt.as_ptr().add(1) } as usize];
+        let list_ptr = obj.as_ptr() as *mut c_void;
+
+        let reserved = unsafe {
+            windows_sys::Win32::System::Memory::VirtualAlloc(
+                std::ptr::null(),
+                0x1_0000,
+                windows_sys::Win32::System::Memory::MEM_RESERVE,
+                windows_sys::Win32::System::Memory::PAGE_NOACCESS,
+            )
+        } as u64;
+        assert_ne!(reserved, 0);
+        let ib = D3D12_INDEX_BUFFER_VIEW { BufferLocation: reserved, SizeInBytes: 64, Format: DXGI_FORMAT_R16_UINT };
+
+        unsafe {
+            ia_set_index_buffer_x(list_ptr, &ib);
+            let before = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(list_ptr as usize)).and_then(|s| s.bindings.index_title));
+            assert_eq!(before, Some((reserved, 64, DXGI_FORMAT_R16_UINT.0)));
+
+            ia_set_index_buffer_x(list_ptr, std::ptr::null());
+            let after = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(list_ptr as usize)).and_then(|s| s.bindings.index_title));
+            assert_eq!(after, None, "IASetIndexBuffer(NULL) must clear bindings.index_title");
+        }
         on_release(list_ptr as usize);
         unsafe { windows_sys::Win32::System::Memory::VirtualFree(reserved as *mut c_void, 0, windows_sys::Win32::System::Memory::MEM_RELEASE) };
     }
