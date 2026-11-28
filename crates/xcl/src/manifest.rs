@@ -121,6 +121,22 @@ mod tests {
     }
 
     #[test]
+    fn parses_persistent_local_storage_size_bounds() {
+        let cases = [
+            ("-1", None),
+            ("18446744073709551616", None),
+            ("not-a-number", None),
+            (" \t18446744073709551615\n ", Some(u64::MAX)),
+        ];
+        for (value, expected) in cases {
+            let xml = format!(
+                "<Game><PersistentLocalStorage><SizeMB>{value}</SizeMB></PersistentLocalStorage></Game>"
+            );
+            assert_eq!(parse(&xml).pls_mb, expected, "SizeMB = {value:?}");
+        }
+    }
+
+    #[test]
     fn parses_declared_resources_languages_with_comments_and_utf16() {
         let xml = r#"<Game configVersion="1">
   <Other><Resource Language="xx-XX"/></Other>
