@@ -601,10 +601,19 @@ impl Vfs {
     }
 
     pub fn delete_file(&self, rel: &str) -> Result<(), u32> {
+        self.remove_file_entry(rel, false)
+    }
+
+    pub fn remove_moved_file(&self, rel: &str) -> Result<(), u32> {
+        self.remove_file_entry(rel, true)
+    }
+
+    fn remove_file_entry(&self, rel: &str, ignore_readonly: bool) -> Result<(), u32> {
         let ov = self.overlay_path(rel);
         let ov_path = Path::new(&ov);
         if let Ok(meta) = std::fs::metadata(ov_path) {
-            if meta.is_dir() {
+            // std::fs::remove_file deletes read-only files on Windows; DeleteFileW does not.
+            if meta.is_dir() || (!ignore_readonly && meta.permissions().readonly()) {
                 return Err(ERROR_ACCESS_DENIED);
             }
             std::fs::remove_file(ov_path).map_err(|_| ERROR_ACCESS_DENIED)?;
@@ -614,7 +623,8 @@ impl Vfs {
         if !self.visible_in_original(rel) {
             return Err(ERROR_FILE_NOT_FOUND);
         }
-        if Path::new(&self.original_path(rel)).is_dir() {
+        let orig_meta = std::fs::metadata(self.original_path(rel));
+        if orig_meta.as_ref().is_ok_and(|m| m.is_dir() || (!ignore_readonly && m.permissions().readonly())) {
             return Err(ERROR_ACCESS_DENIED);
         }
         self.add_whiteout(rel);
@@ -1075,6 +1085,54 @@ mod tests {
         std::fs::write(&ov_file, b"hi").unwrap();
         assert_eq!(v.remove_dir("data\\ov_only.txt"), Err(ERROR_DIRECTORY));
         assert!(v.visible_in_overlay("data\\ov_only.txt"));
+    }
+
+    #[test]
+    fn delete_file_respects_readonly_attribute() {
+        let f = Fixture::new("readonly_delete");
+        let v = &f.vfs;
+        let set_readonly = |p: &Path, ro: bool| {
+            let mut perm = std::fs::metadata(p).unwrap().permissions();
+            perm.set_readonly(ro);
+            std::fs::set_permissions(p, perm).unwrap();
+        };
+
+        // Native control: DeleteFileW refuses a read-only file.
+        let control = f.dir.join("control.txt");
+        std::fs::write(&control, b"c").unwrap();
+        set_readonly(&control, true);
+        let control_w = crate::util::wide(&control.to_string_lossy());
+        // SAFETY: control_w is a NUL-terminated UTF-16 path; native Win32 refuses it without modifying disk.
+        unsafe {
+            assert_eq!(windows_sys::Win32::Storage::FileSystem::DeleteFileW(control_w.as_ptr()), 0);
+            assert_eq!(windows_sys::Win32::Foundation::GetLastError(), ERROR_ACCESS_DENIED);
+        }
+        set_readonly(&control, false);
+
+        // A read-only original is refused: no whiteout, still visible.
+        let orig = f.game().join("data").join("hello.txt");
+        set_readonly(&orig, true);
+        assert_eq!(v.delete_file("data\\hello.txt"), Err(ERROR_ACCESS_DENIED));
+        assert!(!v.is_whiteout("data\\hello.txt"));
+        assert!(v.exists("data\\hello.txt"));
+
+        // A read-only overlay file is refused and kept.
+        let ov = v.prepare_write("data\\ro_overlay.txt", false).unwrap();
+        std::fs::write(&ov, b"overlay").unwrap();
+        set_readonly(Path::new(&ov), true);
+        assert_eq!(v.delete_file("data\\ro_overlay.txt"), Err(ERROR_ACCESS_DENIED));
+        assert!(v.visible_in_overlay("data\\ro_overlay.txt"));
+        assert_eq!(std::fs::read(&ov).unwrap(), b"overlay");
+
+        // A move still removes a read-only source, as MoveFileW does.
+        assert_eq!(v.remove_moved_file("data\\hello.txt"), Ok(()));
+        assert!(v.is_whiteout("data\\hello.txt"));
+
+        // Writable files are still deleted.
+        assert_eq!(v.delete_file("data\\gone.txt"), Ok(()));
+
+        set_readonly(&orig, false);
+        set_readonly(Path::new(&ov), false);
     }
 
     #[test]
