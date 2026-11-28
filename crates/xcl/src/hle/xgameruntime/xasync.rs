@@ -232,12 +232,12 @@ pub unsafe extern "system" fn XAsyncBegin(
     _identity_name: *const u8,
     provider: usize,
 ) -> HRESULT {
+    if b.is_null() || provider == 0 {
+        return E_INVALIDARG;
+    }
     if let Some((o, f)) = pc(7) {
         let f: unsafe extern "system" fn(usize, *mut XAsyncBlock, *mut c_void, *const c_void, *const u8, usize) -> HRESULT = std::mem::transmute(f);
         return f(o, b, context, identity, _identity_name, provider);
-    }
-    if b.is_null() || provider == 0 {
-        return E_INVALIDARG;
     }
     let s = Arc::new(State {
         id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
@@ -259,12 +259,12 @@ pub unsafe extern "system" fn XAsyncBegin(
 }
 
 pub unsafe extern "system" fn XAsyncSchedule(b: *mut XAsyncBlock, delay_ms: u32) -> HRESULT {
+    if b.is_null() {
+        return E_INVALIDARG;
+    }
     if let Some((o, f)) = pc(9) {
         let f: unsafe extern "system" fn(usize, *mut XAsyncBlock, u32) -> HRESULT = std::mem::transmute(f);
         return f(o, b, delay_ms);
-    }
-    if b.is_null() {
-        return E_INVALIDARG;
     }
     let Some(q) = taskqueue::queue_from((*b).queue) else {
         return if (*b).queue.is_null() { taskqueue::E_NO_TASK_QUEUE } else { E_INVALIDARG };
@@ -277,13 +277,12 @@ pub unsafe extern "system" fn XAsyncSchedule(b: *mut XAsyncBlock, delay_ms: u32)
 }
 
 pub unsafe extern "system" fn XAsyncComplete(b: *mut XAsyncBlock, result: HRESULT, required: usize) {
+    if b.is_null() || result == E_PENDING {
+        return;
+    }
     if let Some((o, f)) = pc(10) {
         let f: unsafe extern "system" fn(usize, *mut XAsyncBlock, HRESULT, usize) = std::mem::transmute(f);
         return f(o, b, result, required);
-    }
-    // E_PENDING is not a completion: the provider still has work to do (libHttpClient).
-    if result == E_PENDING {
-        return;
     }
     let Lookup::Active(s) = lookup(b) else { return };
     // Atomically claim completion while keeping `is_done() == false` until `OP_CLEANUP` and
@@ -327,6 +326,9 @@ pub unsafe extern "system" fn XAsyncComplete(b: *mut XAsyncBlock, result: HRESUL
 }
 
 pub unsafe extern "system" fn XAsyncGetStatus(b: *mut XAsyncBlock, wait: bool) -> HRESULT {
+    if b.is_null() {
+        return E_INVALIDARG;
+    }
     if let Some((o, f)) = pc(3) {
         let f: unsafe extern "system" fn(usize, *mut XAsyncBlock, bool) -> HRESULT = std::mem::transmute(f);
         return f(o, b, wait);
@@ -347,6 +349,9 @@ pub unsafe extern "system" fn XAsyncGetStatus(b: *mut XAsyncBlock, wait: bool) -
 }
 
 pub unsafe extern "system" fn XAsyncGetResultSize(b: *mut XAsyncBlock, size: *mut usize) -> HRESULT {
+    if b.is_null() {
+        return E_INVALIDARG;
+    }
     if let Some((o, f)) = pc(4) {
         let f: unsafe extern "system" fn(usize, *mut XAsyncBlock, *mut usize) -> HRESULT = std::mem::transmute(f);
         return f(o, b, size);
@@ -379,6 +384,9 @@ pub unsafe extern "system" fn XAsyncGetResult(
     buffer: *mut c_void,
     used: *mut usize,
 ) -> HRESULT {
+    if b.is_null() {
+        return E_INVALIDARG;
+    }
     if let Some((o, f)) = pc(11) {
         let f: unsafe extern "system" fn(usize, *mut XAsyncBlock, *const c_void, usize, *mut c_void, *mut usize) -> HRESULT = std::mem::transmute(f);
         return f(o, b, identity, size, buffer, used);
@@ -444,6 +452,9 @@ pub unsafe extern "system" fn XAsyncGetResult(
 }
 
 pub unsafe extern "system" fn XAsyncCancel(b: *mut XAsyncBlock) {
+    if b.is_null() {
+        return;
+    }
     if let Some((o, f)) = pc(5) {
         let f: unsafe extern "system" fn(usize, *mut XAsyncBlock) = std::mem::transmute(f);
         return f(o, b);
@@ -460,12 +471,12 @@ pub unsafe extern "system" fn XAsyncCancel(b: *mut XAsyncBlock) {
 }
 
 pub unsafe extern "system" fn XAsyncRun(b: *mut XAsyncBlock, work: usize) -> HRESULT {
+    if b.is_null() || work == 0 {
+        return E_INVALIDARG;
+    }
     if let Some((o, f)) = pc(6) {
         let f: unsafe extern "system" fn(usize, *mut XAsyncBlock, usize) -> HRESULT = std::mem::transmute(f);
         return f(o, b, work);
-    }
-    if b.is_null() || work == 0 {
-        return E_INVALIDARG;
     }
     let s = Arc::new(State {
         id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
@@ -1225,6 +1236,88 @@ mod tests {
 
             taskqueue::XTaskQueueTerminate(q, true, std::ptr::null_mut(), 0);
             taskqueue::XTaskQueueCloseHandle(q);
+        }
+    }
+
+    #[test]
+    fn xasync_entry_points_reject_null_block() {
+        let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            assert_eq!(XAsyncBegin(std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null(), std::ptr::null(), 0x1234), E_INVALIDARG);
+            let mut b: XAsyncBlock = std::mem::zeroed();
+            assert_eq!(XAsyncBegin(&mut b, std::ptr::null_mut(), std::ptr::null(), std::ptr::null(), 0), E_INVALIDARG);
+            assert_eq!(XAsyncSchedule(std::ptr::null_mut(), 0), E_INVALIDARG);
+            XAsyncComplete(std::ptr::null_mut(), S_OK, 0);
+            XAsyncComplete(&mut b, E_PENDING, 0);
+            assert_eq!(XAsyncGetStatus(std::ptr::null_mut(), false), E_INVALIDARG);
+            let mut size = 0usize;
+            assert_eq!(XAsyncGetResultSize(std::ptr::null_mut(), &mut size), E_INVALIDARG);
+            let mut buf = [0u8; 4];
+            let mut used = 0usize;
+            assert_eq!(XAsyncGetResult(std::ptr::null_mut(), std::ptr::null(), 4, buf.as_mut_ptr() as _, &mut used), E_INVALIDARG);
+            XAsyncCancel(std::ptr::null_mut());
+            assert_eq!(XAsyncRun(std::ptr::null_mut(), 0x1234), E_INVALIDARG);
+            assert_eq!(XAsyncRun(&mut b, 0), E_INVALIDARG);
+
+            // begin_with_fixups returns E_INVALIDARG on null b and cleans up its Payload without leak.
+            assert_eq!(begin_with_fixups(std::ptr::null_mut(), 0x5678, || Ok(PayloadBuf { bytes: vec![1, 2, 3], fixups: Vec::new() })), E_INVALIDARG);
+        }
+    }
+
+    #[test]
+    fn xasync_entry_points_validate_before_pc_forwarding() {
+        let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        static HITS: AtomicU32 = AtomicU32::new(0);
+        unsafe extern "system" fn status(_: usize, _: *mut XAsyncBlock, _: bool) -> HRESULT { HITS.fetch_add(1, Ordering::SeqCst); S_OK }
+        unsafe extern "system" fn result_size(_: usize, _: *mut XAsyncBlock, _: *mut usize) -> HRESULT { HITS.fetch_add(1, Ordering::SeqCst); S_OK }
+        unsafe extern "system" fn cancel(_: usize, _: *mut XAsyncBlock) { HITS.fetch_add(1, Ordering::SeqCst); }
+        unsafe extern "system" fn run(_: usize, _: *mut XAsyncBlock, _: usize) -> HRESULT { HITS.fetch_add(1, Ordering::SeqCst); S_OK }
+        unsafe extern "system" fn begin(_: usize, _: *mut XAsyncBlock, _: *mut c_void, _: *const c_void, _: *const u8, _: usize) -> HRESULT { HITS.fetch_add(1, Ordering::SeqCst); S_OK }
+        unsafe extern "system" fn schedule(_: usize, _: *mut XAsyncBlock, _: u32) -> HRESULT { HITS.fetch_add(1, Ordering::SeqCst); S_OK }
+        unsafe extern "system" fn complete(_: usize, _: *mut XAsyncBlock, _: HRESULT, _: usize) { HITS.fetch_add(1, Ordering::SeqCst); }
+        unsafe extern "system" fn result(_: usize, _: *mut XAsyncBlock, _: *const c_void, _: usize, _: *mut c_void, _: *mut usize) -> HRESULT { HITS.fetch_add(1, Ordering::SeqCst); S_OK }
+
+        struct PcReset;
+        impl Drop for PcReset {
+            fn drop(&mut self) { use_pc(0); }
+        }
+        let _reset = PcReset;
+        let mut vtable = [0usize; 12];
+        vtable[3] = status as *const () as usize;
+        vtable[4] = result_size as *const () as usize;
+        vtable[5] = cancel as *const () as usize;
+        vtable[6] = run as *const () as usize;
+        vtable[7] = begin as *const () as usize;
+        vtable[9] = schedule as *const () as usize;
+        vtable[10] = complete as *const () as usize;
+        vtable[11] = result as *const () as usize;
+        let vtable_ptr = vtable.as_ptr();
+        let obj = &vtable_ptr as *const _ as usize;
+        HITS.store(0, Ordering::SeqCst);
+        use_pc(obj);
+
+        unsafe {
+            assert_eq!(XAsyncBegin(std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null(), std::ptr::null(), 0x1234), E_INVALIDARG);
+            let mut b: XAsyncBlock = std::mem::zeroed();
+            assert_eq!(XAsyncBegin(&mut b, std::ptr::null_mut(), std::ptr::null(), std::ptr::null(), 0), E_INVALIDARG);
+            assert_eq!(XAsyncSchedule(std::ptr::null_mut(), 0), E_INVALIDARG);
+            XAsyncComplete(std::ptr::null_mut(), S_OK, 0);
+            XAsyncComplete(&mut b, E_PENDING, 0);
+            assert_eq!(XAsyncGetStatus(std::ptr::null_mut(), false), E_INVALIDARG);
+            let mut size = 0usize;
+            assert_eq!(XAsyncGetResultSize(std::ptr::null_mut(), &mut size), E_INVALIDARG);
+            let mut buf = [0u8; 4];
+            let mut used = 0usize;
+            assert_eq!(XAsyncGetResult(std::ptr::null_mut(), std::ptr::null(), 4, buf.as_mut_ptr() as _, &mut used), E_INVALIDARG);
+            XAsyncCancel(std::ptr::null_mut());
+            assert_eq!(XAsyncRun(std::ptr::null_mut(), 0x1234), E_INVALIDARG);
+            assert_eq!(XAsyncRun(&mut b, 0), E_INVALIDARG);
+
+            assert_eq!(begin_with_fixups(std::ptr::null_mut(), 0x5678, || Ok(PayloadBuf { bytes: vec![1, 2, 3], fixups: Vec::new() })), E_INVALIDARG);
+            assert_eq!(HITS.load(Ordering::SeqCst), 0);
+            assert_eq!(XAsyncGetStatus(&mut b, false), S_OK);
+            assert_eq!(HITS.load(Ordering::SeqCst), 1);
         }
     }
 }
