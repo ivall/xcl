@@ -38,7 +38,7 @@ pub struct KernelOptions {
 /// identity (`recomp::pso`): bump it when `pso::direct_compute` / `direct_graphics` change the
 /// containers. An edit of `gpu/dxil` needs no bump, `XCL_DIRECT_DXIL_SOURCE_ID` is its hash
 /// (the `gpu/dxil` sources are not in build.rs's translator source hash).
-pub const TRANSLATOR_VERSION: u32 = 9;
+pub const TRANSLATOR_VERSION: u32 = 10;
 
 /// `XCL_DIRECT_DXIL=1`: console compute shaders (and the kernel tests) go through this
 /// translator, with the HLSL path as the fallback for what it cannot translate yet.
@@ -598,6 +598,7 @@ impl Lw {
             gfx: None,
             gfx_half: None,
             whole_live: Default::default(),
+            ps_masks: Default::default(),
             guard_override: None,
             mask_override: None,
             local_masks: false,
@@ -649,6 +650,9 @@ impl Lw {
         }
         if split && std::env::var_os("XCL_X64_ALL_MASKS").is_none() {
             lw.whole_live = crate::gpu::recomp::x64_masks::by_pc(insts, kernel);
+        }
+        if matches!(entry, Entry::Pixel(_)) && !split {
+            lw.ps_masks = crate::gpu::recomp::ps_masks::forms(insts);
         }
         lw.setup_storage(uses_lds, if split { slot } else { 1 });
         if let (Some(t), true) = (group_threads, split) {
