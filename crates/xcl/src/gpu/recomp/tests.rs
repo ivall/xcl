@@ -1238,6 +1238,83 @@ fn gpu_valu_float_and_int() {
     }
 }
 
+/// Float min / max order -0 below +0, in either operand order: min(+0, -0) = min(-0, +0) = -0,
+/// max(+0, -0) = max(-0, +0) = +0 (RDNA 2 ISA, V_MIN_F32 / V_MAX_F32 p.131-132, V_MAX_F16 /
+/// V_MIN_F16 p.136, V_MIN_F64 / V_MAX_F64 p.173; the zero cases come before the IEEE_MODE
+/// branch). min3 / max3 are nested min / max (p.170); the packed forms are two V_MIN_F16.
+#[test]
+fn gpu_min_max_order_minus_zero_below_plus_zero() {
+    if !gpu_ready() {
+        return;
+    }
+    let code = prog(&[
+        ("V_MIN_F32", "ENC_VOP2", &[("VDST", 10), ("SRC0", V + 1), ("VSRC1", 2)], None),
+        ("V_MAX_F32", "ENC_VOP2", &[("VDST", 11), ("SRC0", V + 1), ("VSRC1", 2)], None),
+        ("V_MIN3_F32", "ENC_VOP3", &[("VDST", 12), ("SRC0", V + 1), ("SRC1", V + 2), ("SRC2", V + 1)], None),
+        ("V_MAX3_F32", "ENC_VOP3", &[("VDST", 13), ("SRC0", V + 1), ("SRC1", V + 2), ("SRC2", V + 1)], None),
+        ("V_MIN_F16", "ENC_VOP2", &[("VDST", 14), ("SRC0", V + 3), ("VSRC1", 4)], None),
+        ("V_MAX_F16", "ENC_VOP2", &[("VDST", 15), ("SRC0", V + 3), ("VSRC1", 4)], None),
+        ("V_PK_MIN_F16", "ENC_VOP3P", &[("VDST", 16), ("SRC0", V + 3), ("SRC1", V + 4), ("OP_SEL_HI", 3), ("OP_SEL_HI_2", 1)], None),
+        ("V_PK_MAX_F16", "ENC_VOP3P", &[("VDST", 17), ("SRC0", V + 3), ("SRC1", V + 4), ("OP_SEL_HI", 3), ("OP_SEL_HI_2", 1)], None),
+        ("V_MIN_F64", "ENC_VOP3", &[("VDST", 18), ("SRC0", V + 6), ("SRC1", V + 8)], None),
+        ("V_MAX_F64", "ENC_VOP3", &[("VDST", 20), ("SRC0", V + 6), ("SRC1", V + 8)], None),
+    ]);
+    let cases: [(f32, f32); 6] = [(0.0, -0.0), (-0.0, 0.0), (0.0, 0.0), (-0.0, -0.0), (-1.0, 2.0), (2.0, -0.0)];
+    // the ISA's result: zeros by sign, the rest by value
+    let zmin = |a: f32, b: f32| if a == 0.0 && b == 0.0 { if a.is_sign_negative() || b.is_sign_negative() { -0.0 } else { 0.0 } } else { a.min(b) };
+    let zmax = |a: f32, b: f32| if a == 0.0 && b == 0.0 { if a.is_sign_negative() && b.is_sign_negative() { -0.0 } else { 0.0 } } else { a.max(b) };
+    let h = |x: f32| -> u32 {
+        match x.to_bits() {
+            0x0000_0000 => 0x0000,
+            0x8000_0000 => 0x8000,
+            0xBF80_0000 => 0xBC00,
+            0x4000_0000 => 0x4000,
+            b => panic!("no f16 for {b:#X}"),
+        }
+    };
+    let mut st = KernelState::default();
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        let (a, b) = cases[l % cases.len()];
+        r[1] = f(a);
+        r[2] = f(b);
+        r[3] = h(a) * 0x1_0001; // the same f16 in both halves
+        r[4] = h(b) * 0x1_0001;
+        let (da, db) = ((a as f64).to_bits(), (b as f64).to_bits());
+        (r[6], r[7], r[8], r[9]) = (da as u32, (da >> 32) as u32, db as u32, (db >> 32) as u32);
+    }
+    let r = runner::run_code(&code, &st, &[]).unwrap();
+    let mut bad = Vec::new();
+    for l in 0..64 {
+        let v = &r.vgpr[l];
+        let (a, b) = cases[l % cases.len()];
+        let (mn, mx) = (zmin(a, b), zmax(a, b));
+        let d = |i: usize| ((v[i + 1] as u64) << 32) | v[i] as u64;
+        let checks = [
+            ("v_min_f32", v[10], f(mn)),
+            ("v_max_f32", v[11], f(mx)),
+            ("v_min3_f32", v[12], f(mn)),
+            ("v_max3_f32", v[13], f(mx)),
+            ("v_min_f16", v[14] & 0xFFFF, h(mn)),
+            ("v_max_f16", v[15] & 0xFFFF, h(mx)),
+            ("v_pk_min_f16", v[16], h(mn) * 0x1_0001),
+            ("v_pk_max_f16", v[17], h(mx) * 0x1_0001),
+        ];
+        for (name, got, want) in checks {
+            if got != want {
+                bad.push(format!("{name}({a:?}, {b:?}) = {got:#X}, want {want:#X}"));
+            }
+        }
+        for (name, got, want) in [("v_min_f64", d(18), (mn as f64).to_bits()), ("v_max_f64", d(20), (mx as f64).to_bits())] {
+            if got != want {
+                bad.push(format!("{name}({a:?}, {b:?}) = {got:#X}, want {want:#X}"));
+            }
+        }
+    }
+    bad.sort();
+    bad.dedup();
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
 /// Output modifiers each instruction kind applies: omod on f64 (clamp stays in double
 /// precision) and on the f64 → f32 / f32 → f16 conversions, and the integer clamp (saturation) of the
 /// unsigned adds, the packed 16-bit adds and the integer dot products.
