@@ -7227,6 +7227,81 @@ fn gpu_split_wave64_lane_local_masks() {
     }
 }
 
+/// Bitwise 64-bit SALU ops (`s_and_b64`, `s_or_b64`, `s_not_b64`, `s_andn2_b64`, `s_mov_b64`,
+/// `s_cselect_b64`) over lane-local masks stay in each 32-lane half when neither their
+/// destination nor `scc` is whole-live afterward; when `scc` IS read (e.g. only upper-half
+/// lanes match and `s_cselect_b32` reads `scc`), the inputs stay exchanged so both halves
+/// observe the same `scc`.
+#[test]
+fn gpu_split_wave64_bitwise_lane_masks() {
+    if !gpu_ready() {
+        return;
+    }
+    const V: u64 = 256;
+    // Part 1: 3 masks combined purely for v_cndmask_b32 -> zero ballot exchanges
+    let local_code = prog(&[
+        // s[20:21] = (v0 >= 10), s[22:23] = (v0 < 50), vcc = ((v0 & 1) == 0)
+        ("V_CMP_GE_U32", "ENC_VOP3", &[("VDST", 20), ("SRC0", V), ("SRC1", 138)], None),
+        ("V_CMP_LT_U32", "ENC_VOP3", &[("VDST", 22), ("SRC0", V), ("SRC1", 255)], Some(50)),
+        ("V_AND_B32", "ENC_VOP2", &[("VDST", 9), ("SRC0", 129), ("VSRC1", 0)], None),
+        ("V_CMP_EQ_U32", "ENC_VOPC", &[("SRC0", 128), ("VSRC1", 9)], None),
+        // s[24:25] = s[20:21] & s[22:23]  (10 <= l < 50)
+        ("S_AND_B64", "ENC_SOP2", &[("SDST", 24), ("SSRC0", 20), ("SSRC1", 22)], None),
+        // s[26:27] = s[24:25] & ~vcc  (10 <= l < 50 && l odd)
+        ("S_ANDN2_B64", "ENC_SOP2", &[("SDST", 26), ("SSRC0", 24), ("SSRC1", 106)], None),
+        // s[28:29] = ~s[20:21] | s[26:27]  (l < 10 || (10 <= l < 50 && l odd))
+        ("S_NOT_B64", "ENC_SOP1", &[("SDST", 28), ("SSRC0", 20)], None),
+        ("S_OR_B64", "ENC_SOP2", &[("SDST", 28), ("SSRC0", 28), ("SSRC1", 26)], None),
+        // vcc = s_mov_b64(s[28:29]), then s_cselect_b64 with uniform scc (s0 == 1)
+        ("S_MOV_B64", "ENC_SOP1", &[("SDST", 106), ("SSRC0", 28)], None),
+        ("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 0), ("SSRC1", 129)], None),
+        ("S_CSELECT_B64", "ENC_SOP2", &[("SDST", 106), ("SSRC0", 106), ("SSRC1", 26)], None),
+        ("V_CNDMASK_B32", "ENC_VOP2", &[("VDST", 1), ("SRC0", V + 2), ("VSRC1", 3)], None),
+        // Clear all mask SGPRs and overwrite SCC so kernel-mode readback sees uniform registers
+        ("S_MOV_B64", "ENC_SOP1", &[("SDST", 20), ("SSRC0", 128)], None),
+        ("S_MOV_B64", "ENC_SOP1", &[("SDST", 22), ("SSRC0", 128)], None),
+        ("S_MOV_B64", "ENC_SOP1", &[("SDST", 24), ("SSRC0", 128)], None),
+        ("S_MOV_B64", "ENC_SOP1", &[("SDST", 26), ("SSRC0", 128)], None),
+        ("S_MOV_B64", "ENC_SOP1", &[("SDST", 28), ("SSRC0", 128)], None),
+        ("S_MOV_B64", "ENC_SOP1", &[("SDST", 106), ("SSRC0", 128)], None),
+    ]);
+    if runner::split_wave64() {
+        let t = translate(&local_code, &runner::options(Mode::Kernel)).unwrap();
+        assert_eq!(t.hlsl.matches("= xcl_x_ballot_local(and(").count(), 3, "all 3 compares stay local");
+        assert_eq!(t.hlsl.matches("= xcl_x_ballot(and(").count(), 0, "no ballot exchange needed");
+    }
+    let mut st = KernelState::default();
+    st.sgpr[0] = 1;
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        r[0] = l as u32;
+        r[2] = 100 + l as u32;
+        r[3] = 200 + l as u32;
+    }
+    let r = runner::run_code(&local_code, &st, &[]).unwrap();
+    for l in 0..64u32 {
+        let cond = l < 10 || ((10..50).contains(&l) && l % 2 == 1);
+        assert_eq!(r.vgpr[l as usize][1], if cond { 200 + l } else { 100 + l }, "lane {l}: bitwise local mask");
+    }
+
+    // Part 2: only upper-half lanes (40..49) match; s_and_b64's SCC is read by s_cselect_b32 ->
+    // both compares must stay exchanged so half 0 and half 1 agree on SCC == 1.
+    let scc_code = prog(&[
+        ("V_CMP_GE_U32", "ENC_VOP3", &[("VDST", 20), ("SRC0", V), ("SRC1", 255)], Some(40)),
+        ("V_CMP_LT_U32", "ENC_VOP3", &[("VDST", 22), ("SRC0", V), ("SRC1", 255)], Some(50)),
+        ("S_AND_B64", "ENC_SOP2", &[("SDST", 24), ("SSRC0", 20), ("SSRC1", 22)], None),
+        ("S_CSELECT_B32", "ENC_SOP2", &[("SDST", 1), ("SSRC0", 255), ("SSRC1", 139)], Some(77)),
+        ("S_MOV_B64", "ENC_SOP1", &[("SDST", 20), ("SSRC0", 128)], None),
+        ("S_MOV_B64", "ENC_SOP1", &[("SDST", 22), ("SSRC0", 128)], None),
+        ("S_MOV_B64", "ENC_SOP1", &[("SDST", 24), ("SSRC0", 128)], None),
+    ]);
+    if runner::split_wave64() {
+        let t = translate(&scc_code, &runner::options(Mode::Kernel)).unwrap();
+        assert_eq!(t.hlsl.matches("= xcl_x_ballot(and(").count(), 2, "live SCC keeps both exchanges");
+    }
+    let r = runner::run_code(&scc_code, &st, &[]).unwrap();
+    assert_eq!(r.sgpr[1], 77, "both halves must see SCC == 1 from upper-half match");
+}
+
 /// Split-wave64 reduction-tail folding rules: 32-bit reduction tails, 64-bit `v_add_f64` tails,
 /// and direct `(L, L^32)` pairs fold into one `xcl_x_meet()`, while modifiers, mismatched lanes,
 /// `EXEC` writes, jump targets, and native wave64 stay untouched.

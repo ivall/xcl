@@ -1000,7 +1000,7 @@ impl Em {
         // lane (the half's own word, the lane's own bit are enough), that goes nowhere, or that
         // is 0 in every lane anyway
         let local = match *dst {
-            Dst::S(n) => n < 126 && self.mask_whole_live.get(&self.cur_pc).is_some_and(|live| live & (3u128 << n) == 0),
+            Dst::S(n) => n < 126 && n & 1 == 0 && self.mask_whole_live.get(&self.cur_pc).is_some_and(|live| live & (3u128 << n) == 0),
             Dst::Null => true,
             Dst::V(_) => false,
         };

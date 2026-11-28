@@ -2,13 +2,19 @@
 //!
 //! In the split form every mask write (`v_cmp*`, carries) exchanges the two halves' ballots so
 //! that both halves hold the whole 64-bit mask. A mask that is only ever read lane by lane –
-//! `v_cndmask_b32`'s selector, the carry-in of `v_add_co_ci` / `v_sub(rev)_co_ci` – needs just
-//! the reading lane's own bit, which its own half has. This is a backward liveness analysis
-//! over the SGPRs: a register is *whole-live* after an instruction when some path may read
-//! its whole value (any SALU / SMEM / VALU scalar operand, a branch on VCCZ, …) before it is
-//! written again. A mask write whose destination is not whole-live needs no exchange.
+//! `v_cndmask_b32`'s selector, the carry-in of `v_add_co_ci` / `v_sub(rev)_co_ci`, or even-aligned
+//! 64-bit bitwise SALU ops (`s_mov_b64`, `s_and_b64`, `s_or_b64`, `s_xor_b64`, `s_not_b64`,
+//! `s_andn2_b64`, `s_orn2_b64`, `s_nand_b64`, `s_nor_b64`, `s_xnor_b64`, `s_cselect_b64`,
+//! `s_cmov_b64`) whose destination is not whole-live and whose `scc` (if written) is dead – needs
+//! just the reading lane's own bit, which its own half has. This is a backward liveness analysis
+//! over the SGPRs and `scc`: a register is *whole-live* after an instruction when some path may
+//! read its whole value (any non-lane-wise SALU / SMEM / VALU scalar operand, a branch on VCCZ, a
+//! lane-wise op whose destination or written `scc` is live, …) before it is written again. A mask
+//! write whose destination is not whole-live needs no exchange.
 //! Pixel shaders use the same analysis: such a mask needs only the reading lane's own bit, not
 //! the quad reads that give every helper lane's bit (`ballot_px_local` / `ballot_px`, emit.rs).
+//! (`s_wqm_b64` is intentionally excluded because it combines 4-lane quads and therefore requires
+//! helper-lane quad bits in pixel shaders.)
 //!
 //! After a mask stays in its half the two halves hold different values in its registers, so a
 //! whole read that is missed here – or a write taken for a full overwrite that is not one –
@@ -69,6 +75,150 @@ fn reads_mask_per_lane(name: &str) -> bool {
     matches!(name, "V_CNDMASK_B32" | "V_ADD_CO_CI_U32" | "V_SUB_CO_CI_U32" | "V_SUBREV_CO_CI_U32")
 }
 
+/// Pure bit-independent 64-bit SALU ops whose bit `l` depends only on bit `l` of their inputs:
+/// `Some(sets_scc)`. When neither their destination nor (if `sets_scc`) `scc` is whole-live
+/// afterward, each lane (pixel shader) or 32-lane half (split-wave64) can evaluate the op on its
+/// local mask without exchanging the inputs.
+/// `S_WQM_B64` is excluded because it ORs across 4-lane quads, which needs full quad helper bits
+/// in pixel shaders (`ballot_px`).
+fn lane_wise_salu64(name: &str) -> Option<bool> {
+    match name {
+        "S_MOV_B64" | "S_CMOV_B64" | "S_CSELECT_B64" => Some(false),
+        "S_NOT_B64"
+        | "S_AND_B64"
+        | "S_OR_B64"
+        | "S_XOR_B64"
+        | "S_ANDN2_B64"
+        | "S_ORN2_B64"
+        | "S_NAND_B64"
+        | "S_NOR_B64"
+        | "S_XNOR_B64" => Some(true),
+        _ => None,
+    }
+}
+
+fn is_cmp_suffix(s: &str) -> bool {
+    matches!(
+        s,
+        "EQ_I32" | "LG_I32" | "GT_I32" | "GE_I32" | "LT_I32" | "LE_I32" | "EQ_U32" | "LG_U32" | "GT_U32" | "GE_U32" | "LT_U32" | "LE_U32"
+    )
+}
+
+/// Whether `emit.rs` unconditionally overwrites `scc` for `(name, enc_name)` (conservative: false
+/// whenever unsure).
+fn writes_scc_name(n: &str, enc_name: &str) -> bool {
+    match enc_name {
+        "ENC_SOPK" => n == "S_ADDK_I32" || n.strip_prefix("S_CMPK_").is_some_and(is_cmp_suffix),
+        "ENC_SOPC" => {
+            matches!(n, "S_CMP_EQ_U64" | "S_CMP_LG_U64" | "S_BITCMP0_B32" | "S_BITCMP1_B32" | "S_BITCMP0_B64" | "S_BITCMP1_B64")
+                || n.strip_prefix("S_CMP_").is_some_and(is_cmp_suffix)
+        }
+        "ENC_SOP1" | "ENC_SOP2" => {
+            if let Some(op) = n.strip_prefix("S_").and_then(|s| s.strip_suffix("_B32").or_else(|| s.strip_suffix("_B64"))) {
+                if let Some(kind) = op.strip_suffix("_SAVEEXEC").or_else(|| op.strip_suffix("_WREXEC")) {
+                    return matches!(kind, "AND" | "OR" | "XOR" | "ANDN2" | "ORN2" | "NAND" | "NOR" | "XNOR" | "ANDN1" | "ORN1");
+                }
+            }
+            matches!(
+                n,
+                "S_NOT_B32"
+                    | "S_BCNT0_I32_B32"
+                    | "S_BCNT1_I32_B32"
+                    | "S_ABS_I32"
+                    | "S_AND_B32"
+                    | "S_OR_B32"
+                    | "S_XOR_B32"
+                    | "S_ANDN2_B32"
+                    | "S_ORN2_B32"
+                    | "S_NAND_B32"
+                    | "S_NOR_B32"
+                    | "S_XNOR_B32"
+                    | "S_ADD_U32"
+                    | "S_SUB_U32"
+                    | "S_ADDC_U32"
+                    | "S_SUBB_U32"
+                    | "S_ADD_I32"
+                    | "S_SUB_I32"
+                    | "S_LSHL_B32"
+                    | "S_LSHR_B32"
+                    | "S_ASHR_I32"
+                    | "S_LSHL1_ADD_U32"
+                    | "S_LSHL2_ADD_U32"
+                    | "S_LSHL3_ADD_U32"
+                    | "S_LSHL4_ADD_U32"
+                    | "S_BFE_U32"
+                    | "S_BFE_I32"
+                    | "S_MIN_U32"
+                    | "S_MAX_U32"
+                    | "S_MIN_I32"
+                    | "S_MAX_I32"
+                    | "S_WQM_B32"
+                    | "S_ABSDIFF_I32"
+                    | "S_NOT_B64"
+                    | "S_WQM_B64"
+                    | "S_BCNT1_I32_B64"
+                    | "S_BCNT0_I32_B64"
+                    | "S_LSHL_B64"
+                    | "S_LSHR_B64"
+                    | "S_ASHR_I64"
+                    | "S_BFE_U64"
+                    | "S_BFE_I64"
+                    | "S_AND_B64"
+                    | "S_OR_B64"
+                    | "S_XOR_B64"
+                    | "S_ANDN2_B64"
+                    | "S_ORN2_B64"
+                    | "S_NAND_B64"
+                    | "S_NOR_B64"
+                    | "S_XNOR_B64"
+            )
+        }
+        _ => false,
+    }
+}
+
+/// Whether `name` implicitly reads `scc` regardless of its encoded operands.
+fn reads_scc_implicit(n: &str) -> bool {
+    matches!(n, "S_CBRANCH_SCC0" | "S_CBRANCH_SCC1" | "S_CSELECT_B32" | "S_CSELECT_B64" | "S_ADDC_U32" | "S_SUBB_U32")
+        || n.starts_with("S_CMOV")
+}
+
+/// Whether `d` may read `scc` (either implicitly or via scalar source code 253).
+fn reads_scc_fallback(d: &Decoded) -> bool {
+    if reads_scc_implicit(d.inst.name) {
+        return true;
+    }
+    if d.variant == Variant::Sdwa {
+        let Some(e) = ext_encoding(d) else { return true };
+        let fv = |f: &str| rdna2::field_value(e, &d.words, f).unwrap_or(0);
+        if (fv("S0") == 1 && fv("VSRC0") == 253) || (d.enc.field("VSRC1").is_some() && fv("S1") == 1 && fv("VSRC1") == 253) {
+            return true;
+        }
+    }
+    for o in d.ienc.operands {
+        if o.output {
+            continue;
+        }
+        if o.ty == "OPR_SSRC_SPECIAL_SCC" {
+            return true;
+        }
+        if o.implicit {
+            continue;
+        }
+        let Some(f) = o.field else { continue };
+        if f == "LITERAL" || (f == "SRC0" && d.variant != Variant::Plain) {
+            continue;
+        }
+        if !["SREG", "SSRC", "SDST", "OPR_SRC", "SMEM_OFFSET"].iter().any(|k| o.ty.contains(k)) {
+            continue;
+        }
+        if rdna2::register_scale(f) == 1 && rdna2::field_value(d.enc, &d.words, f) == Some(253) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Instructions that keep (part of) their destination's old value: the destination is read
 /// and not overwritten.
 fn keeps_destination(name: &str) -> bool {
@@ -107,7 +257,8 @@ struct DynOp {
     ranges: &'static [(u8, u8)],
     scale: u8,
     n: u8,
-    is_write: bool,
+    is_output: bool,
+    is_per_lane_mask: bool,
     is_src0: bool,
 }
 
@@ -116,7 +267,8 @@ impl DynOp {
         ranges: &[],
         scale: 1,
         n: 1,
-        is_write: false,
+        is_output: false,
+        is_per_lane_mask: false,
         is_src0: false,
     };
 }
@@ -126,6 +278,11 @@ struct UsePlan {
     ienc_ptr: usize,
     enc_ptr: usize,
     is_movrel: bool,
+    keeps: bool,
+    writes_scc: bool,
+    const_reads_scc: bool,
+    /// `0` = not lane-wise, `1` = lane-wise without writing `scc`, `2` = lane-wise writing `scc`.
+    lane_wise: u8,
     movrel_ssrc0: &'static [(u8, u8)],
     const_whole: Regs,
     const_written: Regs,
@@ -139,6 +296,10 @@ impl UsePlan {
         ienc_ptr: 0,
         enc_ptr: 0,
         is_movrel: false,
+        keeps: false,
+        writes_scc: false,
+        const_reads_scc: false,
+        lane_wise: 0,
         movrel_ssrc0: &[],
         const_whole: 0,
         const_written: 0,
@@ -164,6 +325,12 @@ impl UsePlanTable {
             let is_movrel = name.starts_with("S_MOVREL");
             let per_lane = reads_mask_per_lane(name);
             let keeps = keeps_destination(name);
+            let lane_wise = match lane_wise_salu64(name) {
+                None => 0,
+                Some(false) => 1,
+                Some(true) => 2,
+            };
+            let implicit_scc = reads_scc_implicit(name);
             for ienc in inst.encs {
                 let enc = &ENCODINGS[ienc.encoding as usize];
                 let ienc_ptr = ienc as *const rdna2::InstEnc as usize;
@@ -172,6 +339,10 @@ impl UsePlanTable {
                     ienc_ptr,
                     enc_ptr,
                     is_movrel,
+                    keeps,
+                    writes_scc: writes_scc_name(name, enc.name),
+                    const_reads_scc: implicit_scc,
+                    lane_wise,
                     movrel_ssrc0: if is_movrel {
                         enc.field("SSRC0").map_or(&[][..], |f| f.ranges)
                     } else {
@@ -183,51 +354,53 @@ impl UsePlanTable {
                     op_len: 0,
                     overflow: false,
                 };
-                if !is_movrel {
-                    for o in ienc.operands {
-                        let n = (o.size as u64).div_ceil(32).max(1);
-                        let fixed = match (o.field, o.ty) {
-                            (_, "OPR_VCC") => Some(VCC),
-                            (_, "OPR_EXEC" | "OPR_SDST_EXEC") => Some(EXEC),
-                            (_, "OPR_SDST_M0") => Some(M0),
-                            (None, _) | (Some("LITERAL"), _) => continue,
-                            (Some(f), ty) => {
-                                if o.implicit
-                                    || !["SREG", "SSRC", "SDST", "OPR_SRC", "SMEM_OFFSET"]
-                                        .iter()
-                                        .any(|k| ty.contains(k))
-                                {
-                                    continue;
-                                }
-                                if !o.output && per_lane && f == "SRC2" {
-                                    continue;
-                                }
-                                let idx = plan.op_len as usize;
-                                if idx < MAX_DYN_OPS && n <= u8::MAX as u64 {
-                                    plan.ops[idx] = DynOp {
-                                        ranges: enc.field(f).map_or(&[][..], |fld| fld.ranges),
-                                        scale: rdna2::register_scale(f) as u8,
-                                        n: n as u8,
-                                        is_write: o.output && !keeps,
-                                        is_src0: f == "SRC0",
-                                    };
-                                    plan.op_len += 1;
-                                } else {
-                                    plan.overflow = true;
-                                }
-                                None
+                for o in ienc.operands {
+                    if !o.output && o.ty == "OPR_SSRC_SPECIAL_SCC" {
+                        plan.const_reads_scc = true;
+                    }
+                    if is_movrel {
+                        continue;
+                    }
+                    let n = (o.size as u64).div_ceil(32).max(1);
+                    let fixed = match (o.field, o.ty) {
+                        (_, "OPR_VCC") => Some(VCC),
+                        (_, "OPR_EXEC" | "OPR_SDST_EXEC") => Some(EXEC),
+                        (_, "OPR_SDST_M0") => Some(M0),
+                        (None, _) | (Some("LITERAL"), _) => continue,
+                        (Some(f), ty) => {
+                            if o.implicit
+                                || !["SREG", "SSRC", "SDST", "OPR_SRC", "SMEM_OFFSET"]
+                                    .iter()
+                                    .any(|k| ty.contains(k))
+                            {
+                                continue;
                             }
-                        };
-                        if let Some(regs) = fixed {
-                            if o.output {
-                                if keeps {
-                                    plan.const_whole |= regs;
-                                } else {
-                                    plan.const_written |= regs;
-                                }
-                            } else if !(per_lane && (o.ty == "OPR_VCC" || o.field == Some("SRC2"))) {
+                            let idx = plan.op_len as usize;
+                            if idx < MAX_DYN_OPS && n <= u8::MAX as u64 {
+                                plan.ops[idx] = DynOp {
+                                    ranges: enc.field(f).map_or(&[][..], |fld| fld.ranges),
+                                    scale: rdna2::register_scale(f) as u8,
+                                    n: n as u8,
+                                    is_output: o.output,
+                                    is_per_lane_mask: !o.output && per_lane && f == "SRC2",
+                                    is_src0: f == "SRC0",
+                                };
+                                plan.op_len += 1;
+                            } else {
+                                plan.overflow = true;
+                            }
+                            None
+                        }
+                    };
+                    if let Some(regs) = fixed {
+                        if o.output {
+                            if keeps {
                                 plan.const_whole |= regs;
+                            } else {
+                                plan.const_written |= regs;
                             }
+                        } else if !(per_lane && (o.ty == "OPR_VCC" || o.field == Some("SRC2"))) {
+                            plan.const_whole |= regs;
                         }
                     }
                 }
@@ -360,9 +533,12 @@ fn uses_with_table(d: &Decoded, table: &UsePlanTable) -> (Regs, Regs) {
         if op.is_src0 && !plain {
             continue;
         }
+        if op.is_per_lane_mask {
+            continue;
+        }
         let code = extract_ranges(&d.words, op.ranges) * op.scale as u64;
         let regs = scalar_code(code, op.n as u64);
-        if op.is_write {
+        if op.is_output && !plan.keeps {
             written |= regs;
         } else {
             whole |= regs;
@@ -372,6 +548,182 @@ fn uses_with_table(d: &Decoded, table: &UsePlanTable) -> (Regs, Regs) {
         written = (written & !VCC) | dst;
     }
     (whole, written)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct InstFlow {
+    whole: Regs,
+    kill: Regs,
+    /// Even-aligned 64-bit bitwise SALU op: `(dst, lane_srcs, sets_scc)`.
+    lane_op: Option<(Regs, Regs, bool)>,
+    reads_scc: bool,
+    writes_scc: bool,
+}
+
+fn flow_fallback(d: &Decoded) -> InstFlow {
+    let (whole, kill) = uses_fallback(d);
+    let r_scc = reads_scc_fallback(d);
+    let w_scc = writes_scc_name(d.inst.name, d.enc.name);
+    let Some(sets_scc) = lane_wise_salu64(d.inst.name) else {
+        return InstFlow { whole, kill, lane_op: None, reads_scc: r_scc, writes_scc: w_scc };
+    };
+    if d.variant != Variant::Plain {
+        return InstFlow { whole, kill, lane_op: None, reads_scc: r_scc, writes_scc: w_scc };
+    }
+    // Verify even SGPR pair alignment on dst and all register sources so low/high half words can
+    // never cross-alias; scalar special codes `vccz` (251) / `execz` (252) always read whole.
+    let keeps = keeps_destination(d.inst.name);
+    let (mut dst_regs, mut lane_srcs, mut force_whole) = (0 as Regs, 0 as Regs, 0 as Regs);
+    for o in d.ienc.operands {
+        let Some(f) = o.field else { continue };
+        if o.implicit || f == "LITERAL" {
+            continue;
+        }
+        if !["SREG", "SSRC", "SDST", "OPR_SRC"].iter().any(|k| o.ty.contains(k)) {
+            continue;
+        }
+        let code = rdna2::field_value(d.enc, &d.words, f).unwrap_or(0) * rdna2::register_scale(f);
+        let n = (o.size as u64).div_ceil(32).max(1);
+        if o.output {
+            if code == 125 {
+                continue;
+            }
+            if code > 126 || code & 1 != 0 || n != 2 {
+                return InstFlow { whole, kill, lane_op: None, reads_scc: r_scc, writes_scc: w_scc };
+            }
+            let r = range(code, 2);
+            dst_regs |= r;
+            if keeps {
+                lane_srcs |= r;
+            }
+        } else {
+            match code {
+                251 => force_whole |= VCC,
+                252 => force_whole |= EXEC,
+                125 => {}
+                c if c <= 127 => {
+                    if c > 126 || c & 1 != 0 || n != 2 {
+                        return InstFlow { whole, kill, lane_op: None, reads_scc: r_scc, writes_scc: w_scc };
+                    }
+                    lane_srcs |= range(c, 2);
+                }
+                _ => {}
+            }
+        }
+    }
+    InstFlow { whole: force_whole, kill, lane_op: Some((dst_regs, lane_srcs, sets_scc)), reads_scc: r_scc, writes_scc: w_scc }
+}
+
+#[inline]
+fn flow_with_table(d: &Decoded, table: &UsePlanTable) -> InstFlow {
+    let ienc_ptr = d.ienc as *const rdna2::InstEnc as usize;
+    let enc_ptr = d.enc as *const rdna2::Encoding as usize;
+    let Some(plan) = table.get(ienc_ptr, enc_ptr) else {
+        return flow_fallback(d);
+    };
+    if plan.is_movrel {
+        let raw = extract_ranges(&d.words, plan.movrel_ssrc0);
+        let src = raw.min(124);
+        return InstFlow {
+            whole: range(src, 124 - src) | M0 | EXEC,
+            kill: 0,
+            lane_op: None,
+            reads_scc: plan.const_reads_scc || raw == 253,
+            writes_scc: plan.writes_scc,
+        };
+    }
+    let mut whole = plan.const_whole;
+    let mut kill = plan.const_written;
+    let mut r_scc = plan.const_reads_scc;
+    let mut sdwa_dst = None;
+    if d.variant == Variant::Sdwa {
+        let Some(e) = ext_encoding(d) else {
+            return InstFlow { whole: ALL, kill: 0, lane_op: None, reads_scc: true, writes_scc: plan.writes_scc };
+        };
+        let fv = |n: &str| rdna2::field_value(e, &d.words, n).unwrap_or(0);
+        if fv("S0") == 1 {
+            let v0 = fv("VSRC0");
+            whole |= scalar_code(v0, 1);
+            if v0 == 253 {
+                r_scc = true;
+            }
+        }
+        if d.enc.field("VSRC1").is_some() && fv("S1") == 1 {
+            let v1 = fv("VSRC1");
+            whole |= scalar_code(v1, 1);
+            if v1 == 253 {
+                r_scc = true;
+            }
+        }
+        if d.enc.name == "ENC_VOPC" && !d.inst.name.starts_with("V_CMPX") {
+            sdwa_dst = Some(if fv("SD") == 1 { scalar_code(fv("SDST"), 2) } else { VCC });
+        }
+    }
+    let plain = d.variant == Variant::Plain;
+    let try_lane = plan.lane_wise != 0 && plain;
+    let (mut lane_ok, mut dst_regs, mut lane_srcs, mut force_whole) = (try_lane, 0 as Regs, 0 as Regs, 0 as Regs);
+    for op in &plan.ops[..plan.op_len as usize] {
+        if op.is_src0 && !plain {
+            continue;
+        }
+        let raw = extract_ranges(&d.words, op.ranges);
+        if !op.is_output && op.scale == 1 && raw == 253 {
+            r_scc = true;
+        }
+        let code = raw * op.scale as u64;
+        if !op.is_per_lane_mask {
+            let regs = scalar_code(code, op.n as u64);
+            if op.is_output && !plan.keeps {
+                kill |= regs;
+            } else {
+                whole |= regs;
+            }
+        }
+        if lane_ok {
+            if op.is_output {
+                if code == 125 {
+                    continue;
+                }
+                if code > 126 || code & 1 != 0 || op.n != 2 {
+                    lane_ok = false;
+                } else {
+                    let r = range(code, 2);
+                    dst_regs |= r;
+                    if plan.keeps {
+                        lane_srcs |= r;
+                    }
+                }
+            } else {
+                match code {
+                    251 => force_whole |= VCC,
+                    252 => force_whole |= EXEC,
+                    125 => {}
+                    c if c <= 127 => {
+                        if c > 126 || c & 1 != 0 || op.n != 2 {
+                            lane_ok = false;
+                        } else {
+                            lane_srcs |= range(c, 2);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    if let Some(dst) = sdwa_dst {
+        kill = (kill & !VCC) | dst;
+    }
+    if lane_ok {
+        InstFlow {
+            whole: force_whole,
+            kill,
+            lane_op: Some((dst_regs, lane_srcs, plan.lane_wise == 2)),
+            reads_scc: r_scc,
+            writes_scc: plan.writes_scc,
+        }
+    } else {
+        InstFlow { whole, kill, lane_op: None, reads_scc: r_scc, writes_scc: plan.writes_scc }
+    }
 }
 
 /// (read whole, overwritten) SGPRs of one instruction. Lane-by-lane mask reads are left out
@@ -392,6 +744,9 @@ enum BlockSucc {
 struct Block {
     gen: Regs,
     kill: Regs,
+    scc_gen: bool,
+    scc_kill: bool,
+    has_lane_op: bool,
     succ: BlockSucc,
     exit_start: u32,
     exit_len: u32,
@@ -401,6 +756,7 @@ struct Block {
 fn whole_live_out_unsorted(insts: &[Decoded], end_reads_all: bool, table: &UsePlanTable) -> Vec<Regs> {
     let pcs: BTreeMap<u64, usize> = insts.iter().enumerate().map(|(i, d)| (d.pc, i)).collect();
     let at_end = if end_reads_all { ALL } else { EXEC };
+    let scc_at_end = end_reads_all;
     let succ: Vec<Option<Vec<usize>>> = insts
         .iter()
         .enumerate()
@@ -429,23 +785,36 @@ fn whole_live_out_unsorted(insts: &[Decoded], end_reads_all: bool, table: &UsePl
         .iter()
         .map(|d| loops.iter().filter(|&&(a, b)| a <= d.pc && d.pc < b).map(|&(_, b)| pcs.range(b..).next().map(|(_, &j)| j)).collect())
         .collect();
-    let gen_kill: Vec<(Regs, Regs)> = insts.iter().map(|d| uses_with_table(d, table)).collect();
+    let flows: Vec<InstFlow> = insts.iter().map(|d| flow_with_table(d, table)).collect();
     let mut live_in = vec![0 as Regs; insts.len()];
     let mut live_out = vec![0 as Regs; insts.len()];
+    let mut scc_in = vec![false; insts.len()];
+    let mut scc_out = vec![false; insts.len()];
     loop {
         let mut changed = false;
         for i in (0..insts.len()).rev() {
-            let out = match &succ[i] {
-                None => ALL,
-                Some(s) if s.is_empty() => at_end,
-                Some(s) => s.iter().fold(EXEC, |m, &j| m | live_in[j]),
+            let (out, sout) = match &succ[i] {
+                None => (ALL, true),
+                Some(s) if s.is_empty() => (at_end, scc_at_end),
+                Some(s) => s.iter().fold((EXEC, false), |(m, sc), &j| (m | live_in[j], sc || scc_in[j])),
             };
-            let left = exits[i].iter().fold(0, |m, e| m | at_end | e.map_or(0, |j| live_in[j]));
-            let (gen, kill) = gen_kill[i];
-            let inn = gen | (out & !kill) | left | EXEC;
-            if out != live_out[i] || inn != live_in[i] {
+            let (left, sleft) = exits[i].iter().fold((0 as Regs, false), |(m, sc), e| {
+                (m | at_end | e.map_or(0, |j| live_in[j]), sc || scc_at_end || e.is_some_and(|j| scc_in[j]))
+            });
+            let f = &flows[i];
+            let mut gen = f.whole;
+            if let Some((dst, srcs, sets_scc)) = f.lane_op {
+                if (out & dst) != 0 || (sets_scc && sout) {
+                    gen |= srcs;
+                }
+            }
+            let inn = gen | (out & !f.kill) | left | EXEC;
+            let sinn = f.reads_scc || (sout && !f.writes_scc) || sleft;
+            if out != live_out[i] || inn != live_in[i] || sout != scc_out[i] || sinn != scc_in[i] {
                 live_out[i] = out;
                 live_in[i] = inn;
+                scc_out[i] = sout;
+                scc_in[i] = sinn;
                 changed = true;
             }
         }
@@ -525,6 +894,7 @@ pub fn whole_live_out(insts: &[Decoded], end_reads_all: bool) -> Vec<Regs> {
     }
 
     let at_end = if end_reads_all { ALL } else { EXEC };
+    let scc_at_end = end_reads_all;
     let lookup_pc = |pc: u64| insts.binary_search_by_key(&pc, |d| d.pc).ok();
     let first_ge = |pc: u64| {
         let idx = insts.partition_point(|d| d.pc < pc);
@@ -589,19 +959,28 @@ pub fn whole_live_out(insts: &[Decoded], end_reads_all: bool) -> Vec<Regs> {
     }
     let num_blocks = block_starts.len();
 
-    let gen_kill: Vec<(Regs, Regs)> = insts.iter().map(|d| uses_with_table(d, table)).collect();
+    let flows: Vec<InstFlow> = insts.iter().map(|d| flow_with_table(d, table)).collect();
 
-    // Summarize each basic block: because `(X & !k) | X == X` for bitmasks, the constant
-    // per-block `left | EXEC` term collapses out of the intra-block composition into:
-    //   block_in[b] = block_gen[b] | (block_out[b] & !block_kill[b]) | block_left[b] | EXEC.
+    // Summarize each basic block: blocks without conditional `lane_op` instructions collapse
+    // into O(1) `(gen, kill, scc_gen, scc_kill)` summaries; blocks with a `lane_op` evaluate
+    // their exact backward transfer function only when their `(out, sout, left, sleft)` changes.
     let mut blocks: Vec<Block> = Vec::with_capacity(num_blocks);
     for b in 0..num_blocks {
         let start = block_starts[b];
         let end = if b + 1 < num_blocks { block_starts[b + 1] } else { n };
         let (mut bgen, mut bkill) = (0 as Regs, 0 as Regs);
-        for &(g, k) in gen_kill[start..end].iter().rev() {
-            bgen = g | (bgen & !k);
-            bkill |= k;
+        let (mut bsgen, mut bskill) = (false, false);
+        let mut has_lane_op = false;
+        for f in flows[start..end].iter().rev() {
+            if f.lane_op.is_some() {
+                has_lane_op = true;
+            }
+            if !has_lane_op {
+                bgen = f.whole | (bgen & !f.kill);
+                bkill |= f.kill;
+            }
+            bsgen = f.reads_scc || (bsgen && !f.writes_scc);
+            bskill |= f.writes_scc;
         }
         let d = &insts[end - 1];
         let next_block = (end < n).then(|| inst_to_block[end]);
@@ -638,6 +1017,9 @@ pub fn whole_live_out(insts: &[Decoded], end_reads_all: bool) -> Vec<Regs> {
         blocks.push(Block {
             gen: bgen,
             kill: bkill,
+            scc_gen: bsgen,
+            scc_kill: bskill,
+            has_lane_op,
             succ,
             exit_start: 0,
             exit_len: 0,
@@ -677,33 +1059,67 @@ pub fn whole_live_out(insts: &[Decoded], end_reads_all: bool) -> Vec<Regs> {
         }
     }
 
-    // Solve backward liveness at basic-block granularity.
+    // Solve backward liveness (SGPRs + SCC) at basic-block granularity.
     let mut block_in = vec![0 as Regs; num_blocks];
     let mut block_out = vec![0 as Regs; num_blocks];
+    let mut block_sin = vec![false; num_blocks];
+    let mut block_sout = vec![false; num_blocks];
+    let mut block_left = vec![0 as Regs; num_blocks];
+    let mut block_sleft = vec![false; num_blocks];
+    let mut block_seen = vec![false; num_blocks];
     loop {
         let mut changed = false;
         for b in (0..num_blocks).rev() {
             let blk = &blocks[b];
-            let out = match blk.succ {
-                BlockSucc::Indirect => ALL,
-                BlockSucc::Empty => at_end,
-                BlockSucc::One(s0) => EXEC | block_in[s0 as usize],
-                BlockSucc::Two(s0, s1) => EXEC | block_in[s0 as usize] | block_in[s1 as usize],
+            let (out, sout) = match blk.succ {
+                BlockSucc::Indirect => (ALL, true),
+                BlockSucc::Empty => (at_end, scc_at_end),
+                BlockSucc::One(s0) => (EXEC | block_in[s0 as usize], block_sin[s0 as usize]),
+                BlockSucc::Two(s0, s1) => (
+                    EXEC | block_in[s0 as usize] | block_in[s1 as usize],
+                    block_sin[s0 as usize] || block_sin[s1 as usize],
+                ),
             };
-            let left = if blk.has_exit {
+            let (left, sleft) = if blk.has_exit {
                 let es = blk.exit_start as usize;
                 let mut m = at_end;
+                let mut sc = scc_at_end;
                 for &eb in &exit_targets[es..es + blk.exit_len as usize] {
                     m |= block_in[eb as usize];
+                    sc |= block_sin[eb as usize];
                 }
-                m
+                (m, sc)
             } else {
-                0
+                (0, false)
             };
-            let inn = blk.gen | (out & !blk.kill) | left | EXEC;
-            if out != block_out[b] || inn != block_in[b] {
+            let (inn, sinn) = if !blk.has_lane_op {
+                (blk.gen | (out & !blk.kill) | left | EXEC, blk.scc_gen || (sout && !blk.scc_kill) || sleft)
+            } else if block_seen[b] && out == block_out[b] && sout == block_sout[b] && left == block_left[b] && sleft == block_sleft[b] {
+                (block_in[b], block_sin[b])
+            } else {
+                let start = block_starts[b];
+                let end = if b + 1 < num_blocks { block_starts[b + 1] } else { n };
+                let (mut cur, mut scur) = (out, sout);
+                for f in flows[start..end].iter().rev() {
+                    let mut gen = f.whole;
+                    if let Some((dst, srcs, sets_scc)) = f.lane_op {
+                        if (cur & dst) != 0 || (sets_scc && scur) {
+                            gen |= srcs;
+                        }
+                    }
+                    cur = gen | (cur & !f.kill) | left | EXEC;
+                    scur = f.reads_scc || (scur && !f.writes_scc) || sleft;
+                }
+                block_seen[b] = true;
+                block_left[b] = left;
+                block_sleft[b] = sleft;
+                (cur, scur)
+            };
+            if out != block_out[b] || inn != block_in[b] || sout != block_sout[b] || sinn != block_sin[b] {
                 block_out[b] = out;
                 block_in[b] = inn;
+                block_sout[b] = sout;
+                block_sin[b] = sinn;
                 changed = true;
             }
         }
@@ -718,21 +1134,30 @@ pub fn whole_live_out(insts: &[Decoded], end_reads_all: bool) -> Vec<Regs> {
         let blk = &blocks[b];
         let start = block_starts[b];
         let end = if b + 1 < num_blocks { block_starts[b + 1] } else { n };
-        let left = if blk.has_exit {
+        let (left, sleft) = if blk.has_exit {
             let es = blk.exit_start as usize;
             let mut m = at_end;
+            let mut sc = scc_at_end;
             for &eb in &exit_targets[es..es + blk.exit_len as usize] {
                 m |= block_in[eb as usize];
+                sc |= block_sin[eb as usize];
             }
-            m
+            (m, sc)
         } else {
-            0
+            (0, false)
         };
-        let mut out = block_out[b];
+        let (mut out, mut sout) = (block_out[b], block_sout[b]);
         for i in (start..end).rev() {
             live_out[i] = out;
-            let (g, k) = gen_kill[i];
-            out = g | (out & !k) | left | EXEC;
+            let f = &flows[i];
+            let mut gen = f.whole;
+            if let Some((dst, srcs, sets_scc)) = f.lane_op {
+                if (out & dst) != 0 || (sets_scc && sout) {
+                    gen |= srcs;
+                }
+            }
+            out = gen | (out & !f.kill) | left | EXEC;
+            sout = f.reads_scc || (sout && !f.writes_scc) || sleft;
         }
     }
     live_out
@@ -797,9 +1222,8 @@ mod tests {
 
     #[test]
     fn scalar_reads_and_branches_keep_the_exchange() {
-        let readers: [I; 5] = [
+        let readers: [I; 4] = [
             ("S_AND_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 106)]),
-            MOV_S2_VCC,
             ("S_CBRANCH_VCCZ", "ENC_SOPP", &[("SIMM16", 0)]),
             ("V_MOV_B32", "ENC_VOP1", &[("VDST", 5), ("SRC0", 106)]),
             ("S_BCNT1_I32_B64", "ENC_SOP1", &[("SDST", 4), ("SSRC0", 106)]),
@@ -808,28 +1232,34 @@ mod tests {
             let p = asm(&[CMP, reader, ENDPGM]);
             assert!(mask_needed(&whole_live_out(&p, false), 0, 106), "{}", reader.0);
         }
+        // s_mov_b64 keeps the exchange when its destination is read whole
+        let p = asm(&[CMP, MOV_S2_VCC, ("S_BCNT1_I32_B64", "ENC_SOP1", &[("SDST", 4), ("SSRC0", 2)]), ENDPGM]);
+        assert!(mask_needed(&whole_live_out(&p, false), 0, 106));
+        // s_wqm_b64 combines 4-lane quads so it stays whole-live (needed for pixel ballot_px_local)
+        let p = asm(&[CMP, ("S_WQM_B64", "ENC_SOP1", &[("SDST", 106), ("SSRC0", 106)]), CNDMASK, ENDPGM]);
+        assert!(mask_needed(&whole_live_out(&p, false), 0, 106));
     }
 
     #[test]
     fn a_whole_read_on_one_path_or_around_a_loop_keeps_the_exchange() {
-        // v_cmp; s_cbranch_scc0 → skip; v_cndmask; s_branch → end; skip: s_mov s[2:3], vcc; end
+        // v_cmp; s_cbranch_scc0 → skip; v_cndmask; s_branch → end; skip: s_bcnt1 vcc; end
         let p = asm(&[
             CMP,
             ("S_CBRANCH_SCC0", "ENC_SOPP", &[("SIMM16", 2)]),
             CNDMASK,
             ("S_BRANCH", "ENC_SOPP", &[("SIMM16", 1)]),
-            MOV_S2_VCC,
+            BCNT_VCC,
             ENDPGM,
         ]);
         assert!(mask_needed(&whole_live_out(&p, false), 0, 106));
         // loop: the mask written at the bottom is read whole at the top of the next iteration
-        let p = asm(&[MOV_S2_VCC, CMP, ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0xFFFD)]), ENDPGM]);
+        let p = asm(&[BCNT_VCC, CMP, ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0xFFFD)]), ENDPGM]);
         assert!(mask_needed(&whole_live_out(&p, false), 1, 106));
     }
 
     #[test]
     fn overwritten_before_any_whole_read() {
-        let p = asm(&[CMP, CNDMASK, CMP_LT, MOV_S2_VCC, ENDPGM]);
+        let p = asm(&[CMP, CNDMASK, CMP_LT, BCNT_VCC, ENDPGM]);
         let live = whole_live_out(&p, false);
         assert!(!mask_needed(&live, 0, 106));
         assert!(mask_needed(&live, 2, 106));
@@ -931,7 +1361,7 @@ mod tests {
             ("S_ADD_U32", "ENC_SOP2", &[("SDST", 30), ("SSRC0", 30), ("SSRC1", 255)][..], Some(20)),
             ("S_ADDC_U32", "ENC_SOP2", &[("SDST", 31), ("SSRC0", 31), ("SSRC1", 128)][..], None),
             ("S_SETPC_B64", "ENC_SOP1", &[("SSRC0", 30)][..], None),
-            (MOV_S2_VCC.0, MOV_S2_VCC.1, MOV_S2_VCC.2, None),
+            (BCNT_VCC.0, BCNT_VCC.1, BCNT_VCC.2, None),
             (CNDMASK.0, CNDMASK.1, CNDMASK.2, None),
             (ENDPGM.0, ENDPGM.1, ENDPGM.2, None),
         ] {
@@ -997,10 +1427,11 @@ mod tests {
         assert!(mask_needed(&whole_live_out(&p, false), 0, 106));
     }
 
-    /// Reference instruction-level solver matching the original implementation verbatim.
+    /// Reference instruction-level solver using `flow_fallback` verbatim.
     fn whole_live_out_reference(insts: &[Decoded], end_reads_all: bool) -> Vec<Regs> {
         let pcs: BTreeMap<u64, usize> = insts.iter().enumerate().map(|(i, d)| (d.pc, i)).collect();
         let at_end = if end_reads_all { ALL } else { EXEC };
+        let scc_at_end = end_reads_all;
         let succ: Vec<Option<Vec<usize>>> = insts
             .iter()
             .enumerate()
@@ -1029,23 +1460,36 @@ mod tests {
             .iter()
             .map(|d| loops.iter().filter(|&&(a, b)| a <= d.pc && d.pc < b).map(|&(_, b)| pcs.range(b..).next().map(|(_, &j)| j)).collect())
             .collect();
-        let gen_kill: Vec<(Regs, Regs)> = insts.iter().map(uses_fallback).collect();
+        let flows: Vec<InstFlow> = insts.iter().map(flow_fallback).collect();
         let mut live_in = vec![0 as Regs; insts.len()];
         let mut live_out = vec![0 as Regs; insts.len()];
+        let mut scc_in = vec![false; insts.len()];
+        let mut scc_out = vec![false; insts.len()];
         loop {
             let mut changed = false;
             for i in (0..insts.len()).rev() {
-                let out = match &succ[i] {
-                    None => ALL,
-                    Some(s) if s.is_empty() => at_end,
-                    Some(s) => s.iter().fold(EXEC, |m, &j| m | live_in[j]),
+                let (out, sout) = match &succ[i] {
+                    None => (ALL, true),
+                    Some(s) if s.is_empty() => (at_end, scc_at_end),
+                    Some(s) => s.iter().fold((EXEC, false), |(m, sc), &j| (m | live_in[j], sc || scc_in[j])),
                 };
-                let left = exits[i].iter().fold(0, |m, e| m | at_end | e.map_or(0, |j| live_in[j]));
-                let (gen, kill) = gen_kill[i];
-                let inn = gen | (out & !kill) | left | EXEC;
-                if out != live_out[i] || inn != live_in[i] {
+                let (left, sleft) = exits[i].iter().fold((0 as Regs, false), |(m, sc), e| {
+                    (m | at_end | e.map_or(0, |j| live_in[j]), sc || scc_at_end || e.is_some_and(|j| scc_in[j]))
+                });
+                let f = &flows[i];
+                let mut gen = f.whole;
+                if let Some((dst, srcs, sets_scc)) = f.lane_op {
+                    if (out & dst) != 0 || (sets_scc && sout) {
+                        gen |= srcs;
+                    }
+                }
+                let inn = gen | (out & !f.kill) | left | EXEC;
+                let sinn = f.reads_scc || (sout && !f.writes_scc) || sleft;
+                if out != live_out[i] || inn != live_in[i] || sout != scc_out[i] || sinn != scc_in[i] {
                     live_out[i] = out;
                     live_in[i] = inn;
+                    scc_out[i] = sout;
+                    scc_in[i] = sinn;
                     changed = true;
                 }
             }
@@ -1089,6 +1533,8 @@ mod tests {
                 }
                 if inner == 1 && k % 3 == 0 {
                     push(&mut bytes, MOV_S2_VCC.0, MOV_S2_VCC.1, MOV_S2_VCC.2);
+                    push(&mut bytes, "S_AND_B64", "ENC_SOP2", &[("SDST", 106), ("SSRC0", 2), ("SSRC1", 106)]);
+                    push(&mut bytes, CNDMASK.0, CNDMASK.1, CNDMASK.2);
                 }
                 // Back-edge to inner_start (offset in dwords from PC + 4)
                 let back_dw = -(((bytes.len() - inner_start) / 4 + 1) as i16) as u16 as u64;
@@ -1132,6 +1578,7 @@ mod tests {
                         far_target: None,
                     };
                     assert_eq!(uses(&d), uses_fallback(&d), "{} ({}, {variant:?})", inst.name, enc.name);
+                    assert_eq!(flow_with_table(&d, use_plans()), flow_fallback(&d), "flow {} ({}, {variant:?})", inst.name, enc.name);
                 }
             }
         }
@@ -1219,5 +1666,129 @@ mod tests {
                 ref_us / opt_us
             );
         }
+    }
+
+    #[test]
+    fn bitwise_mask_chain_for_selector_needs_no_exchange() {
+        let cmp_s22: I = ("V_CMP_LT_U32", "ENC_VOP3", &[("VDST", 22), ("SRC0", V + 2), ("SRC1", V + 3)]);
+        let p = asm(&[
+            CMP_S20,
+            cmp_s22,
+            ("S_AND_B64", "ENC_SOP2", &[("SDST", 24), ("SSRC0", 20), ("SSRC1", 22)]),
+            ("S_NOT_B64", "ENC_SOP1", &[("SDST", 24), ("SSRC0", 24)]),
+            ("S_OR_B64", "ENC_SOP2", &[("SDST", 26), ("SSRC0", 24), ("SSRC1", 20)]),
+            ("S_MOV_B64", "ENC_SOP1", &[("SDST", 106), ("SSRC0", 26)]),
+            CNDMASK,
+            ENDPGM,
+        ]);
+        let live = whole_live_out(&p, false);
+        assert!(!mask_needed(&live, 0, 20));
+        assert!(!mask_needed(&live, 1, 22));
+        // kernel mode reads all SGPRs and SCC at end: exchanges are kept
+        let live_k = whole_live_out(&p, true);
+        assert!(mask_needed(&live_k, 0, 20));
+        assert!(mask_needed(&live_k, 1, 22));
+    }
+
+    #[test]
+    fn bitwise_mask_with_live_scc_keeps_exchange() {
+        let cmp_s22: I = ("V_CMP_LT_U32", "ENC_VOP3", &[("VDST", 22), ("SRC0", V + 2), ("SRC1", V + 3)]);
+        let and_vcc: I = ("S_AND_B64", "ENC_SOP2", &[("SDST", 106), ("SSRC0", 20), ("SSRC1", 22)]);
+        let br_scc: I = ("S_CBRANCH_SCC0", "ENC_SOPP", &[("SIMM16", 0)]);
+        // SCC from s_and_b64 is live at s_cbranch_scc0 -> inputs must be exchanged
+        let p = asm(&[CMP_S20, cmp_s22, and_vcc, CNDMASK, br_scc, ENDPGM]);
+        let live = whole_live_out(&p, false);
+        assert!(mask_needed(&live, 0, 20));
+        assert!(mask_needed(&live, 1, 22));
+        // Overwriting SCC before the branch makes s_and_b64's SCC dead -> no exchange needed
+        let cmp_scc: I = ("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 0), ("SSRC1", 128)]);
+        let p = asm(&[CMP_S20, cmp_s22, and_vcc, CNDMASK, cmp_scc, br_scc, ENDPGM]);
+        let live = whole_live_out(&p, false);
+        assert!(!mask_needed(&live, 0, 20));
+        assert!(!mask_needed(&live, 1, 22));
+    }
+
+    #[test]
+    fn bitwise_mask_feeding_whole_read_keeps_exchange() {
+        let cmp_s22: I = ("V_CMP_LT_U32", "ENC_VOP3", &[("VDST", 22), ("SRC0", V + 2), ("SRC1", V + 3)]);
+        // Feeding s_and_saveexec_b64 (whole read of s[20:21])
+        let p = asm(&[
+            CMP_S20,
+            cmp_s22,
+            ("S_AND_B64", "ENC_SOP2", &[("SDST", 20), ("SSRC0", 20), ("SSRC1", 22)]),
+            ("S_AND_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 24), ("SSRC0", 20)]),
+            ENDPGM,
+        ]);
+        let live = whole_live_out(&p, false);
+        assert!(mask_needed(&live, 0, 20));
+        assert!(mask_needed(&live, 1, 22));
+        // Writing EXEC directly
+        let p = asm(&[CMP_S20, cmp_s22, ("S_AND_B64", "ENC_SOP2", &[("SDST", 126), ("SSRC0", 20), ("SSRC1", 22)]), ENDPGM]);
+        let live = whole_live_out(&p, false);
+        assert!(mask_needed(&live, 0, 20));
+        assert!(mask_needed(&live, 1, 22));
+    }
+
+    #[test]
+    fn cselect_and_cmov_b64_propagate_lane_masks_and_keep_scc_uniform() {
+        let cmp_s22: I = ("V_CMP_LT_U32", "ENC_VOP3", &[("VDST", 22), ("SRC0", V + 2), ("SRC1", V + 3)]);
+        // Uniform SCC from s_cmp_eq_u32 -> s_cselect_b64 needs no exchange on its mask inputs
+        let p = asm(&[
+            CMP_S20,
+            cmp_s22,
+            ("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 0), ("SSRC1", 128)]),
+            ("S_CSELECT_B64", "ENC_SOP2", &[("SDST", 106), ("SSRC0", 20), ("SSRC1", 22)]),
+            CNDMASK,
+            ENDPGM,
+        ]);
+        let live = whole_live_out(&p, false);
+        assert!(!mask_needed(&live, 0, 20));
+        assert!(!mask_needed(&live, 1, 22));
+        // s_cmov_b64 reads SCC from s_and_b64 -> s_and_b64's inputs must be exchanged so SCC is uniform
+        let p = asm(&[
+            CMP_S20,
+            cmp_s22,
+            ("S_AND_B64", "ENC_SOP2", &[("SDST", 24), ("SSRC0", 20), ("SSRC1", 22)]),
+            ("S_CMOV_B64", "ENC_SOP1", &[("SDST", 106), ("SSRC0", 20)]),
+            CNDMASK,
+            ENDPGM,
+        ]);
+        let live = whole_live_out(&p, false);
+        assert!(mask_needed(&live, 0, 20));
+        assert!(mask_needed(&live, 1, 22));
+    }
+
+    #[test]
+    fn vccz_operand_and_odd_alignment_in_bitwise_ops_keep_exchange() {
+        // SRC_VCCZ (251) tests all 64 bits of VCC -> VCC must stay exchanged
+        let p = asm(&[
+            CMP,
+            ("S_AND_B64", "ENC_SOP2", &[("SDST", 20), ("SSRC0", 22), ("SSRC1", 251)]),
+            ("V_CNDMASK_B32", "ENC_VOP3", &[("VDST", 2), ("SRC0", V + 3), ("SRC1", V + 4), ("SRC2", 20)]),
+            ENDPGM,
+        ]);
+        assert!(mask_needed(&whole_live_out(&p, false), 0, 106));
+        // Odd-aligned pair s[21:22] crosses even/odd half boundary -> stay conservative
+        let p = asm(&[
+            CMP_S20,
+            ("S_AND_B64", "ENC_SOP2", &[("SDST", 24), ("SSRC0", 21), ("SSRC1", 22)]),
+            ("V_CNDMASK_B32", "ENC_VOP3", &[("VDST", 2), ("SRC0", V + 3), ("SRC1", V + 4), ("SRC2", 24)]),
+            ENDPGM,
+        ]);
+        assert!(mask_needed(&whole_live_out(&p, false), 0, 20));
+    }
+
+    #[test]
+    fn loop_exit_reading_scc_keeps_exchange_inside_loop() {
+        // loop: v_cmp s[20:21]; s_and_b64 vcc, s[20:21], s[22:23]; v_cndmask; s_branch loop; s_cbranch_scc1
+        let p = asm(&[
+            CMP_S20,
+            ("S_AND_B64", "ENC_SOP2", &[("SDST", 106), ("SSRC0", 20), ("SSRC1", 22)]),
+            CNDMASK,
+            ("S_BRANCH", "ENC_SOPP", &[("SIMM16", 0xFFFC)]),
+            ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0)]),
+            ENDPGM,
+        ]);
+        assert!(mask_needed(&whole_live_out(&p, false), 0, 20));
     }
 }
