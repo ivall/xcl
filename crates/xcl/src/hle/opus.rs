@@ -1193,6 +1193,11 @@ impl MftDecoder {
             let bits = mt.GetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE).unwrap_or(0);
             let rate = mt.GetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND).unwrap_or(48_000);
             let ch = mt.GetUINT32(&MF_MT_AUDIO_NUM_CHANNELS).unwrap_or(self.channels as u32) as u16;
+            // The decoder interleaves `self.channels` channels; an output type with a
+            // different count would panic there, so only matching types are eligible.
+            if ch != self.channels {
+                continue;
+            }
             if sub == MFAudioFormat_PCM && bits == 16 {
                 chosen = Some((mt, OutputSampleFormat::Pcm16, rate, ch));
                 break;
@@ -1278,6 +1283,7 @@ impl MftDecoder {
     }
 
     unsafe fn drain_output(&mut self, rt: &MfRuntime, out: &mut Vec<i16>) -> Result<(), String> {
+        let mut stream_changes = 0u32;
         loop {
             let alloc_sample = if self.mft_provides_samples {
                 None
@@ -1309,6 +1315,10 @@ impl MftDecoder {
                 }
                 Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => break,
                 Err(e) if e.code() == MF_E_TRANSFORM_STREAM_CHANGE => {
+                    stream_changes += 1;
+                    if stream_changes > 4 {
+                        return Err("ProcessOutput: MF_E_TRANSFORM_STREAM_CHANGE kept coming back after reconfiguring".to_string());
+                    }
                     self.configure_output()?;
                     continue;
                 }
