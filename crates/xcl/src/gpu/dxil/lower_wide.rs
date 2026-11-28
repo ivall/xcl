@@ -179,10 +179,14 @@ impl Lw {
                             self.add(t, w)
                         }
                     };
-                    let (lo, hi) = (self.c(0xFFFF_8000), self.c(0x7FFF));
-                    let t = self.imin(t, hi);
-                    let t = self.imax(t, lo);
-                    self.andc(t, 0xFFFF)
+                    // Select between 16-bit patterns instead of masking `IMax(IMin(t, 0x7FFF), -32768)`:
+                    // NVIDIA Ampere drivers (610.88 / 616.56) drop the `& 0xFFFF` after `IMax(IMin(...))`,
+                    // leaving a sign-extended negative low half (`0xFFFF_xxxx`) that clobbers bits [31:16].
+                    let gt = self.cmpc(Pred::SGt, t, 0x7FFF);
+                    let lt = self.cmpc(Pred::SLt, t, 0xFFFF_8000);
+                    let low = self.andc(t, 0xFFFF);
+                    let r = self.selc(gt, 0x7FFF, low);
+                    self.selc(lt, 0x8000, r)
                 }
                 "v_pk_add_u16" | "v_pk_add_i16" => {
                     let t = self.add(a, b);
@@ -1450,6 +1454,183 @@ mod cmp64_tests {
         validate::validate(&dxil).expect("dxil validate");
         let dis = validate::disassemble(&dxil).expect("dxil disassemble");
         assert!(!dis.lines().any(|l| l.contains("icmp ") && l.contains(" i64 ")), "found i64 icmp in carry ops:\n{dis}");
+    }
+}
+
+#[cfg(test)]
+mod i16_clamp_mask_tests {
+    use crate::gpu::dxil::{kernel, validate};
+    use crate::gpu::rdna2;
+    use crate::gpu::recomp::runner;
+
+    fn sat16(v: i32) -> u32 {
+        v.clamp(-32768, 32767) as u32 & 0xFFFF
+    }
+
+    fn pk(lo: i16, hi: i16) -> u32 {
+        (lo as u16 as u32) | ((hi as u16 as u32) << 16)
+    }
+
+    /// Direct DXIL `v_pk_add_i16`, `v_pk_sub_i16`, and `v_pk_mad_i16` with `CLAMP=1` must saturate
+    /// via 32-bit signed comparisons and `select` over 16-bit masked values without `IMin`/`IMax`
+    /// or `Int64Ops`.
+    #[test]
+    fn v_pk_i16_clamp_uses_masked_select_without_imin_imax() {
+        const V: u64 = 256;
+        let pk2 = |dst: u64| [("VDST", dst), ("SRC0", V), ("SRC1", V + 1), ("OP_SEL_HI", 3), ("CLAMP", 1)];
+        let mut code = rdna2::encode("V_PK_ADD_I16", "ENC_VOP3P", &pk2(4), None).unwrap();
+        code.extend(rdna2::encode("V_PK_SUB_I16", "ENC_VOP3P", &pk2(5), None).unwrap());
+        code.extend(
+            rdna2::encode(
+                "V_PK_MAD_I16",
+                "ENC_VOP3P",
+                &[("VDST", 6), ("SRC0", V), ("SRC1", V + 1), ("SRC2", V + 2), ("OP_SEL_HI", 3), ("OP_SEL_HI_2", 1), ("CLAMP", 1)],
+                None,
+            )
+            .unwrap(),
+        );
+        code.extend(rdna2::encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+        let ko = kernel::KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 };
+        let dxil = kernel::translate(&code, ko).expect("direct translate");
+        if !validate::validator_supported() {
+            validate::skip_validation();
+            return;
+        }
+        validate::validate(&dxil).expect("dxil validate");
+        let dis = validate::disassemble(&dxil).expect("dxil disassemble");
+        assert!(!dis.contains("64-bit integers"), "v_pk_*_i16 CLAMP must not require Int64Ops:\n{dis}");
+        assert!(!dis.contains("@dx.op.binary.i32(i32 37,"), "v_pk_*_i16 CLAMP must not emit IMax:\n{dis}");
+        assert!(!dis.contains("@dx.op.binary.i32(i32 38,"), "v_pk_*_i16 CLAMP must not emit IMin:\n{dis}");
+        assert!(dis.contains("icmp sgt i32"), "v_pk_*_i16 CLAMP must compare against upper i16 bound:\n{dis}");
+        assert!(dis.contains("icmp slt i32"), "v_pk_*_i16 CLAMP must compare against lower i16 bound:\n{dis}");
+        assert!(dis.contains("select i1"), "v_pk_*_i16 CLAMP must saturate via select:\n{dis}");
+    }
+
+    /// Direct DXIL `v_pk_add_i16` / `v_pk_sub_i16` / `v_pk_mad_i16` with `CLAMP=1` (distinct source
+    /// registers), plus `v_cvt_pk_i16_i32` and `v_cvt_i16_f16` controls across the saturation edges
+    /// on the GPU: a negative saturated low half must not spill into bits [31:16]. With
+    /// `IMax(IMin(t, 0x7FFF), -0x8000) & 0xFFFF`, NVIDIA Ampere (RTX 3070 616.56 / RTX 3060 610.88)
+    /// returned e.g. `0xFFFF_FFFE` for `[-1, 1] - [1, 1]` instead of `0x0000_FFFE`.
+    #[test]
+    fn gpu_i16_clamp_negative_low_half_keeps_high_half() {
+        match runner::wave32_supported() {
+            Ok(true) => {}
+            Ok(false) => return runner::skip_test("no wave32"),
+            Err(e) => return runner::skip_test(&e),
+        }
+        const V: u64 = 256;
+        let pk2 = |dst: u64| [("VDST", dst), ("SRC0", V), ("SRC1", V + 1), ("OP_SEL_HI", 3), ("CLAMP", 1)];
+        let mut code = rdna2::encode("V_PK_ADD_I16", "ENC_VOP3P", &pk2(4), None).unwrap();
+        code.extend(rdna2::encode("V_PK_SUB_I16", "ENC_VOP3P", &pk2(5), None).unwrap());
+        code.extend(
+            rdna2::encode(
+                "V_PK_MAD_I16",
+                "ENC_VOP3P",
+                &[("VDST", 6), ("SRC0", V), ("SRC1", V + 1), ("SRC2", V + 9), ("OP_SEL_HI", 3), ("OP_SEL_HI_2", 1), ("CLAMP", 1)],
+                None,
+            )
+            .unwrap(),
+        );
+        code.extend(rdna2::encode("V_CVT_PK_I16_I32", "ENC_VOP3", &[("VDST", 7), ("SRC0", V + 2), ("SRC1", V + 3)], None).unwrap());
+        code.extend(rdna2::encode("V_CVT_I16_F16", "ENC_VOP1", &[("VDST", 8), ("SRC0", V + 10)], None).unwrap());
+        code.extend(rdna2::encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+        let ko = kernel::KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 };
+        let dxil = kernel::translate(&code, ko).expect("direct translate");
+
+        // [a_lo, a_hi] and [b_lo, b_hi]; the remaining lanes take pseudo-random halves
+        let pairs: [[i16; 4]; 16] = [
+            [-1, 1, 1, 1],
+            [-32768, 100, 1, -7],
+            [-2, 3, -32768, 4],
+            [5, 1, 1, 1],
+            [32767, -32768, 1, -1],
+            [-32768, 32767, -1, 1],
+            [-32768, -32768, -32768, -32768],
+            [32767, 32767, 32767, 32767],
+            [-23, 0, 0, 0],
+            [-100, 200, -100, 200],
+            [0, 0, 0, 0],
+            [-16384, 16384, -16385, 16384],
+            [-1, -1, -1, -1],
+            [100, -100, 200, 50],
+            [-32767, 5, 2, 6],
+            [1, -1, -32768, 32767],
+        ];
+        // [c_lo, c_hi] addends for `v_pk_mad_i16` (`sat16(a * b + c)`), exercising negative
+        // in-range low halves, positive/negative saturation, and 32-bit intermediate cancellation.
+        let mad_c: [[i16; 2]; 16] = [
+            [-1, 0],
+            [-1, 10],
+            [0, 1],
+            [-10, 0],
+            [1, -1],
+            [-32768, 1],
+            [-32768, 32767],
+            [32767, -32768],
+            [-23, 5],
+            [-20000, -32768],
+            [0, 0],
+            [0, 0],
+            [-32768, -32768],
+            [-32768, 1000],
+            [-10, 7],
+            [-1, 1],
+        ];
+        let cvt_pk: [(i32, i32); 8] =
+            [(-1, 1), (-40000, 1), (40000, -40000), (-32768, 32767), (-32769, 32768), (5, 7), (i32::MIN, i32::MAX), (-23, -23)];
+        // binary16 bits and the truncated, saturated result
+        let cvt_h: [(u32, i16); 8] = [
+            (0xBC00, -1),     // -1.0
+            (0xCDC0, -23),    // -23.0
+            (0xF8E2, -32768), // -40000.0
+            (0x78E2, 32767),  // 40000.0
+            (0xF800, -32768), // -32768.0
+            (0xFBFF, -32768), // -65504.0
+            (0x3C00, 1),      // 1.0
+            (0x0000, 0),      // +0.0
+        ];
+        let mut seed = 0x1234_5678u32;
+        let mut rnd = || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            seed
+        };
+        let mut st = runner::KernelState::default();
+        let mut want = Vec::new();
+        for (lane, r) in st.vgpr.iter_mut().take(32).enumerate() {
+            let (p, mc) = if lane < pairs.len() {
+                (pairs[lane], mad_c[lane])
+            } else {
+                let (x, y, z) = (rnd(), rnd(), rnd());
+                ([x as i16, (x >> 16) as i16, y as i16, (y >> 16) as i16], [z as i16, (z >> 16) as i16])
+            };
+            let (c0, c1) = if lane < cvt_pk.len() {
+                cvt_pk[lane]
+            } else {
+                (rnd() as i32 >> (lane % 16), rnd() as i32 >> (lane % 13))
+            };
+            let (h, hv) = cvt_h[lane % cvt_h.len()];
+            (r[0], r[1], r[2], r[3], r[9], r[10]) = (pk(p[0], p[1]), pk(p[2], p[3]), c0 as u32, c1 as u32, pk(mc[0], mc[1]), h);
+            let (a, b, c) = ([p[0] as i32, p[1] as i32], [p[2] as i32, p[3] as i32], [mc[0] as i32, mc[1] as i32]);
+            want.push([
+                sat16(a[0] + b[0]) | (sat16(a[1] + b[1]) << 16),
+                sat16(a[0] - b[0]) | (sat16(a[1] - b[1]) << 16),
+                sat16(a[0] * b[0] + c[0]) | (sat16(a[1] * b[1] + c[1]) << 16),
+                sat16(c0) | (sat16(c1) << 16),
+                hv as u16 as u32,
+            ]);
+        }
+        let res = runner::run(&dxil, &st, &[]).expect("GPU run");
+        let names = ["v_pk_add_i16 clamp", "v_pk_sub_i16 clamp", "v_pk_mad_i16 clamp", "v_cvt_pk_i16_i32", "v_cvt_i16_f16"];
+        let mut bad = Vec::new();
+        for (lane, w) in want.iter().enumerate() {
+            for (k, &e) in w.iter().enumerate() {
+                let got = res.vgpr[lane][4 + k];
+                if got != e {
+                    bad.push(format!("lane {lane} {}: got {got:#010X}, want {e:#010X}", names[k]));
+                }
+            }
+        }
+        assert!(bad.is_empty(), "{} mismatches:\n{}", bad.len(), bad.join("\n"));
     }
 }
 
