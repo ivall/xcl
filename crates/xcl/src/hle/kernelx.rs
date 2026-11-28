@@ -1550,9 +1550,12 @@ pub unsafe extern "system" fn UnregisterAppConstrainedChangeNotification(_regist
 // Threads / system info
 // ---------------------------------------------------------------------------------------
 
+// (Set/GetThreadDescription fail with HRESULT_FROM_NT of the status: 0xD0000008 for a bad handle)
 fn hresult_to_win32(hr: i32) -> u32 {
     if (hr as u32 & 0xFFFF_0000) == 0x8007_0000 {
         hr as u32 & 0xFFFF
+    } else if hr as u32 & 0x1000_0000 != 0 {
+        unsafe { RtlNtStatusToDosError(hr & !0x1000_0000) }
     } else {
         fnd::ERROR_INVALID_PARAMETER
     }
@@ -1743,6 +1746,7 @@ extern "system" {
     fn RtlGetVersion(info: *mut OsVersionInfoW) -> i32;
     fn NtQueryTimerResolution(coarsest: *mut u32, finest: *mut u32, current: *mut u32) -> i32;
     fn NtSetTimerResolution(desired: u32, set: u8, current: *mut u32) -> i32;
+    fn RtlNtStatusToDosError(status: i32) -> u32;
 }
 
 pub fn host_os_version() -> (u32, u32, u32) {
@@ -3005,10 +3009,13 @@ mod tests {
             assert_eq!(GetThreadName(cur, full.as_mut_ptr(), full.len(), std::ptr::null_mut()), 1);
             assert_eq!(&full[..], &want[..]);
 
-            // Invalid thread handle -> FALSE + Win32 error set.
+            // Invalid thread handle -> FALSE + ERROR_INVALID_HANDLE (the HRESULT is HRESULT_FROM_NT).
             fnd::SetLastError(0);
             assert_eq!(GetThreadName(std::ptr::null_mut(), full.as_mut_ptr(), full.len(), &mut ret), 0);
-            assert_ne!(fnd::GetLastError(), 0);
+            assert_eq!(fnd::GetLastError(), fnd::ERROR_INVALID_HANDLE);
+            fnd::SetLastError(0);
+            assert_eq!(SetThreadName(std::ptr::null_mut(), want.as_ptr()), 0);
+            assert_eq!(fnd::GetLastError(), fnd::ERROR_INVALID_HANDLE);
         })
         .join()
         .unwrap();
