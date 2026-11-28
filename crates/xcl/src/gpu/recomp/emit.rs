@@ -2666,11 +2666,6 @@ impl Em {
             Some('z') => 2,
             _ => 3,
         };
-        let f16 = {
-            let finfo = finfo.clone();
-            move |e: &str| format!("d16_fmt({e}, {}u, {finfo})", 4 + comp_of(e))
-        };
-
         if sampling {
             if matches!(dim, 6 | 7) {
                 return Err("MIMG sample MSAA");
@@ -2845,6 +2840,11 @@ impl Em {
                     ));
                     format!("{t}_pt")
                 }
+            };
+            // A gather's four lanes are taps of the selected component, not format channels.
+            let f16 = |e: &str| {
+                let component = if gather { comps[0] as u32 } else { comp_of(e) };
+                format!("d16_fmt({e}, {}u, {finfo})", 4 + component)
             };
             let half = move |e: &str| match point.as_str() {
                 "true" => f16(e),

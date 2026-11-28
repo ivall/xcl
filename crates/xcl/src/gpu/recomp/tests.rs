@@ -3298,7 +3298,7 @@ fn gpu_image_d16_gather4_l_of_unorm8_rounds_once() {
     }
     use runner::{TestSampler, TestTexture, TexDim};
     use windows::Win32::Graphics::Direct3D12::*;
-    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM;
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM};
     let mimg = |name: &'static str, f: &[(&str, u64)]| -> Vec<u8> { encode(name, "ENC_MIMG", f, None).unwrap() };
     // v[0:2] = (u, v, lod); component c's four halves in v[10 + 2c : 11 + 2c]
     let mut code = Vec::new();
@@ -3334,6 +3334,15 @@ fn gpu_image_d16_gather4_l_of_unorm8_rounds_once() {
         }
     }
     assert!(bad.is_empty(), "{} of 1024 differ:\n{}", bad.len(), bad.join("\n"));
+
+    // Each red tap is code 64 of 1023. The fourth returned lane is still red, not 2-bit alpha.
+    st.sgpr[16..24].copy_from_slice(&tsharp(0, 50, 9));
+    let data = (0..64).flat_map(|_| 64u32.to_le_bytes()).collect();
+    let packed = [TestTexture { format: DXGI_FORMAT_R10G10B10A2_UNORM, data, ..tex.into_iter().next().unwrap() }];
+    let r = runner::run_code_with(&code, &st, &[], &packed, &samp).unwrap();
+    for (lane, v) in r.vgpr.iter().enumerate() {
+        assert_eq!([v[10], v[11]], [0x2C01_2C01; 2], "lane {lane}: red's four taps round as 10-bit UNORM");
+    }
 }
 
 /// D16 samples with unnormalized coordinates (UNORM = 1; the direct DXIL path's
