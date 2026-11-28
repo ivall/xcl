@@ -8354,6 +8354,72 @@ fn f16_to_f64(h: u16) -> f64 {
     }
 }
 
+/// Float → integer conversions at the edges of their range: NaN gives 0, values past the range
+/// (±inf included) clamp, the rest truncate (v_cvt_flr / v_cvt_rpi first take floor(x) /
+/// floor(x + 0.5) in f32), as Rust's `as` does. The f16 sources carry another value in the high half.
+#[test]
+fn gpu_float_to_int_conversions_clamp_and_take_nan_as_zero() {
+    if !gpu_ready() {
+        return;
+    }
+    let f32s: [f32; 20] = [
+        f32::NAN,
+        -f32::NAN,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        2147483648.0,
+        f32::from_bits(0x4EFF_FFFF), // 2147483520: the largest f32 below 2^31
+        -2147483648.0,
+        f32::from_bits(0xCF00_0001), // the next f32 below -2^31
+        4294967296.0,
+        f32::from_bits(0x4F7F_FFFF), // the largest f32 below 2^32
+        -0.5,
+        -1.5,
+        1.5,
+        2.5,
+        -2.5,
+        -7.99,
+        -0.0,
+        f32::from_bits(1), // a denormal: 0 whether or not it is flushed
+        123456.7,
+        0.49,
+    ];
+    let f16s: [u16; 12] = [0x7E00, 0x7C00, 0xFC00, 0x7BFF, 0xFBFF, 0xBC00, 0x3E00, 0xBE00, 0x0001, 0x5A00, 0xF800, 0x7800];
+    let code = prog(&[
+        ("V_CVT_I32_F32", "ENC_VOP1", &[("VDST", 10), ("SRC0", V + 1)], None),
+        ("V_CVT_U32_F32", "ENC_VOP1", &[("VDST", 11), ("SRC0", V + 1)], None),
+        ("V_CVT_FLR_I32_F32", "ENC_VOP1", &[("VDST", 12), ("SRC0", V + 1)], None),
+        ("V_CVT_RPI_I32_F32", "ENC_VOP1", &[("VDST", 13), ("SRC0", V + 1)], None),
+        ("V_CVT_U16_F16", "ENC_VOP1", &[("VDST", 14), ("SRC0", V + 2)], None),
+        ("V_CVT_I16_F16", "ENC_VOP1", &[("VDST", 15), ("SRC0", V + 2)], None),
+    ]);
+    let mut st = KernelState::default();
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        r[1] = f32s[l % f32s.len()].to_bits();
+        r[2] = 0xBEEF_0000 | f16s[l % f16s.len()] as u32;
+    }
+    let r = runner::run_code(&code, &st, &[]).unwrap();
+    let mut bad = Vec::new();
+    for (l, v) in r.vgpr.iter().enumerate().take(f32s.len().max(f16s.len())) {
+        let (x, hx) = (f32s[l % f32s.len()], f16s[l % f16s.len()]);
+        let h = f16_to_f64(hx);
+        let checks = [
+            ("v_cvt_i32_f32", x as f64, v[10], x as i32 as u32, 0xFFFF_FFFF),
+            ("v_cvt_u32_f32", x as f64, v[11], x as u32, 0xFFFF_FFFF),
+            ("v_cvt_flr_i32_f32", x as f64, v[12], x.floor() as i32 as u32, 0xFFFF_FFFF),
+            ("v_cvt_rpi_i32_f32", x as f64, v[13], (x + 0.5).floor() as i32 as u32, 0xFFFF_FFFF),
+            ("v_cvt_u16_f16", h, v[14], h as u16 as u32, 0xFFFF),
+            ("v_cvt_i16_f16", h, v[15], h as i16 as u16 as u32, 0xFFFF),
+        ];
+        for (n, src, got, want, mask) in checks {
+            if got & mask != want {
+                bad.push(format!("{n}({src:e}) = {:#x}, want {want:#x}", got & mask));
+            }
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
 /// All 16 float compares of f32, f64 and f16 and v_cmpx_lt against the CPU on random operand
 /// pairs, a quarter of them equal. The VOP3 forms write SGPR pairs and the VOPC forms VCC.
 /// One wave of pairs per dispatch in 50 dispatches, or n dispatches with XCL_FUZZ_ITERS=n,
