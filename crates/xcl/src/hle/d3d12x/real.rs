@@ -1021,8 +1021,9 @@ unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
         }
     }
     // XCL_TWO_PASS_BATCH=2: a title call on a list with deferred two-pass draws records them
-    // first, unless it is one that cannot change what they draw (`bind::before_list_call`)
-    if kind == Kind::CommandList && super::bind::two_pass_defer() {
+    // first, unless it is one that cannot change what they draw (`bind::before_list_call`);
+    // XCL_INDIRECT_GUARD_BATCH=1: one that can write memory ends the list's batch of checks
+    if kind == Kind::CommandList && (super::bind::two_pass_defer() || super::indirect_guard::batch_on()) {
         for (i, e) in v.iter_mut().enumerate().skip(1) {
             *e = super::guard::make_before(*e, (i - 1) as u64, super::bind::before_list_call);
         }
