@@ -1072,6 +1072,47 @@ pub unsafe fn write_physical_pages(pages: &[usize], offset: usize, src: &[u8]) -
     true
 }
 
+/// Homes `move_home_away` collects before it gives them back (`give_back_homes`).
+const GIVE_BACK_PAGES: usize = 4096;
+
+/// Pages `map_pages` mapped in a sparse window, told to `sparse::committed` once per run of
+/// neighbouring pages instead of once a page. Each call is an `UpdateTileMappings` and a fence
+/// signal: about 0.5 ms a page on NVIDIA, and a retail game in Series S mode maps 3.4 GB in one
+/// `MapTitlePhysicalPages` at boot – 24 s on its main thread, and its stall check ended it.
+struct SparseRun {
+    start: usize,
+    end: usize,
+    commit: unsafe fn(usize, usize),
+}
+
+impl SparseRun {
+    fn new(commit: unsafe fn(usize, usize)) -> Self {
+        SparseRun { start: 0, end: 0, commit }
+    }
+
+    /// The page at `at` was mapped in a sparse window.
+    unsafe fn add(&mut self, at: usize) {
+        if self.start == self.end || at != self.end {
+            self.flush();
+            self.start = at;
+        }
+        self.end = at + PHYS_PAGE;
+    }
+
+    /// Whether the page at `a` waits in the run.
+    fn holds(&self, a: usize) -> bool {
+        (self.start..self.end).contains(&a)
+    }
+
+    /// The run's pages are committed now (before anything decommits one of them).
+    unsafe fn flush(&mut self) {
+        if self.end > self.start {
+            (self.commit)(self.start, self.end - self.start);
+        }
+        (self.start, self.end) = (0, 0);
+    }
+}
+
 /// A page's data went from `home` to another address: a home in a sparse window is
 /// decommitted at the end of the call or every 256 MB (`give_back_homes`; its GPU tiles go too: the GPU does
 /// not see the page while it is away). True if homes were given back now.
@@ -1080,7 +1121,7 @@ unsafe fn move_home_away(away: &mut Away, home: usize) -> bool {
         away.gone.push(home);
         // (256 MB at a time: a call that maps gigabytes would otherwise hold them twice until
         // it ends)
-        if away.gone.len() >= 4096 {
+        if away.gone.len() >= GIVE_BACK_PAGES {
             give_back_homes(away);
             return true;
         }
@@ -1423,6 +1464,7 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
     // unmapped first) – bar an address that is another page's home (a home in plain memory):
     // that answer was wrong before the runs too.
     let (mut at_run, mut home_run) = (StateRun::default(), StateRun::default());
+    let mut sparse_run = SparseRun::new(crate::hle::d3d12x::sparse::committed);
     for (i, &p) in pages.iter().enumerate() {
         let at = base + i * PHYS_PAGE;
         if unmap_away(away, at, &(0..0)) {
@@ -1432,6 +1474,10 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
             continue;
         }
         if let Some(&old) = away.page.get(&p) {
+            // (the move decommits `old`: committed first if it waits in the run)
+            if sparse_run.holds(old) {
+                sparse_run.flush();
+            }
             // (a move commits `at` and decommits `old`, which may lie in a run already answered:
             // both runs go – #556)
             match move_away(away, old, at, p, in_uma(at)) {
@@ -1442,6 +1488,7 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
                 // a lazy page is only unmarked: memory is as it was, the runs stay
                 Ok(false) => {}
                 Err(()) => {
+                    sparse_run.flush();
                     fnd::SetLastError(fnd::ERROR_INVALID_ADDRESS);
                     return std::ptr::null_mut();
                 }
@@ -1459,11 +1506,16 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
             continue;
         }
         if !in_uma(at) && mem::VirtualAlloc(at as *const c_void, PHYS_PAGE, mem::MEM_COMMIT, mem::PAGE_READWRITE).is_null() {
+            sparse_run.flush();
             fnd::SetLastError(fnd::ERROR_INVALID_ADDRESS);
             return std::ptr::null_mut();
         }
         if committed_page(home) {
             std::ptr::copy_nonoverlapping(home as *const u8, at as *mut u8, PHYS_PAGE);
+            // (giving homes back decommits them, and one may be an address in the run)
+            if sparse_run.holds(home) || away.gone.len() + 1 >= GIVE_BACK_PAGES {
+                sparse_run.flush();
+            }
             if move_home_away(away, home) {
                 (at_run, home_run) = Default::default();
             }
@@ -1471,11 +1523,12 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
             std::ptr::write_bytes(at as *mut u8, 0, PHYS_PAGE); // a page never used: zeros
         }
         if crate::gpu::uma::get().is_some_and(|u| u.is_sparse(at)) {
-            crate::hle::d3d12x::sparse::committed(at, PHYS_PAGE);
+            sparse_run.add(at);
         }
         away.at.insert(at, p);
         away.page.insert(p, at);
     }
+    sparse_run.flush();
     va
 }
 
@@ -2126,6 +2179,31 @@ pub unsafe extern "system" fn DisableThreadLibraryCalls(h: usize) -> BOOL {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Neighbouring sparse pages a mapping call maps are committed as one run; a gap starts
+    /// another, and `holds` names the pages still waiting (they are flushed before a decommit).
+    #[test]
+    fn sparse_pages_are_committed_once_per_run() {
+        static CALLS: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
+        unsafe fn note(a: usize, n: usize) {
+            CALLS.lock().unwrap().push((a, n));
+        }
+        let a = 0x10_0000_0000usize;
+        let mut run = SparseRun::new(note);
+        unsafe {
+            for i in 0..3 {
+                run.add(a + i * PHYS_PAGE);
+            }
+            assert!(CALLS.lock().unwrap().is_empty(), "nothing committed while the run grows");
+            assert!(run.holds(a + PHYS_PAGE) && !run.holds(a + 3 * PHYS_PAGE));
+            // a page past a gap: the run before it goes first
+            run.add(a + 5 * PHYS_PAGE);
+            run.flush();
+            run.flush();
+        }
+        assert_eq!(*CALLS.lock().unwrap(), vec![(a, 3 * PHYS_PAGE), (a + 5 * PHYS_PAGE, PHYS_PAGE)], "one call per run, none for an empty run");
+        assert!(!run.holds(a));
+    }
 
     fn real_sleep(ms: u32) {
         std::thread::sleep(std::time::Duration::from_millis(ms as u64));
