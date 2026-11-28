@@ -403,7 +403,9 @@ fn split_multistream_into<'a>(
 
 /// Split an RFC 7845 multistream packet into `stream_count` standard single-stream packets.
 pub fn split_multistream_packet<'a>(packet: &'a [u8], stream_count: usize) -> Option<Vec<Cow<'a, [u8]>>> {
-    if stream_count == 0 {
+    // Every self-delimited stream needs a TOC and a length byte; the last needs a TOC.
+    // Reject impossible counts before reserving the output vector.
+    if stream_count == 0 || stream_count > packet.len() / 2 + packet.len() % 2 {
         return None;
     }
     if stream_count == 1 {
@@ -1681,6 +1683,17 @@ fn f32_to_i16(x: f32) -> i16 {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    #[test]
+    fn multistream_count_must_fit_the_packet_before_reserving() {
+        assert!(split_multistream_packet(&[], 1).is_none());
+        assert!(split_multistream_packet(&[0], 0).is_none());
+        assert!(split_multistream_packet(&[0], 2).is_none());
+        assert!(split_multistream_packet(&[0], usize::MAX).is_none());
+        let streams = split_multistream_packet(&[0, 0, 0], 2).unwrap();
+        assert_eq!(streams.len(), 2);
+        assert_eq!(streams[0].as_ref(), &[0]);
+        assert_eq!(streams[1].as_ref(), &[0]);
+    }
 
     #[test]
     fn rfc6716_table2_all_32_configs() {
