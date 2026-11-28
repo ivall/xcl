@@ -24,8 +24,8 @@ function Write-Fixture([string]$Root, [string]$Commit, [int]$ColdMs, $WarmMs,
         run_order = @('xcl-cold', 'xcl-warm')
         environment = [ordered]@{ XCL_PRESS_AT = '20:A' }
         runs = @(
-            [ordered]@{ order = 1; cache_state = 'xcl-cold'; duration_requested_seconds = 60; duration_actual_ms = $ColdMs; exit_code = 0; timed_out = $false },
-            [ordered]@{ order = 2; cache_state = 'xcl-warm'; duration_requested_seconds = 60; duration_actual_ms = $WarmMs; exit_code = $null; timed_out = $true }
+            [ordered]@{ order = 1; cache_state = 'xcl-cold'; duration_requested_seconds = 60; startup_timeout_seconds = 120; duration_actual_ms = $ColdMs; exit_code = 0; timed_out = $false },
+            [ordered]@{ order = 2; cache_state = 'xcl-warm'; duration_requested_seconds = 60; startup_timeout_seconds = 120; duration_actual_ms = $WarmMs; exit_code = $null; timed_out = $true }
         )
     }
     $manifest | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $Root 'manifest.json') -Encoding utf8
@@ -343,6 +343,27 @@ try {
     $refused = $false
     try { $null = & $tool -Baseline $baseline -Candidate $candidate } catch { $refused = $_.Exception.Message -match 'xcl-warm GPU driver differs' }
     if (-not $refused) { throw 'GPU driver present on only one side was not refused' }
+    Write-Fixture $baseline 'base-commit' 1000 0
+    Write-Fixture $candidate 'candidate-commit' 850 0
+    $candidateManifest = Get-Content -LiteralPath (Join-Path $candidate 'manifest.json') -Raw -Encoding utf8 | ConvertFrom-Json
+    $candidateManifest.runs[0].startup_timeout_seconds = 7200
+    $candidateManifest | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $candidate 'manifest.json') -Encoding utf8
+    $refused = $false
+    try { $null = & $tool -Baseline $baseline -Candidate $candidate } catch { $refused = $_.Exception.Message -match 'xcl-cold startup timeout differs' }
+    if (-not $refused) { throw 'different startup timeouts were not refused' }
+
+    # XCL settings are case-sensitive: XCL_DIRECT_DXIL=all enables direct translation, ALL does not.
+    Write-Fixture $baseline 'base-commit' 1000 0
+    Write-Fixture $candidate 'candidate-commit' 850 0
+    $baselineManifest = Get-Content -LiteralPath (Join-Path $baseline 'manifest.json') -Raw -Encoding utf8 | ConvertFrom-Json
+    $candidateManifest = Get-Content -LiteralPath (Join-Path $candidate 'manifest.json') -Raw -Encoding utf8 | ConvertFrom-Json
+    $baselineManifest.environment | Add-Member -NotePropertyName XCL_DIRECT_DXIL -NotePropertyValue 'all'
+    $candidateManifest.environment | Add-Member -NotePropertyName XCL_DIRECT_DXIL -NotePropertyValue 'ALL'
+    $baselineManifest | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $baseline 'manifest.json') -Encoding utf8
+    $candidateManifest | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $candidate 'manifest.json') -Encoding utf8
+    $refused = $false
+    try { $null = & $tool -Baseline $baseline -Candidate $candidate } catch { $refused = $_.Exception.Message -match 'runtime environment differs' }
+    if (-not $refused) { throw 'environments differing only in case were not refused' }
 
     Write-Host 'perf-compare tests: all assertions passed'
 } finally {

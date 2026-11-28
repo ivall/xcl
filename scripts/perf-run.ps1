@@ -6,7 +6,10 @@ param(
     [Parameter(Mandatory = $true)][string]$OutDir,
     [int]$Seconds = 120,
     [string[]]$CargoFeatures = @(),
-    [string]$CargoTargetDir
+    [string]$CargoTargetDir,
+    # Additional time for launcher work such as shader preparation before the guest timer starts.
+    # An XCL-cold run prepares every shader of the title first, which can take far longer.
+    [ValidateRange(1,86400)][int]$StartupTimeoutSeconds = 120
 )
 $ErrorActionPreference = 'Stop'
 
@@ -80,7 +83,11 @@ function Get-WorkloadIdentity([string]$Path) {
 
 $workloadIdentity = Get-WorkloadIdentity $gamePath
 
+# Native commands run with 'Continue': under Windows PowerShell, when the output is redirected
+# (a queued or logged run), each stderr line becomes an error record that 'Stop' would throw on.
+# Their exit codes are checked instead.
 function Run-Git([string[]]$Arguments) {
+    $ErrorActionPreference = 'Continue'
     $out = @(& git.exe -C $root @Arguments)
     if ($LASTEXITCODE -ne 0) { throw "git $($Arguments -join ' ') failed with exit code $LASTEXITCODE" }
     return $out
@@ -115,11 +122,14 @@ $cargoArguments += '--target-dir', $cargoTargetPath
 
 Push-Location $root
 try {
+    $ErrorActionPreference = 'Continue'
     & cargo @cargoArguments
-    if ($LASTEXITCODE -ne 0) { throw "release build failed with exit code $LASTEXITCODE" }
+    $buildExit = $LASTEXITCODE
 } finally {
+    $ErrorActionPreference = 'Stop'
     Pop-Location
 }
+if ($buildExit -ne 0) { throw "release build failed with exit code $buildExit" }
 if (@(Run-Git -Arguments @('status', '--porcelain', '--untracked-files=all')).Count -ne 0) {
     throw 'the worktree changed during the release build'
 }
@@ -139,14 +149,11 @@ $dxilCache = Join-Path $cacheRoot 'dxil'
 $null = New-Item -ItemType Directory -Path $dataRoot
 $null = New-Item -ItemType Directory -Path $dxilCache
 
-$environmentNames = @(
-    'XCL_ACTIVITY', 'XCL_ADAPTER', 'XCL_DEVICE_TYPE', 'XCL_DIRECT_DXIL',
-    'XCL_DXC_THREADS', 'XCL_FRAME_INTERVAL_US', 'XCL_HEAP_WINDOWS',
-    'XCL_GPU_TIMING', 'XCL_GPU_TIMING_MS', 'XCL_LAZY_PSO', 'XCL_NETWORK', 'XCL_PRESS_AT', 'XCL_PSO_PRELOAD',
-    'XCL_REQUIRE_GPU', 'XCL_RUN_SECONDS', 'XCL_STALL_TRACE'
-)
 $changedNames = @('XCL_ACTIVITY', 'XCL_DATA_ROOT', 'XCL_DXIL_CACHE', 'XCL_GPU_TIMING', 'XCL_GPU_TIMING_MS',
     'XCL_NETWORK', 'XCL_RUN_SECONDS', 'XCL_STALL_TRACE')
+# Every XCL_* setting the runs inherit is recorded, since the runtime reads far more switches than a
+# list could keep up with. Left out: the per-run cache paths set below and this script's test hooks.
+$unrecordedNames = @('XCL_DATA_ROOT', 'XCL_DXIL_CACHE')
 $savedEnvironment = @{}
 foreach ($name in $changedNames) {
     $savedEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
@@ -165,6 +172,64 @@ function Video-Driver([string]$Adapter) {
     }
 }
 
+# A job object that kills its processes when terminated or closed, so a run's whole process tree
+# ends with it.
+if (-not ('XclPerfRun.KillOnCloseJob' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+namespace XclPerfRun {
+    public sealed class KillOnCloseJob : IDisposable {
+        [StructLayout(LayoutKind.Sequential)]
+        struct BasicLimitInformation {
+            public long PerProcessUserTimeLimit, PerJobUserTimeLimit;
+            public uint LimitFlags;
+            public UIntPtr MinimumWorkingSetSize, MaximumWorkingSetSize;
+            public uint ActiveProcessLimit;
+            public UIntPtr Affinity;
+            public uint PriorityClass, SchedulingClass;
+        }
+        [StructLayout(LayoutKind.Sequential)]
+        struct ExtendedLimitInformation {
+            public BasicLimitInformation Basic;
+            public ulong ReadOperationCount, WriteOperationCount, OtherOperationCount;
+            public ulong ReadTransferCount, WriteTransferCount, OtherTransferCount;
+            public UIntPtr ProcessMemoryLimit, JobMemoryLimit, PeakProcessMemoryUsed, PeakJobMemoryUsed;
+        }
+        const int ExtendedLimitInformationClass = 9;
+        const uint KillOnJobClose = 0x2000;
+        [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr CreateJobObjectW(IntPtr attributes, IntPtr name);
+        [DllImport("kernel32.dll", SetLastError = true)] static extern bool SetInformationJobObject(IntPtr job, int infoClass, ref ExtendedLimitInformation info, int length);
+        [DllImport("kernel32.dll", SetLastError = true)] static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+        [DllImport("kernel32.dll", SetLastError = true)] static extern bool TerminateJobObject(IntPtr job, uint exitCode);
+        [DllImport("kernel32.dll", SetLastError = true)] static extern bool CloseHandle(IntPtr handle);
+        IntPtr handle;
+        public KillOnCloseJob() {
+            handle = CreateJobObjectW(IntPtr.Zero, IntPtr.Zero);
+            if (handle == IntPtr.Zero) throw new Win32Exception();
+            var info = new ExtendedLimitInformation();
+            info.Basic.LimitFlags = KillOnJobClose;
+            if (!SetInformationJobObject(handle, ExtendedLimitInformationClass, ref info, Marshal.SizeOf(typeof(ExtendedLimitInformation)))) {
+                var error = new Win32Exception();
+                Dispose();
+                throw error;
+            }
+        }
+        public void Add(IntPtr process) {
+            if (!AssignProcessToJobObject(handle, process)) throw new Win32Exception();
+        }
+        public void Terminate() {
+            if (!TerminateJobObject(handle, 1)) throw new Win32Exception();
+        }
+        public void Dispose() {
+            if (handle != IntPtr.Zero) { CloseHandle(handle); handle = IntPtr.Zero; }
+        }
+    }
+}
+'@
+}
+
 function Invoke-PerfRun([string]$Mode, [int]$Order) {
     $runName = '{0:d2}-{1}' -f $Order, $Mode
     $artifactDir = Join-Path (Join-Path $outPath 'runs') $runName
@@ -176,7 +241,9 @@ function Invoke-PerfRun([string]$Mode, [int]$Order) {
         $psi.Arguments = '/d /c ""' + $xcl + '" run "' + $gamePath + '""'
     } else {
         $psi.FileName = $xcl
-        $psi.Arguments = 'run "' + $gamePath + '"'
+        # Windows argument parsing halves backslashes before a quote, so a folder given with a
+        # trailing separator needs that run doubled or its closing quote becomes part of the path.
+        $psi.Arguments = 'run "' + ($gamePath -replace '(\\+)$', '$1$1') + '"'
     }
     $psi.WorkingDirectory = $root
     $psi.UseShellExecute = $false
@@ -188,20 +255,36 @@ function Invoke-PerfRun([string]$Mode, [int]$Order) {
 
     $process = New-Object System.Diagnostics.Process
     $process.StartInfo = $psi
-    $watch = [Diagnostics.Stopwatch]::StartNew()
-    $null = $process.Start()
-    $stdoutTask = $process.StandardOutput.ReadToEndAsync()
-    $stderrTask = $process.StandardError.ReadToEndAsync()
-    $timedOut = -not $process.WaitForExit(($Seconds + 120) * 1000)
-    if ($timedOut -and -not $process.HasExited) { $process.Kill() }
-    $process.WaitForExit()
-    $watch.Stop()
+    $job = New-Object XclPerfRun.KillOnCloseJob
+    try {
+        $watch = [Diagnostics.Stopwatch]::StartNew()
+        $null = $process.Start()
+        $job.Add($process.Handle)
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        $timedOut = -not $process.WaitForExit(($Seconds + $StartupTimeoutSeconds) * 1000)
+        # Ends the launcher and everything it started, so that no process left behind keeps
+        # writing the run's log or holds its output pipes open after the run is timed.
+        $job.Terminate()
+        $process.WaitForExit()
+        $watch.Stop()
+    } finally {
+        $job.Dispose()
+    }
+    # A process that escaped the job (started before the launcher was assigned to it) could still
+    # hold the pipes; do not wait for it indefinitely.
+    if (-not $stdoutTask.Wait(30000) -or -not $stderrTask.Wait(30000)) {
+        throw "the $Mode run's output was still open 30 s after XCL ended"
+    }
     $stdout = $stdoutTask.Result
-    $null = $stderrTask.Result
+    $stderr = $stderrTask.Result
 
-    $logLine = ($stdout -split '\r?\n' | Where-Object { $_ -match '^Log:\s+(.+)$' } | Select-Object -Last 1)
-    if (-not $logLine) { throw "XCL printed no log path during the $Mode run" }
-    $log = ($logLine -replace '^Log:\s+', '').Trim()
+    # A run that ends normally prints `Log: <path>`; one that crashes before writing its report
+    # prints `No report - see the log: <path>` instead. Keep that log too: it is the crash record.
+    $logPattern = '^\s*(?:Log:|No report\b.*\bsee the log:)\s+(.+)$'
+    $logLine = ($stdout -split '\r?\n' | Where-Object { $_ -match $logPattern } | Select-Object -Last 1)
+    if (-not $logLine) { throw "XCL printed no log path during the $Mode run (exit code $($process.ExitCode), timed out: $timedOut); its output:`n$stdout`n$stderr" }
+    $log = ($logLine -replace $logPattern, '$1').Trim()
     if (-not (Test-Path -LiteralPath $log)) { throw "XCL's $Mode log does not exist: $log" }
     Copy-Item -LiteralPath $log -Destination (Join-Path $artifactDir 'xcl.log')
 
@@ -220,6 +303,7 @@ function Invoke-PerfRun([string]$Mode, [int]$Order) {
         order = $Order
         cache_state = "xcl-$Mode"
         duration_requested_seconds = $Seconds
+        startup_timeout_seconds = $StartupTimeoutSeconds
         duration_actual_ms = $watch.ElapsedMilliseconds
         exit_code = if ($timedOut) { $null } else { $process.ExitCode }
         timed_out = $timedOut
@@ -240,7 +324,11 @@ try {
     $env:XCL_STALL_TRACE = '1'
 
     $recordedEnvironment = [ordered]@{}
-    foreach ($name in $environmentNames) {
+    [string[]]$recordedNames = @([Environment]::GetEnvironmentVariables('Process').Keys |
+        ForEach-Object { ([string]$_).ToUpperInvariant() } |
+        Where-Object { $_.StartsWith('XCL_') -and -not $_.StartsWith('XCL_PERF_RUN_') -and $_ -notin $unrecordedNames })
+    [Array]::Sort($recordedNames, [StringComparer]::Ordinal)
+    foreach ($name in $recordedNames) {
         $recordedEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
     }
 
@@ -255,8 +343,11 @@ try {
         $os = Get-CimInstance Win32_OperatingSystem
         $windows = "$($os.Caption) $($os.Version) build $($os.BuildNumber)"
     } catch { }
+    $ErrorActionPreference = 'Continue'
     $rust = (& rustc -Vv) -join [Environment]::NewLine
-    if ($LASTEXITCODE -ne 0) { throw 'rustc -Vv failed' }
+    $rustExit = $LASTEXITCODE
+    $ErrorActionPreference = 'Stop'
+    if ($rustExit -ne 0) { throw 'rustc -Vv failed' }
     $verifiedWorkloadIdentity = Get-WorkloadIdentity $gamePath
     if ($verifiedWorkloadIdentity.id -ne $workloadIdentity.id) {
         throw 'game metadata inventory changed during the performance runs'
