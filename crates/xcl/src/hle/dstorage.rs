@@ -935,7 +935,10 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
     } else {
         src
     };
-    let payload = if bc != 0 { bcpack_unpack(r, &stage1, n)? } else { stage1 };
+    let mut payload = if bc != 0 { bcpack_unpack(r, &stage1, n)? } else { stage1 };
+    if bc == 0 && !r.zlib() && payload.len() < n {
+        payload.resize(n, 0);
+    }
 
     if r.dest_physical_pages() {
         let pages = dest_pages.ok_or(E_ACCESS_VIOLATION)?;
@@ -2222,6 +2225,75 @@ mod tests {
             assert!(status_is_complete(s, 3));
             assert_eq!(status_get_hresult(s, 3), S_OK);
             status_release(s);
+        }
+    }
+
+    /// An uncompressed request whose source_size < destination_size: payload is zero-padded
+    /// up to destination_size without panicking on physical page slicing or over-reading on virtual copy.
+    #[test]
+    fn uncompressed_request_with_short_source_is_zero_padded() {
+        let src_data = b"Short uncompressed DirectStorage payload";
+        let src_len = src_data.len() as u32;
+        let dst_len = src_len + 48;
+        let mut dst = vec![0xCCu8; dst_len as usize];
+
+        let req = Request {
+            options: SOURCE_MEMORY_BIT,
+            destination: dst.as_mut_ptr() as u64,
+            destination_page_offset: 0,
+            destination_size: dst_len,
+            source: src_data.as_ptr() as u64,
+            offset: 0,
+            source_page_offset: 0,
+            source_size: src_len,
+            intermediate_size: 0,
+            tag: 0,
+        };
+
+        unsafe {
+            assert_eq!(execute(&req, None, None, None), Ok(()));
+        }
+
+        assert_eq!(&dst[..src_len as usize], src_data);
+        assert!(dst[src_len as usize..].iter().all(|&b| b == 0));
+
+        if crate::gpu::uma::get().is_some() {
+            use crate::hle::kernelx::{AllocateTitlePhysicalPages, FreeTitlePhysicalPages, MapTitlePhysicalPages, PHYS_PAGE_SIZE};
+            unsafe {
+                let mut count = 1usize;
+                let mut page = [0usize; 1];
+                if AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut count, page.as_mut_ptr()) != 0 {
+                    let reserved = windows_sys::Win32::System::Memory::VirtualAlloc(
+                        std::ptr::null(),
+                        PHYS_PAGE_SIZE,
+                        windows_sys::Win32::System::Memory::MEM_RESERVE,
+                        windows_sys::Win32::System::Memory::PAGE_READWRITE,
+                    );
+                    if !reserved.is_null() {
+                        MapTitlePhysicalPages(reserved, 1, 0, 4, page.as_mut_ptr());
+                        let req_phys = Request {
+                            options: SOURCE_MEMORY_BIT | DEST_PHYS_PAGES_BIT,
+                            destination: page.as_ptr() as u64,
+                            destination_page_offset: 0,
+                            destination_size: dst_len,
+                            source: src_data.as_ptr() as u64,
+                            offset: 0,
+                            source_page_offset: 0,
+                            source_size: src_len,
+                            intermediate_size: 0,
+                            tag: 0,
+                        };
+                        assert_eq!(execute(&req_phys, None, Some(&page), None), Ok(()));
+                        let mapped = std::slice::from_raw_parts(reserved as *const u8, dst_len as usize);
+                        assert_eq!(&mapped[..src_len as usize], src_data);
+                        assert!(mapped[src_len as usize..].iter().all(|&b| b == 0));
+
+                        MapTitlePhysicalPages(reserved, 1, 0, 4, std::ptr::null_mut());
+                        windows_sys::Win32::System::Memory::VirtualFree(reserved, 0, windows_sys::Win32::System::Memory::MEM_RELEASE);
+                    }
+                    FreeTitlePhysicalPages(std::ptr::null_mut(), 1, page.as_mut_ptr());
+                }
+            }
         }
     }
 
