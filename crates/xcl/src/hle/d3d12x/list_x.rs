@@ -2296,7 +2296,15 @@ unsafe fn would_signal_close_cycle(graph: &mut SyncGraph, sig_q: usize, target_v
         if completed == u64::MAX || target.armed_waits.is_empty() {
             return false;
         }
-        target.armed_waits.iter().filter(|aw| aw.val <= sig_val).map(|aw| (aw.waiting_queue, aw.wait_seq)).collect()
+        // A wait an earlier signal of this cell already satisfies (GPU or CPU) does not wait on
+        // this one: counting it made every pipelined frame (wait N armed, signal N+1 next) a cycle.
+        let covered = target.submitted_max.max(target.cpu_signaled_max);
+        target
+            .armed_waits
+            .iter()
+            .filter(|aw| aw.val <= sig_val && aw.val > covered)
+            .map(|aw| (aw.waiting_queue, aw.wait_seq))
+            .collect()
     };
     if target_waiters.is_empty() {
         return false;
@@ -9349,6 +9357,65 @@ mod tests {
             assert!(
                 !would_signal_close_cycle(&mut g3, 0xD001, 0x3000, 0x78d),
                 "pipelined 3-queue chain with wait_seq > sig_seq must NOT be treated as a cycle"
+            );
+
+            // 3. Next frame's signal on a cell whose armed wait an earlier signal already covers
+            //    (a retail title, frame 0x6dc): C (0xC001) signalled A=0x6db, Direct (0xD001)
+            //    waits A >= 0x6db (seq 3544) and later signals B=0x6dc (seq 3572); C waits on
+            //    B >= 0x6dc (seq 34) and now signals A=0x6dc. Direct's wait is satisfied by C's
+            //    0x6db signal, not by this one: no cycle.
+            let fa: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let fb: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let mut gp = SyncGraph::default();
+            gp.cells.insert(
+                0x4000,
+                SyncCell {
+                    fence: Some(fa),
+                    device: dev.as_raw() as usize,
+                    recorded_max: 0x6dc,
+                    submitted_max: 0x6db,
+                    submitted_queue: Some(0xC001),
+                    armed_waits: vec![ArmedGpuWait {
+                        val: 0x6db,
+                        waiting_queue: 0xD001,
+                        waiting_queue_ty: D3D12_COMMAND_LIST_TYPE_DIRECT.0,
+                        wait_seq: 3544,
+                        armed_at: Instant::now(),
+                        after_write64: false,
+                    }],
+                    submitted_signals: vec![SubmittedSignal { val: 0x6db, queue: 0xC001, seq: 16 }],
+                    ..Default::default()
+                },
+            );
+            gp.cells.insert(
+                0x5000,
+                SyncCell {
+                    fence: Some(fb),
+                    device: dev.as_raw() as usize,
+                    recorded_max: 0x6dc,
+                    submitted_max: 0x6dc,
+                    submitted_queue: Some(0xD001),
+                    armed_waits: vec![ArmedGpuWait {
+                        val: 0x6dc,
+                        waiting_queue: 0xC001,
+                        waiting_queue_ty: D3D12_COMMAND_LIST_TYPE_COMPUTE.0,
+                        wait_seq: 34,
+                        armed_at: Instant::now(),
+                        after_write64: false,
+                    }],
+                    submitted_signals: vec![SubmittedSignal { val: 0x6dc, queue: 0xD001, seq: 3572 }],
+                    ..Default::default()
+                },
+            );
+            assert!(
+                !would_signal_close_cycle(&mut gp, 0xC001, 0x4000, 0x6dc),
+                "a wait an earlier signal already satisfies must NOT make the next frame's signal a cycle"
+            );
+            // Direct waiting on A >= 0x6dc instead (only this signal satisfies it): a true cycle.
+            gp.cells.get_mut(&0x4000).unwrap().armed_waits[0].val = 0x6dc;
+            assert!(
+                would_signal_close_cycle(&mut gp, 0xC001, 0x4000, 0x6dc),
+                "a wait only this signal satisfies, armed before the waiter's own signal, MUST be a cycle"
             );
         }
     }
