@@ -73,15 +73,32 @@ Remove-Item Env:XCL_RUN_SECONDS, Env:XCL_ACTIVITY
 $logLine = ($stdout -split "`n" | Where-Object { $_ -match '^Log:\s+(.+)$' } | Select-Object -Last 1)
 if (-not $logLine) { throw "XCL printed no log path; its output:`n$stdout" }
 $log = ($logLine -replace '^Log:\s+', '').Trim()
-$text = Get-Content $log -Raw -Encoding utf8
-
-$frames = if ($text -match '\((\d+) frames shown, (\d+) PresentX calls\)') { "$($Matches[1]) (PresentX $($Matches[2]))" } else { 'none logged (the run did not reach its end)' }
-$presents = [regex]::Matches($text, 'activity \(2 s\): (\d+) presents') | ForEach-Object { [int]$_.Groups[1].Value }
-$lastPresents = ($presents | Select-Object -Last 3) -join ' '
-$commits = [regex]::Matches($text, 'memory: (\d+) MB committed') | ForEach-Object { [int]$_.Groups[1].Value }
-$peak = if ($commits) { ($commits | Measure-Object -Maximum).Maximum } else { 'n/a' }
-$removals = ([regex]::Matches($text, 'device removed')).Count
-$crashes = ([regex]::Matches($text, 'unhandled exception|process ends with status')).Count
+# The log can be much larger than the resulting report. Keep only the running counters.
+$frames = $null
+$recent = [System.Collections.Generic.Queue[int]]::new(3)
+$peak = $null
+$removals = 0
+$crashes = 0
+$markers = 'frames shown,', 'activity (2 s):', 'memory:', 'device removed', 'unhandled exception', 'process ends with status'
+Select-String -LiteralPath $log -Encoding UTF8 -SimpleMatch -Pattern $markers | ForEach-Object {
+    $line = $_.Line
+    if ($null -eq $frames -and $line -match '\((\d+) frames shown, (\d+) PresentX calls\)') {
+        $frames = "$($Matches[1]) (PresentX $($Matches[2]))"
+    }
+    foreach ($m in [regex]::Matches($line, 'activity \(2 s\): (\d+) presents')) {
+        if ($recent.Count -eq 3) { $null = $recent.Dequeue() }
+        $recent.Enqueue([int]$m.Groups[1].Value)
+    }
+    foreach ($m in [regex]::Matches($line, 'memory: (\d+) MB committed')) {
+        $value = [int]$m.Groups[1].Value
+        if ($null -eq $peak -or $value -gt $peak) { $peak = $value }
+    }
+    $removals += [regex]::Matches($line, 'device removed').Count
+    $crashes += [regex]::Matches($line, 'unhandled exception|process ends with status').Count
+}
+if ($null -eq $frames) { $frames = 'none logged (the run did not reach its end)' }
+if ($null -eq $peak) { $peak = 'n/a' }
+$lastPresents = $recent -join ' '
 # the adapter XCL ran on (report.json next to the log; XCL removes the last run's at start),
 # not the first one Windows lists – on a machine with an iGPU that is often not the one used
 $gpu = $null
