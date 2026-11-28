@@ -1016,6 +1016,9 @@ unsafe fn refresh_once(queue: *mut c_void, mut look: Option<&mut super::sparse::
                 take_written(base, size, &mut buf, &mut dirty, &mut page, measurement.as_mut());
             }
         });
+        // views of physical pages are not write-watched: their writes are caught by guards
+        // (`XCL_PAGE_ALIAS`), a write through one view counting for all of them
+        crate::hle::kernelx::guards::take_dirty(&mut dirty, page as usize);
         dirty.sort_unstable();
         dirty.len()
     });

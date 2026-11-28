@@ -160,7 +160,8 @@ pub(super) fn writable(va: usize, bytes: usize) -> bool {
     if crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(va, bytes)) {
         return true;
     }
-    crate::hle::kernelx::lazy::ensure(va, bytes);
+    // (held while the protection is asked: a view of a physical page is not guarded again meanwhile)
+    let _open = crate::hle::kernelx::lazy::ensure(va, bytes);
     use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READWRITE, PAGE_READWRITE};
     let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     let found = unsafe { VirtualQuery(va as *const c_void, &mut m, std::mem::size_of_val(&m)) } != 0;
