@@ -8343,6 +8343,151 @@ fn f64_math_random(wave64: bool) {
     assert!(bad.is_empty());
 }
 
+/// The f32 VOP1 math and the 32-bit bit scans against the CPU on random inputs, one wave per
+/// dispatch in 50 dispatches, or n dispatches with XCL_FUZZ_ITERS=n, as wave64 and as wave32.
+/// floor, ceil, trunc, rndne, fract (finite inputs), the three i32 conversions, frexp and the bit
+/// scans must match bit for bit. rcp, sqrt and rsq are allowed 4 ulps, and exp, log, sin and cos
+/// a tolerance that only catches a wrong formula, not the precision of a driver. Lanes whose input
+/// or expected result is an f32 denormal are counted and not checked (the shader's denormal mode).
+#[test]
+fn gpu_f32_math_and_bit_scans_random() {
+    for wave64 in gpu_waves() {
+        f32_math_and_bit_scans_random(wave64);
+    }
+}
+
+/// A random f32 weighted towards the edges: specials, any bit pattern, values next to integers
+/// up to 2^33 (ties included), small values on 1/8 steps, and the revolution range of sin / cos.
+fn rand_f32(r: &mut Rng) -> f32 {
+    const SPECIAL: [u32; 12] = [0, 0x8000_0000, 0x7F80_0000, 0xFF80_0000, 0x7FC0_0000, 0xFFC0_1234,
+        0x7F7F_FFFF, 0xFF7F_FFFF, 0x0080_0000, 0x8080_0000, 0x4F00_0000, 0xCF00_0000]; // ±2^31
+    match r.below(6) {
+        0 => f32::from_bits(SPECIAL[r.below(12) as usize]),
+        1 => f32::from_bits(r.next() as u32),
+        2 => {
+            let k = (r.next() >> (31 + r.below(33))) as f32;
+            let d = [0.0f32, 0.5, -0.5, 0.25, 1e-3, -1e-3, 0.99999994][r.below(7) as usize];
+            let v = k + d;
+            if r.below(2) == 0 { -v } else { v }
+        }
+        3 => (r.below(2000) as f32 - 1000.0) / 8.0,
+        _ => (r.below(1 << 20) as f32 / (1 << 20) as f32 - 0.5) * 600.0, // ±300 revolutions
+    }
+}
+
+fn f32_math_and_bit_scans_random(wave64: bool) {
+    let iters: usize = std::env::var("XCL_FUZZ_ITERS").ok().and_then(|s| s.parse().ok()).unwrap_or(50);
+    let unary = |name: &'static str, d: u64, s: u64| (name, "ENC_VOP1", vec![("VDST", d), ("SRC0", V + s)]);
+    let list = [
+        unary("V_FLOOR_F32", 10, 0), unary("V_CEIL_F32", 11, 0), unary("V_TRUNC_F32", 12, 0),
+        unary("V_RNDNE_F32", 13, 0), unary("V_FRACT_F32", 14, 0), unary("V_CVT_I32_F32", 15, 0),
+        unary("V_CVT_FLR_I32_F32", 16, 0), unary("V_CVT_RPI_I32_F32", 17, 0), unary("V_FREXP_MANT_F32", 18, 0),
+        unary("V_FREXP_EXP_I32_F32", 19, 0), unary("V_RCP_F32", 20, 0), unary("V_SQRT_F32", 21, 0),
+        unary("V_RSQ_F32", 22, 0), unary("V_EXP_F32", 23, 0), unary("V_LOG_F32", 24, 0),
+        unary("V_SIN_F32", 25, 0), unary("V_COS_F32", 26, 0), unary("V_FFBH_U32", 27, 2),
+        unary("V_FFBL_B32", 28, 2), unary("V_FFBH_I32", 29, 2), unary("V_BFREV_B32", 30, 2),
+        ("V_BCNT_U32_B32", "ENC_VOP3", vec![("VDST", 31), ("SRC0", V + 2), ("SRC1", V + 1)]),
+    ];
+    let list: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = list.iter().map(|(n, e, f)| (*n, *e, &f[..], None)).collect();
+    let (dxil, mem) = kernel_wave(&prog(&list), wave64);
+    let lanes = if wave64 { 64 } else { 32 };
+    let mut rng = Rng(0xD1B5_4A32_D192_ED03);
+    let denorm = |x: f32| x != 0.0 && !x.is_nan() && x.abs() < f32::MIN_POSITIVE;
+    let same = |g: f32, w: f32| g.to_bits() == w.to_bits() || (g.is_nan() && w.is_nan());
+    let ulps = |g: f32, w: f32| -> u32 {
+        if same(g, w) { 0 } else if g.is_nan() || w.is_nan() || g.is_sign_negative() != w.is_sign_negative() { u32::MAX } else { g.to_bits().abs_diff(w.to_bits()) }
+    };
+    let cvt = |x: f32| x as i32; // NaN → 0, out of range → clamped, as V_CVT_I32_F32
+    let frexp = |x: f32| -> (f32, i32) {
+        if x == 0.0 || !x.is_finite() { return (x, 0); }
+        let e = ((x.to_bits() >> 23) & 0xFF) as i32; // normal: |x| = 1.m · 2^(e-127) = 0.1m · 2^(e-126)
+        (f32::from_bits((x.to_bits() & 0x807F_FFFF) | (126 << 23)), e - 126)
+    };
+    let (mut checked, mut skipped, mut worst) = (0usize, 0usize, [0u32; 3]);
+    let mut worst_approx = [0f64; 4];
+    let mut bad: Vec<String> = Vec::new();
+    for _ in 0..iters {
+        let mut st = KernelState::default();
+        let mut xs = Vec::new();
+        for r in st.vgpr.iter_mut() {
+            let (x, b, n) = (rand_f32(&mut rng), rng.next() as u32 >> rng.below(32), rng.next() as u32);
+            (r[0], r[1], r[2]) = (x.to_bits(), n, b);
+            xs.push((x, b, n));
+        }
+        let r = runner::run(&dxil, &st, &mem).unwrap();
+        for (l, v) in r.vgpr.iter().take(lanes).enumerate() {
+            let (x, b, n) = xs[l];
+            let fv = |i: usize| f32::from_bits(v[i]);
+            // bit scans: exact on every input
+            let ffbh_i = { let y = if (b as i32) < 0 { !b } else { b }; if y == 0 { u32::MAX } else { y.leading_zeros() } };
+            for (name, g, w) in [
+                ("ffbh_u32", v[27], if b == 0 { u32::MAX } else { b.leading_zeros() }),
+                ("ffbl_b32", v[28], if b == 0 { u32::MAX } else { b.trailing_zeros() }),
+                ("ffbh_i32", v[29], ffbh_i),
+                ("bfrev_b32", v[30], b.reverse_bits()),
+                ("bcnt_u32_b32", v[31], b.count_ones().wrapping_add(n)),
+            ] {
+                if g != w { bad.push(format!("{name}({b:#010x}) = {g:#010x}, want {w:#010x}")); }
+            }
+            if denorm(x) { skipped += 1; continue; }
+            checked += 1;
+            let xb = x.to_bits();
+            // exact float results
+            let fract = if x.is_finite() { ((x as f64 - x.floor() as f64) as f32).min(f32::from_bits(0x3F7F_FFFF)) } else { f32::NAN };
+            for (name, g, w) in [("floor", fv(10), x.floor()), ("ceil", fv(11), x.ceil()), ("trunc", fv(12), x.trunc()),
+                                 ("rndne", fv(13), x.round_ties_even()), ("frexp_mant", fv(18), frexp(x).0)] {
+                if !same(g, w) { bad.push(format!("{name}({x:e} / {xb:#010x}) = {g:e} / {:#010x}, want {w:e} / {:#010x}", g.to_bits(), w.to_bits())); }
+            }
+            if x.is_finite() && !denorm(fract) && !same(fv(14), fract) { bad.push(format!("fract({x:e} / {xb:#010x}) = {:e}, want {fract:e}", fv(14))); }
+            // conversions to i32, and the exponent of frexp
+            let rpi = (x as f64 + 0.5 == (x + 0.5) as f64).then(|| cvt((x + 0.5).floor())); // the sum is exact in f32
+            for (name, g, w) in [("cvt_i32", v[15] as i32, Some(cvt(x))), ("cvt_flr_i32", v[16] as i32, Some(cvt(x.floor()))),
+                                 ("cvt_rpi_i32", v[17] as i32, rpi), ("frexp_exp", v[19] as i32, Some(frexp(x).1))] {
+                if let Some(w) = w { if g != w { bad.push(format!("{name}({x:e} / {xb:#010x}) = {g}, want {w}")); } }
+            }
+            // rcp, sqrt, rsq: within 4 ulps of the correctly rounded value
+            for (k, (name, g, w)) in [("rcp", fv(20), (1.0 / x as f64) as f32), ("sqrt", fv(21), (x as f64).sqrt() as f32),
+                                      ("rsq", fv(22), (1.0 / (x as f64).sqrt()) as f32)].into_iter().enumerate() {
+                if denorm(w) { continue; }
+                let u = ulps(g, w);
+                if u > 4 { bad.push(format!("{name}({x:e} / {xb:#010x}) = {g:e}, want {w:e} ({} ulps)", if u == u32::MAX { "sign/NaN".into() } else { u.to_string() })); } else { worst[k] = worst[k].max(u); }
+            }
+            // exp2, log2: specials exact, otherwise a relative / absolute tolerance
+            let (ge, we) = (fv(23) as f64, (x as f64).exp2());
+            if (-126.0..128.0).contains(&x) && !denorm(we as f32) {
+                let e = (ge - we).abs() / we;
+                worst_approx[0] = worst_approx[0].max(e);
+                if !(e <= 1e-5) { bad.push(format!("exp({x:e}) = {ge:e}, want {we:e}")); }
+            } else if !x.is_nan() && x.is_infinite() && !same(fv(23), we as f32) { bad.push(format!("exp({x:e}) = {ge:e}, want {we:e}")); }
+            let (gl, wl) = (fv(24) as f64, (x as f64).log2());
+            if x > 0.0 && x.is_finite() {
+                let e = (gl - wl).abs() / wl.abs().max(1.0);
+                worst_approx[1] = worst_approx[1].max(e);
+                if !(e <= 1e-5) { bad.push(format!("log({x:e}) = {gl:e}, want {wl:e}")); }
+            } else if !(same(fv(24), wl as f32) || (x == 0.0 && fv(24) == f32::NEG_INFINITY)) { bad.push(format!("log({x:e} / {xb:#010x}) = {gl:e}, want {wl:e}")); }
+            // sin / cos of x revolutions, inside the hardware's ±256 range
+            if x.abs() <= 256.0 {
+                let t = (x as f64).fract() * std::f64::consts::TAU;
+                for (k, name, g, w) in [(2, "sin", fv(25) as f64, t.sin()), (3, "cos", fv(26) as f64, t.cos())] {
+                    let e = (g - w).abs();
+                    worst_approx[k] = worst_approx[k].max(e);
+                    if !(e <= 4e-3) { bad.push(format!("{name}({x:e} revolutions) = {g:e}, want {w:e}")); }
+                }
+            } else if x.is_nan() || x.is_infinite() {
+                for (name, g) in [("sin", fv(25)), ("cos", fv(26))] { if !g.is_nan() { bad.push(format!("{name}({x:e}) = {g:e}, want NaN")); } }
+            }
+        }
+    }
+    println!("wave{lanes}: lanes {checked} (+{skipped} denormal inputs), worst ulps rcp/sqrt/rsq {worst:?}, worst error exp/log (relative) sin/cos (absolute) {:?}", worst_approx.map(|e| format!("{e:.2e}")));
+    bad.sort();
+    bad.dedup();
+    let mut per_op = std::collections::BTreeMap::new();
+    for b in &bad { *per_op.entry(b.split('(').next().unwrap_or("")).or_insert(0usize) += 1; }
+    println!("{} distinct failures {per_op:?}", bad.len());
+    for b in bad.iter().take(40) { println!("  {b}"); }
+    assert!(bad.is_empty());
+}
+
 fn f16_to_f64(h: u16) -> f64 {
     let s = if h & 0x8000 != 0 { -1.0 } else { 1.0 };
     let e = (h >> 10) & 0x1F;
