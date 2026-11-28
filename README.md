@@ -434,6 +434,8 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 - Title data: `%LOCALAPPDATA%\XCL\<title>\` (`%XCL_DATA_ROOT%`): `xcl.toml`, `overlay\`, `saves\`,
   `pls\` (the title's `S:\`), `temp\` (`T:\`), `cache\`, `logs\xcl.log`, `logs\report.json` (the
   previous run's: `xcl.prev.log`, `report.prev.json`).
+- `XMemAllocDefault` preserves graphics-allocation address alignment when falling back to
+  Windows memory, including the 4 MiB alignment requested by console page-size attributes.
 
 </details>
 

@@ -597,6 +597,21 @@ fn xmem_graphics_layout(size: usize, a: XAllocAttrs) -> Option<(usize, usize)> {
     Some((rounded, align))
 }
 
+unsafe fn windows_graphics_alloc(size: usize, align: usize) -> *mut c_void {
+    if align <= crate::gpu::uma::GRAIN {
+        return mem::VirtualAlloc(std::ptr::null(), size, mem::MEM_COMMIT | mem::MEM_RESERVE, mem::PAGE_READWRITE);
+    }
+    let mut requirements = mem::MEM_ADDRESS_REQUIREMENTS { Alignment: align, ..Default::default() };
+    let mut parameter = mem::MEM_EXTENDED_PARAMETER {
+        Anonymous1: mem::MEM_EXTENDED_PARAMETER_0 { _bitfield: mem::MemExtendedParameterAddressRequirements as u64 },
+        Anonymous2: mem::MEM_EXTENDED_PARAMETER_1 { Pointer: (&mut requirements as *mut mem::MEM_ADDRESS_REQUIREMENTS).cast() },
+    };
+    mem::VirtualAlloc2(
+        std::ptr::null_mut(), std::ptr::null(), size,
+        mem::MEM_COMMIT | mem::MEM_RESERVE, mem::PAGE_READWRITE, &mut parameter, 1,
+    )
+}
+
 pub unsafe extern "system" fn XMemAllocDefault(size: usize, attrs: u64) -> *mut c_void {
     let a = XAllocAttrs::decode(attrs);
     if a.memory_type == 0 {
@@ -617,7 +632,7 @@ pub unsafe extern "system" fn XMemAllocDefault(size: usize, attrs: u64) -> *mut 
         trace_mem("XMemAlloc (graphics, UMA)", 0, rounded, attrs, 0, q as usize);
         return q as *mut c_void;
     }
-    mem::VirtualAlloc(std::ptr::null(), rounded, mem::MEM_COMMIT | mem::MEM_RESERVE, mem::PAGE_READWRITE)
+    windows_graphics_alloc(rounded, align)
 }
 
 pub unsafe extern "system" fn XMemFreeDefault(p: *mut c_void, attrs: u64) {
@@ -3024,6 +3039,36 @@ mod tests {
             assert_eq!(XMemVirtualQuery(proc_, page, info.as_mut_ptr() as _), 1);
             assert_eq!((info[6] as u32) & 3, 0, "PAGE_GUARD page must not be marked CPU-readable");
             mem::VirtualFree(page, 0, mem::MEM_RELEASE);
+        }
+    }
+
+    #[test]
+    fn windows_graphics_allocations_preserve_alignment() {
+        // Test the native fallback directly so initialized UMA cannot hide it.
+        for (page_size, alignment_bits, expected_align) in [
+            (0u64, 0u64, 1usize << 16),
+            (0, 17, 1 << 17),
+            (2, 0, 4 << 20),
+            (2, 25, 1 << 25),
+            (0, 31, 1 << 31),
+        ] {
+            let attrs = (1 << 29) | (page_size << 14) | (alignment_bits << 24);
+            let (size, align) = xmem_graphics_layout(0x1_0001, XAllocAttrs::decode(attrs)).unwrap();
+            unsafe {
+                let p = windows_graphics_alloc(size, align);
+                assert!(!p.is_null(), "attrs {attrs:#x}: error {}", fnd::GetLastError());
+                let mut info: mem::MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+                let queried = mem::VirtualQuery(p, &mut info, std::mem::size_of_val(&info));
+                let zeroed = std::slice::from_raw_parts(p.cast::<u8>(), size).iter().all(|&v| v == 0);
+                assert_ne!(mem::VirtualFree(p, 0, mem::MEM_RELEASE), 0);
+                assert_ne!(queried, 0);
+                assert_eq!(p as usize % expected_align, 0, "attrs {attrs:#x}, address {p:p}");
+                assert_eq!(info.AllocationBase, p);
+                assert_eq!(info.RegionSize, if page_size == 2 { 4 << 20 } else { 0x2_0000 });
+                assert_eq!(info.State, mem::MEM_COMMIT);
+                assert_eq!(info.Protect, mem::PAGE_READWRITE);
+                assert!(zeroed, "attrs {attrs:#x}: allocation was not zeroed");
+            }
         }
     }
 
