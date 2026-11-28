@@ -4509,27 +4509,38 @@ mod tests {
 
             // 1. Streaming 512 unreleased 1 MiB textures (512 MiB placed) across 16 MiB stays bounded
             // with zero additional page growth after the 16 MiB working set is covered.
+            // (counted on this test's own textures: the device is the adapter's one device in the
+            // process, and its page bytes change while other tests' targets come and go)
             let dev_key = dev.as_raw() as usize;
             let dev_pages = || super::super::vram::page_bytes_for(dev_key).0;
+            let our_pages = |texs: &[ID3D12Resource]| {
+                let mut tiles = std::collections::BTreeSet::new();
+                for t in texs {
+                    let (used, extra) = super::super::vram::tile_mappings_for(dev_key, t.as_raw() as usize).expect("a placed texture is mapped");
+                    tiles.extend(used.into_iter().chain(extra));
+                }
+                tiles
+            };
             let stream_desc = console_desc(3, 512, 512, 1, 1, 28, 0x109); // 64KB_S, 1 MiB
-            let (pages0, vram0, kept0) = (dev_pages(), local_vram(), counts().0);
+            let (vram0, kept0) = (local_vram(), counts().0);
             let mut leaked_refs = Vec::with_capacity(512);
             for k in 0..16usize {
                 leaked_refs.push(place_tex(base + k * (1 << 20), &stream_desc));
             }
-            let (pages16, vram16) = (dev_pages(), local_vram());
+            let (pages16, vram16) = (our_pages(&leaked_refs), local_vram());
             for k in 16..512usize {
                 leaked_refs.push(place_tex(base + (k % 16) * (1 << 20), &stream_desc));
             }
-            let (pages_delta, vram_delta, vram_after_fill, kept_delta) = (
-                dev_pages() - pages0,
+            let (pages, vram_delta, vram_after_fill, kept_delta) = (
+                our_pages(&leaked_refs),
                 local_vram().saturating_sub(vram0) as usize,
                 local_vram().saturating_sub(vram16) as usize,
                 counts().0 - kept0,
             );
-            println!("512 unreleased 1 MiB textures over 16 MiB: +{pages_delta} B pages (after fill: +{} B), +{vram_delta} B local VRAM (after fill: +{vram_after_fill} B), +{kept_delta} active kept", dev_pages() - pages16);
-            assert_eq!(pages_delta, 16 << 20, "pages must equal covered 16 MiB, not 512 MiB");
-            assert_eq!(dev_pages(), pages16, "no pages added after working set is covered");
+            let page_bytes = pages.len() * 0x1_0000;
+            println!("512 unreleased 1 MiB textures over 16 MiB: {page_bytes} B pages (after fill: +{} B), +{vram_delta} B local VRAM (after fill: +{vram_after_fill} B), +{kept_delta} active kept", pages.len().saturating_sub(pages16.len()) * 0x1_0000);
+            assert_eq!(page_bytes, 16 << 20, "pages must equal covered 16 MiB, not 512 MiB");
+            assert_eq!(pages, pages16, "no pages added after working set is covered");
             // (the process's local video memory is not asserted: other GPU tests in the process
             // allocate at the same time - on an RX 9070 it read +672 MB under --test-threads=4 and
             // stayed within the bound alone; the page count above is what this change controls)
