@@ -16,12 +16,19 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 # GPU tests that cannot run on this adapter pass too: each prints "SKIPPED <test>: <reason>"
 # to stderr (XCL_REQUIRE_GPU=wave64 / =mesh makes them fail); counted at the end
 $skipped = @()
-cargo test --workspace -- --test-threads=4 @args 2>&1 | ForEach-Object {
-    $line = "$_"
-    if ($line -match '^SKIPPED \S+: (.+)$') { $skipped += $Matches[1] }
-    Write-Host $line
+# Let libtest apply the default so an explicit --test-threads can override it.
+$oldTestThreads = $env:RUST_TEST_THREADS
+try {
+    $env:RUST_TEST_THREADS = '4'
+    cargo test --workspace -- @args 2>&1 | ForEach-Object {
+        $line = "$_"
+        if ($line -match '^SKIPPED \S+: (.+)$') { $skipped += $Matches[1] }
+        Write-Host $line
+    }
+    $code = $LASTEXITCODE
+} finally {
+    $env:RUST_TEST_THREADS = $oldTestThreads
 }
-$code = $LASTEXITCODE
 if ($skipped) {
     $counts = $skipped | Group-Object | Sort-Object Count -Descending | ForEach-Object { "$($_.Count) ($($_.Name))" }
     Write-Host "GPU tests skipped on this adapter: $($counts -join ', ')"
