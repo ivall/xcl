@@ -216,7 +216,8 @@ pub fn image_d3d12(t: &Image) -> Option<(D3D12_RESOURCE_DESC, D3D12_SHADER_RESOU
         return None;
     }
     let (format, order) = dxgi_format(t.format)?;
-    let mips = t.max_mip + 1;
+    let msaa = matches!(t.ty, ImageType::D2Msaa | ImageType::D2MsaaArray);
+    let mips = if msaa { 1 } else { t.max_mip + 1 };
     let (dim, depth) = match t.ty {
         ImageType::D1 => (D3D12_RESOURCE_DIMENSION_TEXTURE1D, 1),
         ImageType::D1Array => (D3D12_RESOURCE_DIMENSION_TEXTURE1D, t.depth),
@@ -224,18 +225,18 @@ pub fn image_d3d12(t: &Image) -> Option<(D3D12_RESOURCE_DESC, D3D12_SHADER_RESOU
         ImageType::D2 | ImageType::D2Msaa => (D3D12_RESOURCE_DIMENSION_TEXTURE2D, 1),
         ImageType::D2Array | ImageType::D2MsaaArray | ImageType::Cube => (D3D12_RESOURCE_DIMENSION_TEXTURE2D, t.depth),
     };
-    let samples = if matches!(t.ty, ImageType::D2Msaa | ImageType::D2MsaaArray) { 1u32 << t.last_level.min(4) } else { 1 };
+    let samples = if msaa { 1u32 << t.last_level.min(4) } else { 1 };
     let res = D3D12_RESOURCE_DESC {
         Dimension: dim,
         Width: t.width as u64,
         Height: if dim == D3D12_RESOURCE_DIMENSION_TEXTURE1D { 1 } else { t.height },
         DepthOrArraySize: depth as u16,
-        MipLevels: if samples > 1 { 1 } else { mips as u16 },
+        MipLevels: mips as u16,
         Format: format,
         SampleDesc: DXGI_SAMPLE_DESC { Count: samples, Quality: 0 },
         ..Default::default()
     };
-    let levels = t.last_level.saturating_sub(t.base_level) + 1;
+    let levels = if msaa { 1 } else { t.last_level.saturating_sub(t.base_level) + 1 };
     let slices = depth.saturating_sub(t.base_array).max(1);
     let mut v = D3D12_SHADER_RESOURCE_VIEW_DESC { Format: format, Shader4ComponentMapping: component_mapping(t.dst_sel, order), ..Default::default() };
     let lod = t.min_lod;
@@ -582,6 +583,24 @@ mod tests {
             }
             assert!(image_d3d12(&t).is_none(), "3D axis {axis} over the limit");
         }
+    }
+
+    #[test]
+    fn msaa_resources_always_have_one_mip_and_never_overflow() {
+        let mut t = image(&tsharp()).unwrap();
+        t.ty = ImageType::D2Msaa;
+        t.width = 4;
+        t.height = 4;
+        t.last_level = 0; // 1x MSAA (samples == 1)
+        t.max_mip = 15;
+        let (res, _) = image_d3d12(&t).unwrap();
+        assert_eq!(res.MipLevels, 1, "D2Msaa resource must have MipLevels == 1 even when samples == 1");
+
+        t.ty = ImageType::D2MsaaArray;
+        t.max_mip = u32::MAX;
+        t.last_level = u32::MAX;
+        let (res2, _) = image_d3d12(&t).unwrap();
+        assert_eq!(res2.MipLevels, 1);
     }
 
     #[test]
