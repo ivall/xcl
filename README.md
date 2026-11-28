@@ -365,6 +365,15 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 - `XCL_DSTORAGE_PARALLEL_DECOMPRESS=1` enables parallel CPU decompression for file-backed zlib
   requests with virtual destinations. Defaults: four workers and a shared 32 MiB staging budget
   (`XCL_DSTORAGE_WORKERS`, `XCL_DSTORAGE_MEMORY_BUDGET_MIB`). Requests retire in queue order.
+- `XCL_DSTORAGE_CACHE=<folder>` keeps the unpacked bytes of DirectStorage file requests (zlib
+  and BCPack) on disk and reads them back when the same request comes again, in the same run or
+  a later one, instead of decoding it on the CPU again. A file that changes (size or modification
+  time) gets new entries. Nothing is evicted: entries stop being added once the folder holds
+  `XCL_DSTORAGE_CACHE_MB` (default 32,768). Requests decoded by `XCL_DSTORAGE_PARALLEL_DECOMPRESS`
+  do not use it. New entries are written by a thread of their own; while 256 MiB wait to be
+  written, more are not kept. Each entry is checked against its Adler-32 when read back
+  (`XCL_DSTORAGE_CACHE_VERIFY=0` skips the check). `report.json` → `dstorage.unpack_cache` counts hits and stored
+  entries.
 - Every run writes `report.json` (called stubs, unknown D3D12.X slots and interfaces, XGameRuntime
   classes asked for, shader statistics, audio formats, crash).
   `d3d12.presents` counts presentations, not visible content. With `XCL_FRAME_DUMP=N` (`N > 1`),

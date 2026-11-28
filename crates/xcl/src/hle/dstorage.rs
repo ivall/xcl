@@ -35,6 +35,8 @@
 
 #[path = "dstorage/parallel.rs"]
 mod parallel;
+#[path = "dstorage/unpack_cache.rs"]
+mod unpack_cache;
 
 use std::ffi::c_void;
 use std::os::windows::fs::FileExt;
@@ -206,10 +208,30 @@ pub struct DStorageStats {
     /// BCPack requests the decoder ran on, by `DSTORAGE_BCPACK_MODE`
     #[serde(default)]
     pub bcpack_unpacked: BTreeMap<String, BcpackUnpackStats>,
+    /// `XCL_DSTORAGE_CACHE`, when set
+    #[serde(default)]
+    pub unpack_cache: Option<UnpackCacheStats>,
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct UnpackCacheStats {
+    /// requests answered from the cache, and their bytes
+    pub hits: u64,
+    pub hit_bytes: u64,
+    /// entries added in this run, and their bytes
+    pub stored: u64,
+    pub stored_bytes: u64,
+    /// entries not added because the cache was full
+    pub not_stored_full: u64,
+    /// entries not added because too many were waiting to be written
+    #[serde(default)]
+    pub not_stored_busy: u64,
+    /// entries whose bytes did not match their checksum (decoded again)
+    pub bad_entries: u64,
 }
 
 pub fn stats() -> DStorageStats {
-    DStorageStats { bcpack_refused: BCPACK.stats(), bcpack_unpacked: UNPACKED.stats() }
+    DStorageStats { bcpack_refused: BCPACK.stats(), bcpack_unpacked: UNPACKED.stats(), unpack_cache: unpack_cache::get().map(|c| c.stats()) }
 }
 
 /// BCPack requests that reached the decoder, by mode.
@@ -515,6 +537,8 @@ struct FileInner {
     id: u32,
     path: Vec<u16>,
     file: Mutex<Option<Arc<std::fs::File>>>,
+    /// the file's entries in the unpack cache (`XCL_DSTORAGE_CACHE`), found at its first decoded request
+    cache: OnceLock<Option<Arc<unpack_cache::Store>>>,
 }
 
 impl FileInner {
@@ -549,7 +573,7 @@ unsafe extern "system" fn factory_open_file(_p: *mut c_void, path: *const u16, r
             return e.raw_os_error().map_or(E_INVALIDARG, |c| (0x8007_0000u32 | (c as u32 & 0xFFFF)) as i32);
         }
     };
-    let inner = Arc::new(FileInner { id: NEXT_ID.fetch_add(1, Ordering::Relaxed), path: name.encode_utf16().collect(), file: Mutex::new(Some(Arc::new(file))) });
+    let inner = Arc::new(FileInner { id: NEXT_ID.fetch_add(1, Ordering::Relaxed), path: name.encode_utf16().collect(), file: Mutex::new(Some(Arc::new(file))), cache: OnceLock::new() });
     let o = new_object(file_vtbl(), inner);
     let hr = file_qi(o, riid, out);
     file_release(o);
@@ -881,6 +905,44 @@ fn note_request(r: &Request) {
     }
 }
 
+/// The unpack cache (`XCL_DSTORAGE_CACHE`) with `file`'s entries and the key of `r`, for a file
+/// request that is decoded.
+fn unpack_cache_for(r: &Request, file: Option<&FileInner>) -> Option<(&'static unpack_cache::Cache, Arc<unpack_cache::Store>, unpack_cache::Key)> {
+    unpack_cache_entry(unpack_cache::get()?, r, file)
+}
+
+fn unpack_cache_entry<'a>(c: &'a unpack_cache::Cache, r: &Request, file: Option<&FileInner>) -> Option<(&'a unpack_cache::Cache, Arc<unpack_cache::Store>, unpack_cache::Key)> {
+    if r.memory_source() || (!r.zlib() && r.bcpack() == 0) {
+        return None;
+    }
+    let f = file?;
+    // a closed file (`Close`) fails its requests with E_FILE_HANDLE, kept bytes or not
+    f.handle()?;
+    let store = f
+        .cache
+        .get_or_init(|| {
+            let h = f.handle()?;
+            match c.store(&h) {
+                Ok(s) => Some(s),
+                // another process holds the store: said once by `store`
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => None,
+                Err(e) => {
+                    crate::xlog_warn!("DirectStorage: no unpack cache for '{}': {e}", String::from_utf16_lossy(&f.path));
+                    None
+                }
+            }
+        })
+        .clone()?;
+    let key = unpack_cache::Key {
+        offset: r.offset,
+        source_size: r.source_size,
+        decode: (r.options & (ZLIB_BIT | BCPACK_MASK)) as u32,
+        intermediate_size: r.intermediate_size,
+        destination_size: r.destination_size,
+    };
+    Some((c, store, key))
+}
+
 /// Run a request; the destination gets the bytes or nothing.
 unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[usize]>, dest_on_stack: bool, src_pages: Option<&[usize]>) -> Result<(), HRESULT> {
     let n = r.destination_size as usize;
@@ -888,7 +950,12 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
     if !r.dest_physical_pages() && !writable(r.destination as usize, n) {
         return Err(E_ACCESS_VIOLATION);
     }
-    let src: Vec<u8> = if r.memory_source() {
+    // a decoded file request whose bytes the unpack cache keeps is neither read nor decoded
+    let cache = unpack_cache_for(r, file);
+    let cached = cache.as_ref().and_then(|(c, s, k)| c.get(s, k));
+    let src: Vec<u8> = if cached.is_some() {
+        Vec::new()
+    } else if r.memory_source() {
         let mut b = vec![0u8; r.source_size as usize];
         if r.source_physical_pages() {
             let pages = src_pages.ok_or(E_ACCESS_VIOLATION)?;
@@ -917,7 +984,7 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
     }
 
     // the stages in the console's order: zlib, then BCPack
-    let stage1: Vec<u8> = if r.zlib() {
+    let stage1: Vec<u8> = if cached.is_none() && r.zlib() {
         let stage1_len = if r.intermediate_size != 0 { r.intermediate_size as usize } else { n };
         let mut d = miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(&src, stage1_len).map_err(|_| E_ZLIB_DATA)?;
         // zlib yields `intermediate_size` bytes; when the title names none, the destination's
@@ -935,7 +1002,16 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
     } else {
         src
     };
-    let payload = if bc != 0 { bcpack_unpack(r, &stage1, n)? } else { stage1 };
+    let payload = match cached {
+        Some(p) => p,
+        None => {
+            let p = if bc != 0 { bcpack_unpack(r, &stage1, n)? } else { stage1 };
+            if let Some((c, s, k)) = &cache {
+                c.put(s, k, &p);
+            }
+            p
+        }
+    };
 
     if r.dest_physical_pages() {
         let pages = dest_pages.ok_or(E_ACCESS_VIOLATION)?;
@@ -1591,6 +1667,60 @@ unsafe extern "system" fn queue_query(p: *mut c_void, out: *mut u8) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_closed_file_is_not_answered_from_the_unpack_cache() {
+        let d = std::env::temp_dir().join(format!("xcl_dscache_closed_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let src = d.join("pack.bin");
+        std::fs::write(&src, [0u8; 64]).unwrap();
+        let cache = unpack_cache::Cache::open(&d.join("cache"), 1 << 30, true).unwrap();
+        let open = std::fs::File::open(&src).unwrap();
+        let f = FileInner { id: 1, path: src.to_string_lossy().encode_utf16().collect(), file: Mutex::new(Some(Arc::new(open))), cache: OnceLock::new() };
+        let r = Request::parse(&request(ZLIB_BIT, 0x1000, 4096, 0, 0, 64));
+        let (c, s, k) = unpack_cache_entry(&cache, &r, Some(&f)).expect("a decoded request of an open file has an entry");
+        c.put(&s, &k, &[7u8; 4096]);
+        c.flush();
+        assert!(c.get(&s, &k).is_some());
+        // as file_close does: the request then fails with E_FILE_HANDLE, as without the cache
+        f.file.lock().unwrap().take();
+        assert!(unpack_cache_entry(&cache, &r, Some(&f)).is_none());
+        drop((s, cache));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn one_guest_name_on_two_host_files_does_not_share_unpacked_bytes() {
+        let d = std::env::temp_dir().join(format!("xcl_dscache_vfs_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        // the files the VFS can open for one guest name (the game folder's, an overlay copy):
+        // different bytes, the same size and modification time
+        let when = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let open = |dir: &str, b: u8| {
+            let p = d.join(dir).join("pack.bin");
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, [b; 64]).unwrap();
+            std::fs::OpenOptions::new().write(true).open(&p).unwrap().set_modified(when).unwrap();
+            let f = std::fs::File::open(&p).unwrap();
+            FileInner { id: 1, path: "D:\\pack.bin".encode_utf16().collect(), file: Mutex::new(Some(Arc::new(f))), cache: OnceLock::new() }
+        };
+        let overlay = open("overlay", 2);
+        let r = Request::parse(&request(ZLIB_BIT, 0x1000, 4096, 0, 0, 64));
+        {
+            let game = open("game", 1);
+            let cache = unpack_cache::Cache::open(&d.join("cache"), 1 << 30, true).unwrap();
+            let (c, s, k) = unpack_cache_entry(&cache, &r, Some(&game)).unwrap();
+            c.put(&s, &k, &[1u8; 4096]);
+            c.flush();
+        }
+        // a later run: the name now opens the other file
+        let cache = unpack_cache::Cache::open(&d.join("cache"), 1 << 30, true).unwrap();
+        let (c, s, k) = unpack_cache_entry(&cache, &r, Some(&overlay)).expect("its own store");
+        assert!(c.get(&s, &k).is_none(), "the other file's unpacked bytes");
+        drop((s, cache, overlay));
+        let _ = std::fs::remove_dir_all(&d);
+    }
 
     fn request(options: u64, dst: u64, dst_size: u32, src: u64, offset: u64, src_size: u32) -> [u8; REQUEST_BYTES] {
         let mut b = [0u8; REQUEST_BYTES];
