@@ -501,12 +501,50 @@ const WANTED_AT_ONCE: usize = 6;
 /// to be 6, which left most of a 16-thread CPU idle while a title with ~24 000 shaders
 /// compiled for half an hour. (Normal priority: a title thread can wait for a pipeline –
 /// `resolve_wait`, a compute pipeline's first bind – and must not wait behind its own threads.)
+/// Under Wine at most `WINE_COMPILE_THREADS` unless `XCL_DXC_THREADS` says otherwise.
 pub fn compile_threads() -> usize {
     static N: OnceLock<usize> = OnceLock::new();
     *N.get_or_init(|| {
         let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
-        std::env::var("XCL_DXC_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(cores.saturating_sub(1)).clamp(1, 64)
+        let chosen = std::env::var("XCL_DXC_THREADS").ok().and_then(|v| v.parse().ok());
+        let wine = crate::util::under_wine();
+        let n = chosen.unwrap_or_else(|| default_compile_threads(cores, wine)).clamp(1, 64);
+        if wine && chosen.is_none() && n < cores.saturating_sub(1) {
+            crate::xlog_info!("DXC: {n} compile threads under Wine (XCL_DXC_THREADS to choose)");
+        }
+        n
     })
+}
+
+/// DXC threads under Wine when `XCL_DXC_THREADS` is unset. Under Wine the DXC workers of one
+/// process mostly wait on each other: on a 32-thread Ryzen with Wine 11.22, `--precompile
+/// --only cs` wrote 11.8 MB of DXIL in 120 s with 1 thread, 19.5 MB with 2 and 4, 17.8 MB with
+/// 8 and 12.8 MB with 16. With every core but one, a retail title's world load waited
+/// 35–70 s for each compute program it needed (#1269). Several processes do scale.
+const WINE_COMPILE_THREADS: usize = 4;
+
+/// `compile_threads` without `XCL_DXC_THREADS`: every core but one, at most
+/// `WINE_COMPILE_THREADS` under Wine (`wine`).
+fn default_compile_threads(cores: usize, wine: bool) -> usize {
+    let all = cores.saturating_sub(1);
+    if wine {
+        all.min(WINE_COMPILE_THREADS)
+    } else {
+        all
+    }
+}
+
+#[cfg(test)]
+mod thread_tests {
+    use super::default_compile_threads;
+
+    #[test]
+    fn wine_caps_the_default_compile_threads() {
+        assert_eq!(default_compile_threads(32, false), 31, "every core but one");
+        assert_eq!(default_compile_threads(32, true), 4, "under Wine at most 4");
+        assert_eq!(default_compile_threads(4, true), 3, "fewer cores than the cap: every core but one");
+        assert_eq!(default_compile_threads(1, true), 0, "clamped to 1 by compile_threads");
+    }
 }
 
 /// GB of commit `wait_for_memory` keeps free besides the compiles: 6 for a running title (its
