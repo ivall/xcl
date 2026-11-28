@@ -22,8 +22,17 @@ pub enum Call {
     Submit,
     /// PresentX, or a present of the fallback's at a console method
     Present,
-    /// a present's wait for the copy of the frame before
+    /// a present's wait for the copy of the frame before (this one and the parts below run
+    /// inside `Present`, or inside `Submit` when the fallback presents on a submission)
     PresentCopyWait,
+    /// a present's wait for the one before it (`PresentX`'s lock and the presenter's)
+    PresentLockWait,
+    /// a present's copy (or composite) of the frame, recorded and submitted
+    PresentRecord,
+    /// the swap chain's Present (DXGI holds it while the frames before it are queued)
+    PresentSwap,
+    /// a present's wait for the copy of a frame dump (`XCL_FRAME_DUMP`, `XCL_DUMP_TARGETS`)
+    PresentDumpWait,
     WaitFrameEvent,
     /// the title's blocking waits for a fence (SetEventOnCompletion without an event)
     FenceWait,
@@ -31,7 +40,7 @@ pub enum Call {
     FenceSettle,
 }
 
-pub const CALLS: [(Call, &str); 12] = [
+pub const CALLS: [(Call, &str); 16] = [
     (Call::PlacedTexture, "placed textures"),
     (Call::PlacedBuffer, "placed buffers"),
     (Call::PhysicalPages, "physical page calls"),
@@ -41,6 +50,10 @@ pub const CALLS: [(Call, &str); 12] = [
     (Call::Submit, "ExecuteCommandLists"),
     (Call::Present, "presents"),
     (Call::PresentCopyWait, "waits of a present for the last frame's copy"),
+    (Call::PresentLockWait, "waits of a present for the one before"),
+    (Call::PresentRecord, "copies of a present recorded and submitted"),
+    (Call::PresentSwap, "swap chain Presents"),
+    (Call::PresentDumpWait, "waits of a present for a frame dump's copy"),
     (Call::WaitFrameEvent, "WaitFrameEventX"),
     (Call::FenceWait, "blocking fence waits"),
     (Call::FenceSettle, "copies back settled at fence looks"),
