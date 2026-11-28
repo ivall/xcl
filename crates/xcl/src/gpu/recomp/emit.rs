@@ -2711,8 +2711,12 @@ impl Em {
                 for k in (0..n).step_by(2) {
                     let v = s.vreg(vdata + k as u64 / 2);
                     let lo = half(&format!("{r}.{}", ["x", "y", "z", "w"][sel(k) as usize]));
-                    let hi = if k + 1 < n { half(&format!("{r}.{}", ["x", "y", "z", "w"][sel(k + 1) as usize])) } else { "0u".into() };
-                    s.line(&format!("{v} = select({a}, ({lo} & 0xFFFFu) | ({hi} << 16), {v});"));
+                    if k + 1 < n {
+                        let hi = half(&format!("{r}.{}", ["x", "y", "z", "w"][sel(k + 1) as usize]));
+                        s.line(&format!("{v} = select({a}, ({lo} & 0xFFFFu) | (({hi} & 0xFFFFu) << 16), {v});"));
+                    } else {
+                        s.line(&format!("{v} = select({a}, ({v} & 0xFFFF0000u) | ({lo} & 0xFFFFu), {v});"));
+                    }
                 }
             } else {
                 for k in 0..n {
@@ -2999,7 +3003,7 @@ impl Em {
                     ));
                 }
                 let cls = format!("{t}_cls");
-                let half = move |e: &str| format!("(({cls} == 0u) ? f32tof16(asfloat({e})) : ({e} & 0xFFFFu))");
+                let half = move |e: &str| format!("img_d16({e}, {cls})");
                 let comps2 = comps.clone();
                 write_result(self, &format!("{t}_r"), comps.len(), &move |k| comps2[k], &half);
             }
@@ -6229,6 +6233,7 @@ uint4 bvh_intersect(uint type, uint at, float tmax, float3 o, float3 d, float3 i
     return uint4(0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu);
 }
 uint img_cls(uint fmt) { uint ty = select(fmt <= 77u, (FMT_INFO[min(fmt, 77u)] >> 3) & 7u, 6u); return select(ty == 4u, 1u, select(ty == 5u, 2u, 0u)); }
+uint img_d16(uint e, uint cls) { return select(cls == 0u, f32tof16(asfloat(e)), select(cls == 1u, min(e, 65535u), (uint)clamp(asint(e), -32768, 32767) & 0xFFFFu)); }
 void put_bits(inout uint4 r, uint off, uint w, uint v) {
     uint m = w >= 32u ? 0xFFFFFFFFu : ((1u << w) - 1u); v &= m;
     uint i = off >> 5; uint s = off & 31u;

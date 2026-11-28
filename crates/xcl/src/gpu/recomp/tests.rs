@@ -3306,6 +3306,89 @@ fn gpu_images_a16_d16() {
     }
 }
 
+#[test]
+fn image_load_d16_translation_uses_saturating_helper_and_preserves_high_half() {
+    let mimg = |name: &'static str, f: &[(&str, u64)]| -> Vec<u8> { encode(name, "ENC_MIMG", f, None).unwrap() };
+    let mut code = Vec::new();
+    code.extend(mimg("IMAGE_LOAD", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("DMASK", 0x1), ("DIM", 1), ("UNORM", 1), ("D16", 1)]));
+    code.extend(mimg("IMAGE_LOAD_MIP", &[("VDATA", 12), ("VADDR", 2), ("SRSRC", 4), ("DMASK", 0x7), ("DIM", 1), ("UNORM", 1), ("D16", 1)]));
+    code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+    let t = translate(&code, &Options::default()).unwrap();
+    assert!(t.complete(), "{:?}\n{}", t.unsupported_why, t.hlsl);
+    assert!(t.hlsl.contains("img_d16("), "expected integer-saturating img_d16 helper in HLSL:\n{}", t.hlsl);
+    assert!(t.hlsl.contains("v10 & 0xFFFF0000u"), "expected odd-channel dmask 0x1 to preserve v10[31:16]:\n{}", t.hlsl);
+    assert!(t.hlsl.contains("v13 & 0xFFFF0000u"), "expected odd-channel dmask 0x7 to preserve v13[31:16]:\n{}", t.hlsl);
+}
+
+#[test]
+fn gpu_image_load_d16_saturates_and_keeps_high_half() {
+    if !gpu_ready() {
+        return;
+    }
+    use runner::{TestTexture, TexDim};
+    use windows::Win32::Graphics::Dxgi::Common::{
+        DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_FORMAT_R32G32B32A32_SINT, DXGI_FORMAT_R32_SINT, DXGI_FORMAT_R32_UINT,
+    };
+    let mimg = |name: &'static str, f: &[(&str, u64)]| -> Vec<u8> { encode(name, "ENC_MIMG", f, None).unwrap() };
+    let mut code = Vec::new();
+    code.extend(mimg("IMAGE_LOAD", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("DMASK", 0x1), ("DIM", 1), ("UNORM", 1), ("D16", 1)]));
+    code.extend(mimg("IMAGE_LOAD", &[("VDATA", 12), ("VADDR", 2), ("SRSRC", 6), ("DMASK", 0x7), ("DIM", 1), ("UNORM", 1), ("D16", 1)]));
+    code.extend(mimg("IMAGE_LOAD_MIP", &[("VDATA", 14), ("VADDR", 4), ("SRSRC", 8), ("DMASK", 0x1), ("DIM", 1), ("UNORM", 1), ("D16", 1)]));
+    code.extend(mimg("IMAGE_LOAD", &[("VDATA", 15), ("VADDR", 2), ("SRSRC", 10), ("DMASK", 0x1), ("DIM", 1), ("UNORM", 1), ("D16", 1)]));
+    code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+
+    let mut st = KernelState::default();
+    st.sgpr[16..24].copy_from_slice(&tsharp(0, 20, 9)); // 32_UINT
+    st.sgpr[24..32].copy_from_slice(&tsharp(2, 76, 9)); // 32_32_32_32_SINT
+    st.sgpr[32..40].copy_from_slice(&tsharp(4, 21, 9)); // 32_SINT
+    st.sgpr[40..48].copy_from_slice(&tsharp(6, 77, 9)); // 32_32_32_32_FLOAT
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        r[0] = (l as u32) & 1; // x = 0 or 1 into tex0
+        r[1] = 0;
+        r[2] = 0;
+        r[3] = 0;
+        r[4] = 0;
+        r[5] = 0;
+        r[6] = 0; // mip 0
+        r[10] = 0xCAFE_1111;
+        r[12] = 0x1234_5678;
+        r[13] = 0xBEEF_9999;
+        r[14] = 0xDEAD_2222;
+        r[15] = 0xABCD_3333;
+    }
+
+    let mut d0 = Vec::new();
+    for v in [100_000u32, 42u32] {
+        d0.extend_from_slice(&v.to_le_bytes());
+    }
+    let mut d1 = Vec::new();
+    for v in [40_000i32, -40_000i32, -5i32, 10i32] {
+        d1.extend_from_slice(&v.to_le_bytes());
+    }
+    let d2 = (-40_000i32).to_le_bytes().to_vec();
+    let mut d3 = Vec::new();
+    for v in [1.5f32, -2.0f32, 0.5f32, 4.0f32] {
+        d3.extend_from_slice(&v.to_le_bytes());
+    }
+
+    let tex = vec![
+        TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32_UINT, width: 2, height: 1, depth: 1, texel_bytes: 4, data: d0, uav: false },
+        TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32G32B32A32_SINT, width: 1, height: 1, depth: 1, texel_bytes: 16, data: d1, uav: false },
+        TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32_SINT, width: 1, height: 1, depth: 1, texel_bytes: 4, data: d2, uav: false },
+        TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32G32B32A32_FLOAT, width: 1, height: 1, depth: 1, texel_bytes: 16, data: d3, uav: false },
+    ];
+    let r = runner::run_code_with(&code, &st, &[], &tex, &[]).unwrap();
+    for l in 0..64 {
+        let v = &r.vgpr[l];
+        let want_u = if l & 1 == 0 { 0xCAFE_FFFF } else { 0xCAFE_002A };
+        assert_eq!(v[10], want_u, "lane {l} R32_UINT d16 dmask:0x1");
+        assert_eq!(v[12], 0x8000_7FFF, "lane {l} RGBA32_SINT d16 ch 0..1");
+        assert_eq!(v[13], 0xBEEF_FFFB, "lane {l} RGBA32_SINT d16 ch 2 high-half preserved");
+        assert_eq!(v[14], 0xDEAD_8000, "lane {l} R32_SINT load_mip d16 clamp min");
+        assert_eq!(v[15], 0xABCD_3E00, "lane {l} RGBA32_FLOAT d16 high-half preserved");
+    }
+}
+
 /// f32 → IEEE half bits (exact for the small values used in tests).
 fn half_bits(x: f32) -> u32 {
     if x == 0.0 {
