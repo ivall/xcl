@@ -5743,6 +5743,310 @@ unsafe fn trace_watched_copy(what: &str, dst: usize, src: usize) {
     );
 }
 
+/// One buffer copy between a title buffer and the copy scratch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RowCopy {
+    buffer: u64,
+    scratch: u64,
+    bytes: u64,
+}
+
+/// Which side of a CopyTextureRegion is the placed footprint, with what the plan needs to know.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FootprintSide {
+    /// buffer -> texture: the rows (in blocks) and slices the source box covers, read up to the
+    /// end of the buffer (`buffer_bytes`)
+    Source { buffer_bytes: u64, rows: std::ops::Range<u32>, slices: std::ops::Range<u32> },
+    /// texture -> buffer: only the bytes the copy writes go back, so the bytes between rows and
+    /// outside the box stay as they are. Rows and slices in blocks, bytes within a row.
+    Destination { rows: std::ops::Range<u32>, slices: std::ops::Range<u32>, bytes: std::ops::Range<u64> },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum FootprintPlan {
+    /// PC D3D12 takes the footprint as it is
+    PassThrough,
+    /// copy through a scratch buffer at offset 0 with `row_pitch` (a multiple of 256)
+    ViaScratch { row_pitch: u32, scratch_bytes: u64, copies: Vec<RowCopy> },
+}
+
+/// rows of blocks of a DXGI format (block-compressed formats: 4 texels high)
+fn block_height(format: u32) -> u32 {
+    match format {
+        70..=84 | 94..=99 => 4,
+        _ => 1,
+    }
+}
+
+/// How to issue a CopyTextureRegion whose placed footprint is at `offset` with `row_pitch`.
+/// PC D3D12 requires `Offset` % 512 (D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT) and `RowPitch` %
+/// 256 (D3D12_TEXTURE_DATA_PITCH_ALIGNMENT), in both directions; console footprints may be packed
+/// tighter. With `OPTIONS13.UnrestrictedBufferTextureCopyPitchSupported`, both only need to be
+/// multiples of the format's unit (texel or block) size: `unrestricted_unit` is that size when the
+/// device reports it. Rows are rows of blocks; `height` is in texels.
+fn footprint_plan(offset: u64, row_pitch: u32, format: u32, height: u32, depth: u32, unrestricted_unit: Option<u64>, side: &FootprintSide) -> FootprintPlan {
+    let align = D3D12_TEXTURE_DATA_PITCH_ALIGNMENT as u64;
+    if offset.is_multiple_of(D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT as u64) && (row_pitch as u64).is_multiple_of(align) {
+        return FootprintPlan::PassThrough;
+    }
+    if unrestricted_unit.is_some_and(|u| u > 0 && offset.is_multiple_of(u) && (row_pitch as u64).is_multiple_of(u)) {
+        return FootprintPlan::PassThrough;
+    }
+    if row_pitch == 0 || height == 0 || depth == 0 {
+        return FootprintPlan::PassThrough;
+    }
+    let (p, q) = (row_pitch as u64, (row_pitch as u64).next_multiple_of(align));
+    let rows = height.div_ceil(block_height(format)) as u64;
+    let scratch_bytes = rows * depth as u64 * q;
+    let mut copies = Vec::new();
+    match side {
+        FootprintSide::Source { buffer_bytes, rows: ys, slices: zs } => {
+            let (ys, zs) = (ys.start..ys.end.min(rows as u32), zs.start..zs.end.min(depth));
+            if ys.is_empty() || zs.is_empty() {
+                return FootprintPlan::ViaScratch { row_pitch: q as u32, scratch_bytes, copies };
+            }
+            if p == q {
+                // only the offset is off: from the box's first row to its last in one copy
+                let (r0, r1) = (zs.start as u64 * rows + ys.start as u64, (zs.end - 1) as u64 * rows + ys.end as u64);
+                let at = offset + r0 * p;
+                let span = ((r1 - r0) * p).min(buffer_bytes.saturating_sub(at));
+                if span > 0 {
+                    copies.push(RowCopy { buffer: at, scratch: r0 * q, bytes: span });
+                }
+            } else {
+                'rows: for z in zs {
+                    for y in ys.clone() {
+                        let r = z as u64 * rows + y as u64;
+                        let at = offset + r * p;
+                        let bytes = p.min(buffer_bytes.saturating_sub(at));
+                        if bytes == 0 {
+                            break 'rows;
+                        }
+                        copies.push(RowCopy { buffer: at, scratch: r * q, bytes });
+                    }
+                }
+            }
+        }
+        FootprintSide::Destination { rows: ys, slices: zs, bytes: xs } => {
+            let n = xs.end.saturating_sub(xs.start).min(p.saturating_sub(xs.start));
+            if n > 0 {
+                for z in zs.clone() {
+                    for y in ys.clone() {
+                        let r = z as u64 * rows + y as u64;
+                        copies.push(RowCopy { buffer: offset + r * p + xs.start, scratch: r * q + xs.start, bytes: n });
+                    }
+                }
+            }
+        }
+    }
+    FootprintPlan::ViaScratch { row_pitch: q as u32, scratch_bytes, copies }
+}
+
+/// `OPTIONS13.UnrestrictedBufferTextureCopyPitchSupported`, probed once (-1: not yet; a failed
+/// query counts as unsupported)
+static UNRESTRICTED_COPY_PITCH: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
+
+unsafe fn unrestricted_copy_pitch(dev: &ID3D12Device) -> bool {
+    match UNRESTRICTED_COPY_PITCH.load(Ordering::Acquire) {
+        -1 => {}
+        v => return v == 1,
+    }
+    let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS13::default();
+    let yes = dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS13, &mut o as *mut _ as *mut c_void, std::mem::size_of_val(&o) as u32).is_ok() && o.UnrestrictedBufferTextureCopyPitchSupported.as_bool();
+    UNRESTRICTED_COPY_PITCH.store(yes as i8, Ordering::Release);
+    crate::xlog_info!("D3D12.X: unrestricted buffer-texture copy pitch (OPTIONS13): {yes}");
+    yes
+}
+
+/// A CopyTextureRegion with a placed footprint PC D3D12 does not take, through an aligned copy
+/// scratch of the list. `false`: not such a copy, or no scratch (the call goes as it is).
+unsafe fn copy_texture_region_realigned(this: *mut c_void, d: &D3D12_TEXTURE_COPY_LOCATION, x: u32, y: u32, z: u32, s: &D3D12_TEXTURE_COPY_LOCATION, bx: *const D3D12_BOX) -> bool {
+    let placed = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    let to_texture = s.Type == placed;
+    if to_texture == (d.Type == placed) {
+        return false;
+    }
+    let loc = if to_texture { s } else { d };
+    let f = loc.Anonymous.PlacedFootprint;
+    let fp = f.Footprint;
+    if f.Offset.is_multiple_of(D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT as u64) && fp.RowPitch.is_multiple_of(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT) {
+        return false;
+    }
+    static N: AtomicU64 = AtomicU64::new(0);
+    const W: &str = "CopyTextureRegion through an aligned scratch";
+    let Some(buffer) = loc.pResource.as_ref() else { return false };
+    let buf = buffer.as_raw() as usize;
+    let Some(dev) = device_of(this) else { return false };
+    let bw = block_height(fp.Format.0 as u32);
+    // the texture side's subresource as the PC lays it out, and its bytes per block
+    let tex_loc = if to_texture { d } else { s };
+    let unit = || {
+        let tex = tex_loc.pResource.as_ref()?;
+        let (mut rows, mut row_size) = (0u32, 0u64);
+        let mut sub = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+        dev.GetCopyableFootprints(&tex.GetDesc(), tex_loc.Anonymous.SubresourceIndex, 1, 0, Some(&mut sub), Some(&mut rows), Some(&mut row_size), None);
+        Some((row_size / sub.Footprint.Width.div_ceil(bw).max(1) as u64, sub.Footprint))
+    };
+    let unrestricted = if unrestricted_copy_pitch(&dev) { unit().map(|(u, _)| u) } else { None };
+    let side = if to_texture {
+        let (rows, slices) = match bx.as_ref() {
+            Some(b) => (b.top / bw..b.bottom.div_ceil(bw), b.front..b.back),
+            None => (0..fp.Height.div_ceil(bw), 0..fp.Depth),
+        };
+        FootprintSide::Source { buffer_bytes: buffer.GetDesc().Width, rows, slices }
+    } else {
+        let Some((per_block, sub)) = unit() else { return false };
+        // the extent written into the footprint: the box, or the whole subresource
+        let (w, h, dz) = match bx.as_ref() {
+            Some(b) => (b.right.saturating_sub(b.left), b.bottom.saturating_sub(b.top), b.back.saturating_sub(b.front)),
+            None => (sub.Width, sub.Height, sub.Depth),
+        };
+        let bx0 = (x / bw) as u64 * per_block;
+        FootprintSide::Destination {
+            rows: y / bw..(y + h).div_ceil(bw),
+            slices: z..z + dz,
+            bytes: bx0..bx0 + w.div_ceil(bw) as u64 * per_block,
+        }
+    };
+    let FootprintPlan::ViaScratch { row_pitch, scratch_bytes, copies } = footprint_plan(f.Offset, fp.RowPitch, fp.Format.0 as u32, fp.Height, fp.Depth, unrestricted, &side) else {
+        return false;
+    };
+    // a scratch already used in this recording keeps its size: too small -> the call as it is
+    let Some((t, _)) = copy_scratch(this, scratch_bytes).filter(|&(_, c)| c >= scratch_bytes) else {
+        warn(&N, W, format_args!("no scratch of {scratch_bytes:#x} bytes for a footprint at {:#x} with row pitch {}", f.Offset, fp.RowPitch));
+        return false;
+    };
+    let mut scratch: D3D12_TEXTURE_COPY_LOCATION = std::ptr::read(loc);
+    std::ptr::write(&mut scratch.pResource as *mut _ as *mut usize, t);
+    scratch.Anonymous.PlacedFootprint.Offset = 0;
+    scratch.Anonymous.PlacedFootprint.Footprint.RowPitch = row_pitch;
+    let copy = |dl: &D3D12_TEXTURE_COPY_LOCATION, sl: &D3D12_TEXTURE_COPY_LOCATION| {
+        pc::<unsafe extern "system" fn(*mut c_void, *const D3D12_TEXTURE_COPY_LOCATION, u32, u32, u32, *const D3D12_TEXTURE_COPY_LOCATION, *const D3D12_BOX)>(this, PC_COPY_TEXTURE_REGION)(this, dl, x, y, z, sl, bx)
+    };
+    if to_texture {
+        as_copy_dest(this, t, || copies.iter().for_each(|c| copy_buffer_region(this, t, c.scratch, buf, c.buffer, c.bytes)));
+        transition(this, t, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        copy(d, &scratch);
+    } else {
+        as_copy_dest(this, t, || copy(&scratch, s));
+        transition(this, t, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        copies.iter().for_each(|c| copy_buffer_region(this, buf, c.buffer, t, c.scratch, c.bytes));
+    }
+    transition(this, t, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+    std::mem::forget(scratch); // borrowed resource pointers
+    static DONE: AtomicU64 = AtomicU64::new(0);
+    let k = DONE.fetch_add(1, Ordering::Relaxed) + 1;
+    if k.is_power_of_two() {
+        crate::xlog_info!("D3D12.X: {W}: {k} copies (last: offset {:#x}, row pitch {} -> {row_pitch}, {} buffer copies)", f.Offset, fp.RowPitch, copies.len());
+    }
+    true
+}
+
+#[cfg(test)]
+mod footprint_plan_tests {
+    use super::*;
+
+    fn via(p: FootprintPlan) -> (u32, u64, Vec<RowCopy>) {
+        match p {
+            FootprintPlan::ViaScratch { row_pitch, scratch_bytes, copies } => (row_pitch, scratch_bytes, copies),
+            FootprintPlan::PassThrough => panic!("expected a scratch copy"),
+        }
+    }
+
+    /// buffer -> texture with no box (the planner clamps the ranges to the footprint)
+    fn src(buffer_bytes: u64) -> FootprintSide {
+        FootprintSide::Source { buffer_bytes, rows: 0..u32::MAX, slices: 0..u32::MAX }
+    }
+
+    #[test]
+    fn unrestricted_copy_pitch_takes_unit_aligned_footprints() {
+        // R8G8B8A8 (4-byte texels): pitch 64 and offset 0x104 are whole texels
+        assert_eq!(footprint_plan(0x104, 64, 28, 4, 1, Some(4), &src(0x400)), FootprintPlan::PassThrough);
+        // without the capability the same footprint needs the scratch
+        assert!(matches!(footprint_plan(0x104, 64, 28, 4, 1, None, &src(0x400)), FootprintPlan::ViaScratch { .. }));
+        // with it, an offset that is not a whole texel still does
+        assert!(matches!(footprint_plan(0x102, 64, 28, 4, 1, Some(4), &src(0x400)), FootprintPlan::ViaScratch { .. }));
+        // BC1 (8-byte blocks): pitch 36 is not whole blocks
+        assert!(matches!(footprint_plan(0, 36, 71, 8, 1, Some(8), &src(0x400)), FootprintPlan::ViaScratch { .. }));
+    }
+
+    #[test]
+    fn a_source_box_copies_only_its_rows_and_slices() {
+        // pitch 64, 4 rows x 3 slices; the box covers rows 1..3 of slices 1..2
+        let side = FootprintSide::Source { buffer_bytes: 12 * 64, rows: 1..3, slices: 1..2 };
+        let (_, bytes, copies) = via(footprint_plan(0, 64, 28, 4, 3, None, &side));
+        assert_eq!(bytes, 12 * 256);
+        assert_eq!(copies, vec![
+            RowCopy { buffer: 5 * 64, scratch: 5 * 256, bytes: 64 },
+            RowCopy { buffer: 6 * 64, scratch: 6 * 256, bytes: 64 },
+        ]);
+        // aligned pitch, odd offset: one copy from the first row of the box to its last
+        let side = FootprintSide::Source { buffer_bytes: 1 << 16, rows: 1..3, slices: 0..2 };
+        let (_, _, copies) = via(footprint_plan(0x40, 256, 28, 4, 2, None, &side));
+        assert_eq!(copies, vec![RowCopy { buffer: 0x40 + 256, scratch: 256, bytes: 6 * 256 }]);
+    }
+
+    #[test]
+    fn an_aligned_footprint_goes_as_it_is() {
+        let side = src(1 << 20);
+        assert_eq!(footprint_plan(0x400, 256, 28, 16, 1, None, &side), FootprintPlan::PassThrough);
+        assert_eq!(footprint_plan(0, 512, 71, 64, 1, None, &side), FootprintPlan::PassThrough);
+    }
+
+    #[test]
+    fn an_odd_pitch_copies_each_row_to_a_256_byte_pitch() {
+        // R8G8B8A8 16x4, rows of 64 bytes packed
+        let (pitch, bytes, copies) = via(footprint_plan(0x200, 64, 28, 4, 1, None, &src(0x300)));
+        assert_eq!((pitch, bytes), (256, 4 * 256));
+        assert_eq!(copies, (0..4).map(|r| RowCopy { buffer: 0x200 + r * 64, scratch: r * 256, bytes: 64 }).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn an_odd_offset_with_an_aligned_pitch_is_one_copy() {
+        let (pitch, bytes, copies) = via(footprint_plan(0x100, 256, 28, 8, 1, None, &src(0x100 + 8 * 256)));
+        assert_eq!((pitch, bytes), (256, 8 * 256));
+        assert_eq!(copies, vec![RowCopy { buffer: 0x100, scratch: 0, bytes: 8 * 256 }]);
+    }
+
+    #[test]
+    fn an_odd_offset_and_pitch_stop_at_the_end_of_the_buffer() {
+        // the last row is only as long as the buffer has bytes
+        let (pitch, _, copies) = via(footprint_plan(0x10, 100, 28, 3, 1, None, &src(0x10 + 2 * 100 + 40)));
+        assert_eq!(pitch, 256);
+        assert_eq!(copies[2], RowCopy { buffer: 0x10 + 200, scratch: 512, bytes: 40 });
+        assert_eq!(copies.len(), 3);
+    }
+
+    #[test]
+    fn block_compressed_rows_are_rows_of_blocks() {
+        // BC1 (71) 16x16: 4 rows of 4 blocks x 8 bytes, pitch 32
+        let (pitch, bytes, copies) = via(footprint_plan(0, 32, 71, 16, 1, None, &src(128)));
+        assert_eq!((pitch, bytes, copies.len()), (256, 4 * 256, 4));
+        assert_eq!(copies[3], RowCopy { buffer: 96, scratch: 768, bytes: 32 });
+    }
+
+    #[test]
+    fn depth_slices_follow_one_another() {
+        // 3D, 2 rows per slice, 3 slices, pitch 64
+        let (_, bytes, copies) = via(footprint_plan(0, 64, 28, 2, 3, None, &src(6 * 64)));
+        assert_eq!((bytes, copies.len()), (6 * 256, 6));
+        assert_eq!(copies[5], RowCopy { buffer: 5 * 64, scratch: 5 * 256, bytes: 64 });
+    }
+
+    #[test]
+    fn texture_to_buffer_writes_back_only_the_copied_bytes() {
+        // into a packed 2-slice footprint (pitch 64, 4 rows/slice): rows 1..3, slice 1, bytes 8..24
+        let side = FootprintSide::Destination { rows: 1..3, slices: 1..2, bytes: 8..24 };
+        let (pitch, bytes, copies) = via(footprint_plan(0x40, 64, 28, 4, 2, None, &side));
+        assert_eq!((pitch, bytes), (256, 8 * 256));
+        assert_eq!(copies, vec![
+            RowCopy { buffer: 0x40 + 5 * 64 + 8, scratch: 5 * 256 + 8, bytes: 16 },
+            RowCopy { buffer: 0x40 + 6 * 64 + 8, scratch: 6 * 256 + 8, bytes: 16 },
+        ]);
+        assert_eq!(footprint_plan(0x200, 256, 28, 4, 2, None, &side), FootprintPlan::PassThrough);
+    }
+}
+
 /// CopyTextureRegion(dst, x, y, z, src, box) (PC #16; DMA list #12)
 pub(super) unsafe extern "system" fn copy_texture_region_x(this: *mut c_void, dst: *const D3D12_TEXTURE_COPY_LOCATION, x: u32, y: u32, z: u32, src: *const D3D12_TEXTURE_COPY_LOCATION, bx: *const D3D12_BOX) {
     let _detail = crate::stall::detail_span(crate::stall::StallKind::DetailCopy);
@@ -5822,6 +6126,10 @@ pub(super) unsafe extern "system" fn copy_texture_region_x(this: *mut c_void, ds
         }
     }
     let (Some(d), Some(s)) = (pc_location(dst), pc_location(src)) else { return };
+    if copy_texture_region_realigned(this, &d, x, y, z, &s, bx) {
+        std::mem::forget((d, s)); // borrowed resource pointers
+        return;
+    }
     pc::<unsafe extern "system" fn(*mut c_void, *const D3D12_TEXTURE_COPY_LOCATION, u32, u32, u32, *const D3D12_TEXTURE_COPY_LOCATION, *const D3D12_BOX)>(this, PC_COPY_TEXTURE_REGION)(this, &d, x, y, z, &s, bx);
     std::mem::forget((d, s)); // borrowed resource pointers
 }
