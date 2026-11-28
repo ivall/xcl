@@ -42,17 +42,21 @@ for i, (a, t) in enumerate(ins):
                     if ml:
                         length = int(ml.group(1), 16)
             break
-    # header: first store to (%P) / 0x0(%P) – immediate or from a list field
+    # Read the first move into the record header, accepting either spelling of offset zero.
     header = '?'
-    for tb in body:
-        mh = re.match(rf'movl\s+\$0x([0-9a-f]+),\(%{P}\)$', tb)
-        if mh:
-            header = 'imm ' + mh.group(1)
-            break
-        mf = re.match(rf'mov\s+0x([0-9a-f]+)\(%{L}\),%(\w+)$', tb)
-        if mf:
-            header = f'list+{mf.group(1)}'
-            break
+    for k, tb in enumerate(body):
+        store = re.fullmatch(rf'movl?\s+(?:\$0x([0-9a-f]+)|(%\w+)),(?:0x0)?\(%{P}\)', tb)
+        if not store:
+            continue
+        immediate, register = store.groups()
+        if immediate is not None:
+            header = 'imm ' + immediate
+        elif k > 0:
+            # An adjacent load into the stored register proves a direct list-field copy.
+            load = re.fullmatch(rf'movl?\s+0x([0-9a-f]+)\(%{L}\),{register}', body[k - 1])
+            if load:
+                header = 'list+' + load.group(1)
+        break
     # fallback: first indirect call at/after the jae target
     slot = '?'
     k = idx.get(fallback)

@@ -34,6 +34,34 @@ class RecordWriterTests(unittest.TestCase):
                     r"header imm 1234\s+length 32 B  bound \+0x30  fallback slot 8",
                 )
 
+    def test_header_comes_from_the_first_store_at_the_record_base(self):
+        cases = (
+            (("mov 0x10(%rcx),%edx", "movl $0x37,(%rax)"), "imm 37"),
+            (("movl $0x37,0x0(%rax)",), "imm 37"),
+            (("mov 0x10(%rcx),%r8d", "mov 0x344(%rcx),%edx",
+              "mov %edx,0x0(%rax)", "movl $0x37,(%rax)"), "list+344"),
+            (("mov 0x10(%rcx),%edx", "xor %edx,%edx",
+              "mov %edx,(%rax)", "movl $0x37,(%rax)"), "?"),
+        )
+        for body, header in cases:
+            with self.subTest(body=body), tempfile.TemporaryDirectory() as tmp:
+                instructions = (
+                    "mov 0x18(%rcx),%rax", "cmp 0x30(%rcx),%rax", "jae 180001030",
+                    *body, "add $0x20,%rax", "mov %rax,0x18(%rcx)", "ret",
+                )
+                listing = Path(tmp) / "synthetic.asm"
+                listing.write_text(
+                    "".join(f"   {0x180001000 + 4 * i:x}: {ins}\n"
+                            for i, ins in enumerate(instructions))
+                    + "   180001030: call *0x40(%rbx)\n",
+                    encoding="utf-8",
+                )
+                result = subprocess.run(
+                    [sys.executable, "-B", str(SCRIPT), str(listing)],
+                    capture_output=True, text=True, check=True,
+                )
+                self.assertIn(f"header {header:18} length 32 B", result.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()
