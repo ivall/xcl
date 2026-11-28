@@ -1183,10 +1183,25 @@ impl Module {
         if map.is_empty() {
             return;
         }
-        let r = |v: &mut Value| {
-            while let Some(&n) = map.get(v) {
-                *v = n;
+        // Cache chain ends locally: cascaded trivial phis can share a long tail,
+        // which otherwise gets walked again for every use (including removed phis).
+        let mut resolved = map.clone();
+        let mut r = |v: &mut Value| {
+            let Some(&first) = resolved.get(v) else { return };
+            let mut end = first;
+            while let Some(&n) = resolved.get(&end) {
+                end = n;
             }
+            if end != first {
+                let mut c = *v;
+                while let Some(n) = resolved.get_mut(&c) {
+                    if *n == end {
+                        break;
+                    }
+                    c = std::mem::replace(n, end);
+                }
+            }
+            *v = end;
         };
         for inst in &mut self.insts {
             match &mut inst.op {
@@ -1200,11 +1215,11 @@ impl Module {
                     r(b);
                     r(c)
                 }
-                Op::Call(_, args) => args.iter_mut().for_each(r),
+                Op::Call(_, args) => args.iter_mut().for_each(&mut r),
                 Op::Phi(inc) => inc.iter_mut().for_each(|(v, _)| r(v)),
                 Op::Gep(p, idx) => {
                     r(p);
-                    idx.iter_mut().for_each(r)
+                    idx.iter_mut().for_each(&mut r)
                 }
                 Op::Switch(v, _, cases) => {
                     r(v);

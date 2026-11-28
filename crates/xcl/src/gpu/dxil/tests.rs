@@ -216,3 +216,54 @@ fn batched_replacements_match_one_at_a_time() {
         panic!("validator rejected the kernel:\n{e}");
     }
 }
+
+/// Cascaded trivial phis share replacement tails; compressing them must preserve
+/// instruction operands, metadata and the caller's replacement map.
+#[test]
+fn replacement_chains_match_flattened_maps() {
+    let build = |n: usize, flat: bool| {
+        let mut s = Shader::new(Stage::Compute, (6, 6));
+        let res = s.raw_uav(1, 0);
+        let x = s.m.i32c(7);
+        let zero = s.m.i32c(0);
+        let entry = s.m.entry_block();
+        let next = s.m.new_block();
+        s.m.br(next);
+        s.m.set_block(next);
+        let i32 = s.m.i32();
+        let mut map = std::collections::HashMap::new();
+        let mut chain = Vec::new();
+        let mut prev = x;
+        for _ in 0..n {
+            let phi = s.m.phi(i32);
+            s.m.add_incoming(phi, prev, entry);
+            map.insert(phi, if flat { x } else { prev });
+            chain.push(phi);
+            prev = phi;
+        }
+        let mut heads = Vec::new();
+        for tail in [prev, chain[n / 2], prev] {
+            let phi = s.m.phi(i32);
+            s.m.add_incoming(phi, tail, entry);
+            map.insert(phi, if flat { x } else { tail });
+            heads.push(phi);
+        }
+        let sum = s.m.bin(BinOp::Add, heads[0], heads[0]);
+        let sum = s.m.bin(BinOp::Add, sum, heads[1]);
+        s.raw_store(res, zero, &[sum, heads[2]]);
+        let values: Vec<_> = heads.iter().map(|&v| Some(s.m.md_value(v))).collect();
+        // The writer serializes unnamed metadata too; DXIL rejects custom named nodes.
+        s.m.md_node(&values);
+        let before = map.clone();
+        s.m.replace_uses(&map);
+        assert_eq!(map, before, "replacement map changed");
+        s.finish([1, 1, 1], None)
+    };
+    for n in [1, 32, 1024] {
+        let c = build(n, false);
+        assert_eq!(c, build(n, true), "chain length {n}");
+        if let Err(e) = validate::validate(&c) {
+            panic!("validator rejected chain length {n}:\n{e}");
+        }
+    }
+}
