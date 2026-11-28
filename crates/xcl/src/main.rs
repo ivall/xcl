@@ -35,6 +35,7 @@ Usage:
       --recomp: translates every RDNA2 program → HLSL and shows what is missing;
       --compile N: additionally compiles N complete translations with DXC.
       --precompile [--only STAGE]: caches compiled shaders before a run (e.g. --only cs).
+      --prepare-corpus: builds every staged native pipeline recipe for a title folder.
           --pipelines also builds compute pipelines and caches them for the next run.
           --used-only skips compute shaders whose pipelines were not used in earlier runs.
       --export-hlsl DIR [--count N] [--min-kb N] [--record-hash HEX]: writes deterministic
@@ -44,6 +45,12 @@ Usage:
       --direct [--sample N] [--seed S] [--validate] [--compare]: direct DXIL translator
       coverage over a seeded sample (default 200 programs, 0 = all); also
       --timeout, --max-bytes, --threads, --json, --hash H, --dump DIR.
+  xcl pso-precompile <game folder | shaders.rpf> [--threads N] [--records FILE] [--used]
+      Before a run: translates the game's compute programs (its shaders.rpf) and has the
+      driver compile their pipelines, the ones an earlier run used first, biggest first.
+      Fills the caches the run reads (DXIL, driver blobs); what is cached is skipped.
+      --records FILE / --used: only the programs of these record hashes / pipeline keys.
+      Run it with the run's XCL_DIRECT_DXIL / XCL_HEAP_WINDOWS: they change the keys.
   xcl rpf <package.rpf> [--top N] [--find NAME] [--extract NAME --out DIR]
       Lists or extracts readable inline records. Archives larger than 1 GB use a
       bounded-memory header probe; --probe requests it explicitly and --full overrides it.
@@ -75,6 +82,7 @@ fn main() {
         }
         Some("disasm") if args.len() >= 2 => xcl::disasm::run(&PathBuf::from(&args[1]), &args[2..]),
         Some("shaders") if args.len() >= 2 => xcl::shaders::run(&PathBuf::from(&args[1]), &args[2..]),
+        Some("pso-precompile") if args.len() >= 2 => xcl::shaders::pso_precompile(&PathBuf::from(&args[1]), &args[2..]),
         Some("rpf") if args.len() >= 2 => xcl::rpf::run(&PathBuf::from(&args[1]), &args[2..]),
         Some("--version") | Some("-V") => {
             println!("xcl {}", env!("CARGO_PKG_VERSION"));
