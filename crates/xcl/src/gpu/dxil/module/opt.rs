@@ -103,6 +103,7 @@ impl Module {
 
     fn cse_kind(&self, op: &Op) -> Cse {
         match op {
+            Op::Gep(p, _) if !self.is_const_global_ptr(*p) => Cse::Block,
             Op::Bin(..) | Op::Cast(..) | Op::Cmp(..) | Op::Select(..) | Op::Extract(..) | Op::Gep(..) => Cse::Dom,
             Op::Load(p, _) if self.is_const_global_ptr(*p) => Cse::Dom,
             Op::Phi(_) if cfg!(test) && std::env::var_os("XCL_SAMPLE_PHI_CSE").is_some() => Cse::Block,
@@ -1369,6 +1370,42 @@ mod tests {
             .flat_map(|b| b.iter())
             .filter(|&&i| matches!(m.insts[i as usize].op, Op::Call(f, _) if f == target_fn))
             .count()
+    }
+
+    #[test]
+    fn a_pointer_to_storage_is_made_again_in_each_block() {
+        let mut m = Module::new();
+        m.define_entry("main");
+        let i32t = m.i32();
+        let arr = m.array(2, i32t);
+        let g = m.global("xcl_xs", arr, 3, None, false, 4);
+        let (zero, one) = (m.i32c(0), m.i32c(1));
+        let lane_ty = m.func_ty(i32t, &[]);
+        let lane_fn = m.declare("dx.op.waveGetLaneIndex", lane_ty, FnAttrs::ReadNone);
+        let next = m.new_block();
+        let done = m.new_block();
+        let b = m.entry_block();
+        m.set_block(b);
+        let lane = m.call(lane_fn, &[]);
+        let go = m.cmp(Pred::Eq, lane, zero);
+        for to in [Some(next), None] {
+            let p = m.gep(g, &[zero, one]);
+            m.store(p, zero, 4);
+            let q = m.gep(g, &[zero, one]);
+            m.store(q, one, 4);
+            match to {
+                Some(to) => {
+                    m.cond_br(go, to, done);
+                    m.set_block(to);
+                }
+                None => m.br(done),
+            }
+        }
+        m.set_block(done);
+        m.ret();
+        m.optimize();
+        let geps = |b: &Vec<u32>| b.iter().filter(|&&i| matches!(m.insts[i as usize].op, Op::Gep(..))).count();
+        assert_eq!(m.blocks.iter().map(geps).collect::<Vec<_>>(), [1, 1, 0]);
     }
 
     #[test]
