@@ -96,6 +96,36 @@ class SmokeBlockTests(unittest.TestCase):
             for run in ("the PR's", "the main"):
                 self.assertTrue(any(p.startswith(run) and f"no `{field}` line" in p for p in problems), problems)
 
+    RUN = "title: G\nseconds: 60\ndevice removals: 0\ncrashes: 0\npeak commit: {} MB\nframes shown: {}\n"
+
+    def test_a_main_run_with_uncommitted_changes_is_not_a_baseline(self):
+        body = ("```\nxcl-smoke v1\ncommit: 1111111aaaa (uncommitted changes)\n" + self.RUN.format(100, 100) + "```\n"
+                "```\nxcl-smoke v1\ncommit: 1234567890\n" + self.RUN.format(100, 100) + "```\n")
+        problems = check(BODY + body, HEAD, [changed("crates/xcl/src/hle/d3d12x/vram.rs")], lambda sha: sha == "1111111aaaa")
+        self.assertEqual(["the main regression run (`xcl-smoke` block of commit 1111111aaaa) has uncommitted "
+                          "changes: rerun scripts/smoke.ps1 on a clean checkout of main"], problems)
+
+    def test_the_newest_main_block_is_the_baseline_whatever_its_place(self):
+        # an old main run with a low peak pasted first, the current main run after it
+        old = "```\nxcl-smoke v1\ncommit: 1111111aaaa\n" + self.RUN.format(1000, 100) + "```\n"
+        new = "```\nxcl-smoke v1\ncommit: 2222222bbbb\n" + self.RUN.format(4000, 100) + "```\n"
+        pr = "```\nxcl-smoke v1\ncommit: 1234567890\n" + self.RUN.format(4000, 100) + "```\n"
+        files = [changed("crates/xcl/src/hle/d3d12x/vram.rs")]
+        on_main = lambda sha: sha in ("1111111aaaa", "2222222bbbb")
+        behind = {"1111111aaaa": 40, "2222222bbbb": 2}.get
+        for order in (old + new, new + old):
+            self.assertEqual([], check(BODY + order + pr, HEAD, files, on_main, main_behind=behind))
+        # without the distance the first block is taken, as before
+        self.assertIn("the PR's run commits much more memory than main's (4000 MB against 1000 MB)",
+                      check(BODY + old + new + pr, HEAD, files, on_main))
+        # an unknown distance (a failed API call) does not reorder: the first block, not the older one
+        flaky = {"1111111aaaa": 40, "2222222bbbb": None}.get
+        self.assertEqual([], check(BODY + new + old + pr, HEAD, files, on_main, main_behind=flaky))
+        # a failing comparison with an old baseline says how old it is
+        self.assertIn("the PR's run commits much more memory than main's (4000 MB against 1000 MB); "
+                      "the main block is 40 commit(s) behind main: rerun it before comparing",
+                      check(BODY + old + pr, HEAD, files, on_main, main_behind=behind))
+
     def test_non_numeric_frames_shown_fails(self):
         run = "title: G\nseconds: 60\ndevice removals: 0\ncrashes: 0\n"
         problems = self.smoke_problems(run + "frames shown: 100\n", run + "frames shown: many\n")
