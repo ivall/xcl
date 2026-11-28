@@ -2211,14 +2211,26 @@ mod tests {
 
     #[test]
     fn fine_timer_makes_short_sleeps_short() {
-        // Windows' Sleep (std::thread::sleep has its own high-resolution timer)
         fine_timer();
-        let t = std::time::Instant::now();
-        for _ in 0..20 {
-            unsafe { windows_sys::Win32::System::Threading::Sleep(1) };
-        }
-        let per = t.elapsed() / 20;
-        assert!(per < std::time::Duration::from_millis(5), "Sleep(1) took {per:?}: the 15.6 ms tick");
+        // what it sets: the timer resolution, at most 1 ms (in 100 ns units)
+        let (mut coarsest, mut finest, mut now) = (0u32, 0u32, 0u32);
+        assert!(unsafe { NtQueryTimerResolution(&mut coarsest, &mut finest, &mut now) } >= 0);
+        assert!(now <= 10_000, "timer resolution {:.2} ms after fine_timer", now as f64 / 10_000.0);
+        // and Windows' Sleep (std::thread::sleep has its own high-resolution timer): the fastest
+        // of 20, after one that lines the thread up with the timer. With the 15.6 ms tick every
+        // one of them takes a tick. On a busy PC (a parallel test run with more threads than
+        // processors) most wake up late, which moved the mean of 20 past 5 ms (#1487), but not
+        // all of them.
+        unsafe { windows_sys::Win32::System::Threading::Sleep(1) };
+        let fastest = (0..20)
+            .map(|_| {
+                let t = std::time::Instant::now();
+                unsafe { windows_sys::Win32::System::Threading::Sleep(1) };
+                t.elapsed()
+            })
+            .min()
+            .unwrap();
+        assert!(fastest < std::time::Duration::from_millis(5), "Sleep(1) took at least {fastest:?}: the 15.6 ms tick");
     }
 
     #[test]
