@@ -20,8 +20,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use windows_sys::Win32::Foundation::{CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows_sys::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows_sys::Win32::System::Threading::{
-    CreateEventW, CreateSemaphoreW, CreateWaitableTimerExW, GetCurrentProcess, GetCurrentThread, ReleaseSemaphore, SetEvent, SetThreadPriority,
-    SetWaitableTimer, WaitForMultipleObjects, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, INFINITE, THREAD_PRIORITY_TIME_CRITICAL, TIMER_ALL_ACCESS,
+    CreateEventW, CreateSemaphoreW, CreateWaitableTimerExW, GetCurrentProcess, GetCurrentThread, ReleaseSemaphore, ResetEvent, SetEvent,
+    SetThreadPriority, SetWaitableTimer, WaitForMultipleObjects, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, INFINITE, THREAD_PRIORITY_TIME_CRITICAL,
+    TIMER_ALL_ACCESS,
 };
 
 use crate::util::{HRESULT, S_OK};
@@ -225,6 +226,22 @@ fn with<R>(f: impl FnOnce(&mut Clock) -> R) -> R {
     f(c)
 }
 
+/// Unschedule `k` and clear any pending kernel signal, queued origin timestamps, or duplicated
+/// ancillary handles left over from the ended schedule.
+unsafe fn unschedule_kind(k: &mut Kind, is_origin: bool) {
+    k.scheduled = false;
+    k.extra = Arc::new(Handles(Vec::new()));
+    if !k.internal.is_null() {
+        if is_origin {
+            let mut o = ORIGINS.lock().unwrap();
+            while WaitForMultipleObjects(1, &k.internal, 0, 0) == WAIT_OBJECT_0 {}
+            o.clear();
+        } else {
+            ResetEvent(k.internal);
+        }
+    }
+}
+
 /// device #78 SetFrameIntervalX(output, length µs, periodicity, flags)
 pub unsafe extern "system" fn set_frame_interval_x(_this: *mut std::ffi::c_void, _output: *mut std::ffi::c_void, len_us: u32, periodicity: u32, flags: u32) -> HRESULT {
     if len_us != 0 && !interval_valid(len_us, high_refresh()) {
@@ -233,7 +250,7 @@ pub unsafe extern "system" fn set_frame_interval_x(_this: *mut std::ffi::c_void,
     }
     with(|c| {
         if c.interval_us != len_us {
-            c.kinds[0].scheduled = false;
+            unschedule_kind(&mut c.kinds[0], true);
             if c.active && len_us != 0 {
                 c.base_qpc = qpc();
             }
@@ -241,8 +258,8 @@ pub unsafe extern "system" fn set_frame_interval_x(_this: *mut std::ffi::c_void,
         c.interval_us = len_us;
         if len_us == 0 {
             c.active = false;
-            for k in c.kinds.iter_mut() {
-                k.scheduled = false;
+            for (i, k) in c.kinds.iter_mut().enumerate() {
+                unschedule_kind(k, i == 0);
             }
         }
         c.generation += 1;
@@ -415,11 +432,11 @@ pub unsafe extern "system" fn schedule_frame_event_x(_this: *mut std::ffi::c_voi
         }
         let interval = c.interval_us.max(1);
         let k = &mut c.kinds[ty as usize];
-        // the previous handles close with their last holder (the clock thread may be signalling them)
-        k.extra = Arc::new(Handles(dups));
         if unschedule {
-            k.scheduled = false;
+            unschedule_kind(k, ty == 0);
         } else {
+            // the previous handles close with their last holder (the clock thread may be signalling them)
+            k.extra = Arc::new(Handles(dups));
             k.offset_us = offset_us % interval;
             k.scheduled = true;
         }
@@ -642,18 +659,29 @@ fn clock_thread() {
                 WaitForMultipleObjects(1, &wake(), 0, INFINITE);
                 continue;
             };
-            if !sleep_until(timer, deadline, allow_spin) || !with(|c| c.generation == generation) {
+            if !sleep_until(timer, deadline, allow_spin) {
                 continue;
             }
-            for (_, ty, internal, extra) in due {
-                last[ty] = deadline;
-                if ty == 0 {
-                    let now = qpc();
-                    LAST_ORIGIN.store(now, Ordering::Relaxed);
-                    publish_origin(&ORIGINS, internal as HANDLE, now, || {});
-                } else {
-                    SetEvent(internal as HANDLE);
+            let now = qpc();
+            let fired = with(|c| {
+                if c.generation != generation {
+                    return false;
                 }
+                for &(_, ty, internal, _) in &due {
+                    if ty == 0 {
+                        LAST_ORIGIN.store(now, Ordering::Relaxed);
+                        publish_origin(&ORIGINS, internal as HANDLE, now, || {});
+                    } else {
+                        SetEvent(internal as HANDLE);
+                    }
+                }
+                true
+            });
+            if !fired {
+                continue;
+            }
+            for (_, ty, _, extra) in due {
+                last[ty] = deadline;
                 for &h in &extra.0 {
                     if SetEvent(h) == 0 {
                         ReleaseSemaphore(h, 1, std::ptr::null_mut());
@@ -879,6 +907,80 @@ mod tests {
             let mut t = 0u64;
             assert_eq!(wait_frame_event_x(dev, 0, 200, std::ptr::null(), 0, &mut t), S_OK);
             assert_eq!(set_frame_interval_x(dev, std::ptr::null_mut(), 0, 0, 0), S_FALSE, "stops the clock");
+        }
+    }
+
+    /// Unconsumed origin ticks and signalled secondary frame events do not carry across a clock
+    /// stop, an interval change, or an `UNSCHEDULE`: restarted waits block for fresh deadlines and
+    /// issue tokens stamped at or after the new schedule rather than before the stop.
+    #[test]
+    fn stopping_interval_change_and_unschedule_drop_stale_signals_and_origins() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let dev = std::ptr::null_mut();
+            let ev = CreateEventW(std::ptr::null(), 0, 0, std::ptr::null());
+            let list = [ev];
+            let mut signaled = 0i32;
+            let mut block = [0u8; 0x18];
+            block[..4].copy_from_slice(&1u32.to_le_bytes());
+            block[8..16].copy_from_slice(&(list.as_ptr() as usize).to_le_bytes());
+            block[16..24].copy_from_slice(&(&mut signaled as *mut i32 as usize).to_le_bytes());
+
+            assert_eq!(set_frame_interval_x(dev, std::ptr::null_mut(), 16667, 1, 0), S_FALSE);
+            let hr = schedule_frame_event_x(dev, 0, 0, block.as_ptr(), 0);
+            assert!(hr == STARTED_CLOCK || hr == S_FALSE, "{hr:#x}");
+            assert_eq!(schedule_frame_event_x(dev, 1, 0, block.as_ptr(), 0), S_FALSE);
+            // Let several unconsumed origin and type-1 ticks accumulate.
+            std::thread::sleep(std::time::Duration::from_millis(85));
+
+            // Unscheduling type 1 clears its internal event and drops its duplicated handles.
+            assert_eq!(schedule_frame_event_x(dev, 1, 0, std::ptr::null(), UNSCHEDULE), S_FALSE);
+            assert!(with(|c| c.kinds[1].extra.0.is_empty()), "unschedule drops ancillary handles");
+
+            // Stopping the clock drains queued origin counts/timestamps and drops type-0 handles.
+            assert_eq!(set_frame_interval_x(dev, std::ptr::null_mut(), 0, 0, 0), S_FALSE);
+            assert!(with(|c| c.kinds.iter().all(|k| k.extra.0.is_empty())), "stop drops ancillary handles");
+            std::thread::sleep(std::time::Duration::from_millis(40));
+
+            // Restart at 30 Hz (33 333 µs): neither type 0 nor a late-offset type 1 is pre-signalled
+            // from before the stop, and the first issued token's origin is after `restart_qpc`.
+            assert_eq!(set_frame_interval_x(dev, std::ptr::null_mut(), 33333, 1, 0), S_FALSE);
+            let restart_qpc = qpc();
+            let hr = schedule_frame_event_x(dev, 0, 0, std::ptr::null(), 0);
+            assert!(hr == STARTED_CLOCK || hr == S_FALSE, "{hr:#x}");
+            assert_eq!(schedule_frame_event_x(dev, 1, 25_000, std::ptr::null(), 0), S_FALSE);
+            assert_eq!(wait_frame_event_x(dev, 1, 0, std::ptr::null(), 0, std::ptr::null_mut()), S_FALSE, "rescheduled type 1 must not wake from a stale signal");
+
+            let t0 = std::time::Instant::now();
+            let mut tok = 0u64;
+            assert_eq!(wait_frame_event_x(dev, 0, 200, std::ptr::null(), 0, &mut tok), S_OK);
+            let first_wait_ms = t0.elapsed().as_millis();
+            assert!(first_wait_ms >= 15, "first 30 Hz origin after stop returned in {first_wait_ms} ms (stale semaphore count)");
+            mark_flipped(tok);
+            let (mut n, mut st) = (1u32, [0u8; 0x40]);
+            assert_eq!(frame_statistics_x(dev, tok, 0, &mut n, st.as_mut_ptr()), S_OK);
+            let origin = i64::from_le_bytes(st[0x10..0x18].try_into().unwrap());
+            assert!(origin >= restart_qpc, "token got pre-stop origin {origin} < restart {restart_qpc}");
+
+            // Changing the interval while active also drains unconsumed origins from the old rate.
+            assert_eq!(set_frame_interval_x(dev, std::ptr::null_mut(), 16667, 1, 0), S_FALSE);
+            let hr = schedule_frame_event_x(dev, 0, 0, std::ptr::null(), 0);
+            assert!(hr == STARTED_CLOCK || hr == S_FALSE, "{hr:#x}");
+            std::thread::sleep(std::time::Duration::from_millis(85));
+            assert_eq!(set_frame_interval_x(dev, std::ptr::null_mut(), 33333, 1, 0), S_FALSE);
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            let switch_qpc = qpc();
+            let hr = schedule_frame_event_x(dev, 0, 0, std::ptr::null(), 0);
+            assert!(hr == STARTED_CLOCK || hr == S_FALSE, "{hr:#x}");
+            let mut tok2 = 0u64;
+            assert_eq!(wait_frame_event_x(dev, 0, 200, std::ptr::null(), 0, &mut tok2), S_OK);
+            mark_flipped(tok2);
+            assert_eq!(frame_statistics_x(dev, tok2, 0, &mut n, st.as_mut_ptr()), S_OK);
+            let origin2 = i64::from_le_bytes(st[0x10..0x18].try_into().unwrap());
+            assert!(origin2 >= switch_qpc, "token got pre-interval-change origin {origin2} < switch {switch_qpc}");
+
+            assert_eq!(set_frame_interval_x(dev, std::ptr::null_mut(), 0, 0, 0), S_FALSE);
+            CloseHandle(ev);
         }
     }
 }
