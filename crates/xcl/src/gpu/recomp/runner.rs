@@ -871,7 +871,7 @@ pub fn draw_gs(
     size: u32,
     clear: [f32; 4],
 ) -> Result<Vec<[f32; 4]>, String> {
-    draw_gs_views(vs, gs, ps, layout, vertices, stride, &[], sgprs, mem, &[], &[], size, clear)
+    draw_gs_views(vs, gs, ps, layout, vertices, stride, &[], sgprs, mem, &[], &[], size, clear, 1)
 }
 
 /// `draw_gs` of an indexed triangle list (`indices`).
@@ -887,7 +887,7 @@ pub fn draw_gs_indexed(
     size: u32,
     clear: [f32; 4],
 ) -> Result<Vec<[f32; 4]>, String> {
-    draw_gs_views(vs, gs, ps, layout, vertices, stride, indices, &[], &[], &[], &[], size, clear)
+    draw_gs_views(vs, gs, ps, layout, vertices, stride, indices, &[], &[], &[], &[], size, clear, 1)
 }
 
 /// `draw` with textures and samplers in the directly indexed heaps (see `ViewTexture`).
@@ -905,7 +905,27 @@ pub fn draw_views(
     size: u32,
     clear: [f32; 4],
 ) -> Result<Vec<[f32; 4]>, String> {
-    draw_gs_views(vs, None, ps, layout, vertices, stride, &[], sgprs, mem, textures, samplers, size, clear)
+    draw_gs_views(
+        vs, None, ps, layout, vertices, stride, &[], sgprs, mem, textures, samplers, size, clear, 1,
+    )
+}
+
+/// `draw` into a target with `samples` samples per pixel: returns every sample, pixel (x, y)
+/// sample s at `(y · size + x) · samples + s` (read back by a compute pass: needs DXC).
+#[allow(clippy::too_many_arguments)]
+pub fn draw_msaa(
+    vs: &[u8],
+    ps: &[u8],
+    layout: &[VertexElement],
+    vertices: &[f32],
+    stride: u32,
+    samples: u32,
+    size: u32,
+    clear: [f32; 4],
+) -> Result<Vec<[f32; 4]>, String> {
+    draw_gs_views(
+        vs, None, ps, layout, vertices, stride, &[], &[], &[], &[], &[], size, clear, samples,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -923,6 +943,7 @@ fn draw_gs_views(
     samplers: &[D3D12_SAMPLER_DESC],
     size: u32,
     clear: [f32; 4],
+    samples: u32,
 ) -> Result<Vec<[f32; 4]>, String> {
     let mut g = GPU.lock().unwrap();
     let gpu = g.get_or_insert_with(init).as_mut().map_err(|x| x.clone())?;
@@ -952,7 +973,7 @@ fn draw_gs_views(
             InputLayout: D3D12_INPUT_LAYOUT_DESC { pInputElementDescs: elems.as_ptr(), NumElements: elems.len() as u32 },
             PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
             NumRenderTargets: 1,
-            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            SampleDesc: DXGI_SAMPLE_DESC { Count: samples, Quality: 0 },
             ..Default::default()
         };
         pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8;
@@ -962,7 +983,11 @@ fn draw_gs_views(
         pd.RTVFormats[0] = DXGI_FORMAT_R32G32B32A32_FLOAT;
         let pso: ID3D12PipelineState = dev.CreateGraphicsPipelineState(&pd).map_err(|x| format!("CreateGraphicsPipelineState: {x}"))?;
         let draw = Draw { sgprs: sgprs.to_vec(), scissor: [0, 0, size as i32, size as i32] };
-        draw_indexed_on(dev, &pso, &rs, vertices, stride, indices, &[draw], mem, textures, samplers, size, clear)
+        let draws = [draw];
+        draw_indexed_on(
+            dev, &pso, &rs, vertices, stride, indices, &draws, mem, textures, samplers, size, clear,
+            samples,
+        )
     }
 }
 
@@ -1083,10 +1108,13 @@ pub fn draw_on_multi(
     size: u32,
     clear: [f32; 4],
 ) -> Result<Vec<[f32; 4]>, String> {
-    draw_indexed_on(dev, pso, rs, vertices, stride, &[], draws, mem, textures, samplers, size, clear)
+    draw_indexed_on(
+        dev, pso, rs, vertices, stride, &[], draws, mem, textures, samplers, size, clear, 1,
+    )
 }
 
-/// `draw_on_multi`, the draws indexed when there are `indices` (one index buffer for all).
+/// `draw_on_multi`, the draws indexed when there are `indices` (one index buffer for all),
+/// into a target of `samples` samples per pixel (`draw_msaa`: every sample is returned).
 #[allow(clippy::too_many_arguments)]
 fn draw_indexed_on(
     dev: &ID3D12Device,
@@ -1101,6 +1129,7 @@ fn draw_indexed_on(
     samplers: &[D3D12_SAMPLER_DESC],
     size: u32,
     clear: [f32; 4],
+    samples: u32,
 ) -> Result<Vec<[f32; 4]>, String> {
     unsafe {
         let queue: ID3D12CommandQueue =
@@ -1114,7 +1143,7 @@ fn draw_indexed_on(
             DepthOrArraySize: 1,
             MipLevels: 1,
             Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
-            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            SampleDesc: DXGI_SAMPLE_DESC { Count: samples, Quality: 0 },
             Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
             ..Default::default()
         };
@@ -1161,9 +1190,14 @@ fn draw_indexed_on(
         let mem_buf = buffer(dev, mem_bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, true)?;
         let res_buf = buffer(dev, 256, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, true)?;
 
+        // a row of the readback: `size` pixels, of `samples` samples each
+        let row = (size * samples) as usize;
         let mut layout_fp = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
-        let mut total = 0u64;
-        dev.GetCopyableFootprints(&tex, 0, 1, 0, Some(&mut layout_fp), None, None, Some(&mut total));
+        let mut total = (row * size as usize * 16) as u64;
+        if samples == 1 {
+            let fp: Option<*mut _> = Some(&mut layout_fp);
+            dev.GetCopyableFootprints(&tex, 0, 1, 0, fp, None, None, Some(&mut total));
+        }
         let readback = buffer(dev, total, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, false)?;
 
         let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(e)?;
@@ -1209,27 +1243,34 @@ fn draw_indexed_on(
                 list.DrawIndexedInstanced(indices.len() as u32, 1, 0, 0, 0);
             }
         }
-        list.ResourceBarrier(&[transition(&rt, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
-        let dst = D3D12_TEXTURE_COPY_LOCATION {
-            pResource: transmute_copy(&readback),
-            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: layout_fp },
+        // what the samples' readback records with, alive until the list ran
+        let _samples_pass = if samples > 1 {
+            Some(read_samples(dev, &list, &rt, &readback, size, samples)?)
+        } else {
+            let (from, to) = (D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            list.ResourceBarrier(&[transition(&rt, from, to)]);
+            let dst = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: transmute_copy(&readback),
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: layout_fp },
+            };
+            let src = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: transmute_copy(&rt),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+            };
+            list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+            None
         };
-        let src = D3D12_TEXTURE_COPY_LOCATION {
-            pResource: transmute_copy(&rt),
-            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
-        };
-        list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
         list.Close().map_err(e)?;
         queue.ExecuteCommandLists(&[Some(list.cast().map_err(e)?)]);
         wait_for_submission(dev, &queue, &fence, 1, "draw")?;
         let mut p = std::ptr::null_mut();
         readback.Map(0, None, Some(&mut p)).map_err(e)?;
-        let pitch = layout_fp.Footprint.RowPitch as usize;
-        let mut px = Vec::with_capacity((size * size) as usize);
+        let pitch = if samples > 1 { row * 16 } else { layout_fp.Footprint.RowPitch as usize };
+        let mut px = Vec::with_capacity(row * size as usize);
         for y in 0..size as usize {
-            for x in 0..size as usize {
+            for x in 0..row {
                 let q = (p as *const u8).add(y * pitch + x * 16) as *const f32;
                 px.push([*q, *q.add(1), *q.add(2), *q.add(3)]);
             }
@@ -1237,6 +1278,84 @@ fn draw_indexed_on(
         readback.Unmap(0, None);
         Ok(px)
     }
+}
+
+/// What `read_samples` records with (alive until the list ran).
+struct SamplePass {
+    _pso: ID3D12PipelineState,
+    _rs: ID3D12RootSignature,
+    _heaps: [ID3D12DescriptorHeap; 2],
+    _out: ID3D12Resource,
+}
+
+/// Copy every sample of the `size`² RGBA32F target `rt` (`samples` per pixel, in the
+/// render-target state) into `readback`, tightly packed: pixel (x, y) sample s at
+/// `((y · size + x) · samples + s) · 16`. No copy reads the samples of a multisampled
+/// resource, so a compute pass loads each one (`Texture2DMS::Load`).
+unsafe fn read_samples(
+    dev: &ID3D12Device,
+    list: &ID3D12GraphicsCommandList,
+    rt: &ID3D12Resource,
+    readback: &ID3D12Resource,
+    size: u32,
+    samples: u32,
+) -> Result<SamplePass, String> {
+    let src = format!(
+        "RWByteAddressBuffer O : register(u0);\n\
+         [numthreads(1, 1, 1)] void main(uint3 id : SV_DispatchThreadID) {{\n\
+           Texture2DMS<float4> t = ResourceDescriptorHeap[0];\n\
+           uint i = (id.y * {size}u + id.x) * {samples}u + id.z;\n\
+           O.Store4(i * 16u, asuint(t.Load(int2(id.xy), id.z)));\n\
+         }}\n"
+    );
+    let cs = super::dxc::compile(&src, "main", "cs_6_6", &[])?;
+    let rs = root_signature(dev, false)?;
+    let pso: ID3D12PipelineState = dev
+        .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            pRootSignature: transmute_copy(&rs),
+            CS: D3D12_SHADER_BYTECODE {
+                pShaderBytecode: cs.as_ptr() as _,
+                BytecodeLength: cs.len(),
+            },
+            ..Default::default()
+        })
+        .map_err(|x| format!("CreateComputePipelineState (MSAA readback): {x}"))?;
+    // the SRV at 0; a sampler heap too, as the root signature indexes both directly
+    let make = |ty: D3D12_DESCRIPTOR_HEAP_TYPE| -> Result<ID3D12DescriptorHeap, String> {
+        dev.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+            Type: ty,
+            NumDescriptors: 1,
+            Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+            NodeMask: 0,
+        })
+        .map_err(e)
+    };
+    let heap = make(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)?;
+    let sheap = make(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER)?;
+    let sv = D3D12_SHADER_RESOURCE_VIEW_DESC {
+        Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
+        ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DMS,
+        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+        ..Default::default()
+    };
+    dev.CreateShaderResourceView(rt, Some(&sv), heap.GetCPUDescriptorHandleForHeapStart());
+    let bytes = (size * size * samples * 16) as u64;
+    let out = buffer(dev, bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, true)?;
+    let srv = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    let uav = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    list.ResourceBarrier(&[
+        transition(rt, D3D12_RESOURCE_STATE_RENDER_TARGET, srv),
+        transition(&out, D3D12_RESOURCE_STATE_COMMON, uav),
+    ]);
+    // a directly indexed root signature is set after the heaps
+    list.SetDescriptorHeaps(&[Some(heap.clone()), Some(sheap.clone())]);
+    list.SetPipelineState(&pso);
+    list.SetComputeRootSignature(&rs);
+    list.SetComputeRootUnorderedAccessView(0, out.GetGPUVirtualAddress());
+    list.Dispatch(size, size, samples);
+    list.ResourceBarrier(&[transition(&out, uav, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+    list.CopyBufferRegion(readback, 0, &out, 0, bytes);
+    Ok(SamplePass { _pso: pso, _rs: rs, _heaps: [heap, sheap], _out: out })
 }
 
 fn uav_barrier(r: &ID3D12Resource) -> D3D12_RESOURCE_BARRIER {

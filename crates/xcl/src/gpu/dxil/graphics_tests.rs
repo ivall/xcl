@@ -1236,3 +1236,335 @@ fn ps_static_resources_match_dxc() {
     assert_eq!(part(&c, b"SFI0"), part(DXC_PS_RESOURCES, b"SFI0"));
     assert_valid(&c);
 }
+
+/// `exp mrtz` carries the sample mask in `z` (32-bit Z formats; Mesa `ac_nir_lower_ps_late.c`
+/// `emit_ps_mrtz_export`), or in `VSRC1[15:0]` when compressed (`UINT16_ABGR`, `EN = 0xC`):
+/// Direct DXIL writes it to `SV_Coverage` (default-initialised to `0xFFFF_FFFF`) iff the PS
+/// signature declares `SV_Coverage` and an `mrtz` export enables the mask channel.
+#[test]
+fn ps_mrtz_sample_mask_writes_sv_coverage() {
+    use crate::gpu::dxbc::SigElement as DxbcSig;
+    use crate::gpu::dxil::bitreader_tests::parse;
+    use crate::gpu::dxil::cfg::Cfg;
+    use crate::gpu::dxil::kernel::{Entry, KernelOptions};
+    use crate::gpu::dxil::lower::Lw;
+    use crate::gpu::dxil::module::{Block, InstInfo, Module, Value};
+    use crate::gpu::rdna2::encode;
+    use crate::gpu::recomp::PsInterface;
+
+    let el = |name: &str, index: u32, sv: u32, ct: u32, reg: u32, mask: u8| DxbcSig {
+        name: name.into(),
+        index,
+        system_value: sv,
+        component_type: ct,
+        register: reg,
+        mask,
+        rw_mask: mask,
+        stream: 0,
+    };
+    fn find_inst(m: &Module, val: Value) -> Option<InstInfo<'_>> {
+        match val {
+            Value::Inst(i) => Some(m.inst_info(i)),
+            _ => None,
+        }
+    }
+    type Inst<'a> = (&'a str, &'a str, &'a [(&'a str, u64)], Option<u32>);
+    let lower_ps = |outputs: Vec<DxbcSig>, insts: &[Inst], check_ir: &dyn Fn(&Module)| -> Vec<u8> {
+        let mut code = Vec::new();
+        for (n, e, f, l) in insts {
+            code.extend(encode(n, e, f, *l).unwrap());
+        }
+        code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+        let cfg = Cfg::build(&code).unwrap();
+        let leaders =
+            cfg.blocks.iter().filter_map(|b| b.insts.first().map(|&i| cfg.insts[i].pc)).collect();
+        // `input_ena`: bit 1 (persp center, 2 VGPRs v0..v1) + bit 8 (`SV_Position.x` in v2).
+        let psi = PsInterface { inputs: vec![], outputs, input_ena: 0x102, attrs: None };
+        let o = KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 };
+        let mut lw = Lw::new(&cfg.insts, &leaders, o, &Entry::Pixel(psi.clone()));
+        lw.setup_lanes_gfx();
+        lw.setup_pixel(&psi, &Default::default());
+        let entry = *cfg.rpo.first().unwrap();
+        let mut heads = vec![None; cfg.blocks.len()];
+        let mut head = |lw: &mut Lw, b: usize| -> Block {
+            let preds = cfg.blocks[b].preds.len() + (b == entry) as usize;
+            *heads[b].get_or_insert_with(|| lw.block(Some(preds)))
+        };
+        let h0 = head(&mut lw, entry);
+        let exit = lw.block(None);
+        lw.edge(Block(0), h0);
+        for &b in &cfg.rpo {
+            let h = head(&mut lw, b);
+            lw.s.m.set_block(h);
+            for &i in &cfg.blocks[b].insts {
+                lw.inst(&cfg.insts[i]).unwrap();
+            }
+            match cfg.blocks[b].term {
+                crate::gpu::dxil::cfg::Term::Jump(t) => {
+                    let t = head(&mut lw, t);
+                    lw.br(t);
+                }
+                crate::gpu::dxil::cfg::Term::Cond(i, t, f) => {
+                    let c = lw.branch_cond(&cfg.insts[i]).unwrap();
+                    let (t, f) = (head(&mut lw, t), head(&mut lw, f));
+                    lw.cond_br(c, t, f);
+                }
+                crate::gpu::dxil::cfg::Term::End => lw.br(exit),
+            }
+        }
+        lw.s.m.set_block(exit);
+        lw.seal(exit);
+        let tail = lw.block(Some(1));
+        lw.br(tail);
+        lw.s.m.set_block(tail);
+        lw.finish_gfx();
+        lw.s.m.ret();
+        lw.s.m.set_block(Block(0));
+        lw.s.m.br(h0);
+        lw.s.m.optimize();
+        check_ir(&lw.s.m);
+        let g = lw.gfx.take().unwrap();
+        let c = lw.s.finish_graphics(g.io, StageInfo::Pixel { early_depth_stencil: false });
+        // The bitcode in the `DXIL` part (after the 24-byte `DxilProgramHeader`) parses.
+        let _ = parse(&part(&c, b"DXIL").unwrap()[24..]);
+        if validate::validator_supported() {
+            assert_valid(&c);
+        }
+        c
+    };
+    // Returns `(sig_id, stored_value)` for every `dx.op.storeOutput.i32` call in `m`.
+    let i32_output_stores = |m: &Module| -> Vec<(u64, Value)> {
+        (0..m.block_count())
+            .flat_map(|b| m.block_insts(Block(b as u32)).iter().copied())
+            .filter_map(|i| match m.inst_info(i) {
+                InstInfo::Call("dx.op.storeOutput.i32", args) => {
+                    Some((m.const_u64(args[1]).unwrap(), args[4]))
+                }
+                _ => None,
+            })
+            .collect()
+    };
+    let osg_names = |c: &[u8]| -> Vec<(String, u32)> {
+        let b = part(c, b"OSG1").unwrap();
+        let count = u32::from_le_bytes(b[0..4].try_into().unwrap()) as usize;
+        (0..count)
+            .map(|i| {
+                let r = &b[8 + 32 * i..8 + 32 * (i + 1)];
+                let noff = u32::from_le_bytes(r[4..8].try_into().unwrap()) as usize;
+                let sv = u32::from_le_bytes(r[12..16].try_into().unwrap());
+                let end = b[noff..].iter().position(|&x| x == 0).unwrap();
+                (String::from_utf8_lossy(&b[noff..noff + end]).into_owned(), sv)
+            })
+            .collect()
+    };
+    let t0: &[(&str, u64)] = &[
+        ("TGT", 0), ("EN", 0xF), ("VSRC0", 0), ("VSRC1", 1), ("VSRC2", 0), ("VSRC3", 1),
+        ("DONE", 1), ("VM", 1),
+    ];
+    let done_t0 = ("EXP", "ENC_EXP", t0, None);
+    let target = el("SV_Target", 0, 64, 3, 0, 0xF);
+    let cov = el("SV_Coverage", 0, 66, 1, 0xFFFF_FFFF, 1);
+    let depth = el("SV_Depth", 0, 65, 3, 0xFFFF_FFFF, 1);
+
+    // 1. Uncompressed `exp mrtz` (`EN = 0x4`): `VSRC2` (`0xA5`) stored to `SV_Coverage`
+    //    (sig 1) with `0xFFFF_FFFF` inactive fallback.
+    let c1 = lower_ps(
+        vec![target.clone(), cov.clone()],
+        &[
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 5), ("SRC0", 255)], Some(0xA5)),
+            ("EXP", "ENC_EXP", &[("TGT", 8), ("EN", 0x4), ("VSRC2", 5)], None),
+            done_t0,
+        ],
+        &|m| {
+            let stores = i32_output_stores(m);
+            assert_eq!(stores.len(), 1);
+            assert_eq!(stores[0].0, 1, "SV_Coverage is output sig 1");
+            // `set_out`: `select(act, v5, 0xFFFF_FFFF)` where `v5 = select(act, 0xA5, 0)`.
+            let Some(InstInfo::Other(ops)) = find_inst(m, stores[0].1) else {
+                panic!("expected select for SV_Coverage")
+            };
+            assert_eq!(m.const_u64(ops[2]), Some(0xFFFF_FFFF));
+            let Some(InstInfo::Other(v5_ops)) = find_inst(m, ops[1]) else {
+                panic!("expected v5 select")
+            };
+            assert_eq!(m.const_u64(v5_ops[1]), Some(0xA5));
+        },
+    );
+    assert_eq!(osg_names(&c1), vec![("SV_Target".into(), 64), ("SV_Coverage".into(), 66)]);
+
+    // 2. Compressed `exp mrtz` (`COMPR = 1`, `EN = 0xC`, `VSRC1[15:0]` -> `v5 & 0xFFFF`, NOT
+    //    `VSRC2` or f16) under a lane-divergent `EXEC` mask + `S_CBRANCH_EXECZ` (`SIMM16 = 2`
+    //    skipping the 2-dword `EXP`): bypassed paths merge `0xFFFF_FFFF` via `phi`.
+    let c2 = lower_ps(
+        vec![target.clone(), cov.clone()],
+        &[
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 5), ("SRC0", 255)], Some(0xABCD_005A)),
+            ("V_CMP_GT_F32", "ENC_VOPC", &[("SRC0", 256 + 2), ("VSRC1", 0)], None),
+            ("S_AND_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 2), ("SSRC0", 106)], None),
+            ("S_CBRANCH_EXECZ", "ENC_SOPP", &[("SIMM16", 2)], None),
+            (
+                "EXP",
+                "ENC_EXP",
+                &[("TGT", 8), ("EN", 0xC), ("COMPR", 1), ("VSRC0", 6), ("VSRC1", 5), ("VSRC2", 3)],
+                None,
+            ),
+            ("S_MOV_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 2)], None),
+            done_t0,
+        ],
+        &|m| {
+            let stores = i32_output_stores(m);
+            assert_eq!(stores.len(), 1);
+            let Some(InstInfo::Phi(inc)) = find_inst(m, stores[0].1) else {
+                panic!("expected phi at join after S_CBRANCH_EXECZ")
+            };
+            assert_eq!(inc.len(), 2);
+            let has_default = inc.iter().any(|&(v, _)| m.const_u64(v) == Some(0xFFFF_FFFF));
+            // Export arm: `select(act, and(v5, 0xFFFF), 0xFFFF_FFFF)` where
+            // `v5 = select(act0, 0xABCD_005A, 0)`.
+            let is = |v: Value, n: usize, k: usize, c: u64| match find_inst(m, v) {
+                Some(InstInfo::Other(ops)) if ops.len() == n && m.const_u64(ops[k]) == Some(c) => {
+                    Some(ops.to_vec())
+                }
+                _ => None,
+            };
+            let has_masked_low16 = inc.iter().any(|&(v, _)| {
+                let Some(sel) = is(v, 3, 2, 0xFFFF_FFFF) else { return false };
+                let Some(and) = is(sel[1], 2, 1, 0xFFFF) else { return false };
+                is(and[0], 3, 1, 0xABCD_005A).is_some()
+            });
+            assert!(
+                has_default && has_masked_low16,
+                "phi incoming edges must carry 0xFFFF_FFFF bypass and (v5 & 0xFFFF): {inc:?}"
+            );
+        },
+    );
+    assert_eq!(osg_names(&c2), vec![("SV_Target".into(), 64), ("SV_Coverage".into(), 66)]);
+
+    // 3. `SV_Coverage` in signature, but `mrtz` writes only depth (`EN = 0x1`): `SV_Coverage`
+    //    omitted and zero i32 output stores.
+    let c3 = lower_ps(
+        vec![target.clone(), depth, cov.clone()],
+        &[("EXP", "ENC_EXP", &[("TGT", 8), ("EN", 0x1), ("VSRC0", 4)], None), done_t0],
+        &|m| assert!(i32_output_stores(m).is_empty()),
+    );
+    assert_eq!(osg_names(&c3), vec![("SV_Target".into(), 64), ("SV_Depth".into(), 65)]);
+
+    // 4. Coverage-only PS: declares `SV_Coverage` (sig 0) without a dummy `SV_Target7`.
+    let c4 = lower_ps(
+        vec![cov],
+        &[
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 5), ("SRC0", 131)], None),
+            (
+                "EXP",
+                "ENC_EXP",
+                &[("TGT", 8), ("EN", 0x4), ("VSRC2", 5), ("DONE", 1), ("VM", 1)],
+                None,
+            ),
+        ],
+        &|m| {
+            let stores = i32_output_stores(m);
+            assert_eq!(stores.len(), 1);
+            assert_eq!(stores[0].0, 0, "coverage-only PS has SV_Coverage at sig 0");
+        },
+    );
+    assert_eq!(osg_names(&c4), vec![("SV_Coverage".into(), 66)]);
+
+    // 5. No `SV_Coverage` in signature: `mrtz` mask channel ignored.
+    let c5 = lower_ps(
+        vec![target],
+        &[("EXP", "ENC_EXP", &[("TGT", 8), ("EN", 0x4), ("VSRC2", 5)], None), done_t0],
+        &|m| assert!(i32_output_stores(m).is_empty()),
+    );
+    assert_eq!(osg_names(&c5), vec![("SV_Target".into(), 64)]);
+}
+
+/// On the GPU: a console PS whose `exp mrtz` writes a sample mask draws into a 4x MSAA target,
+/// and every sample is read back. Only the samples of the mask get the colour; a pixel with
+/// `x < 4` skips the export (EXEC off, `s_cbranch_execz`) and keeps the default mask (all).
+/// The mask is in `VSRC2` (`EN = 0x4`), or in `VSRC1 [15:0]` when compressed (`EN = 0xC`;
+/// `VSRC2` then holds the other mask, which must not be used). As a wave32 and a wave64 program.
+#[test]
+fn gpu_ps_mrtz_sample_mask_covers_only_its_samples() {
+    use crate::gpu::dxbc::SigElement as DxbcSig;
+    use crate::gpu::dxil::kernel::{translate_pixel, KernelOptions};
+    use crate::gpu::rdna2::encode;
+    use crate::gpu::recomp::{dxc, runner, PsInterface};
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32G32_FLOAT;
+    if !draw_ready() {
+        return;
+    }
+    if dxc::location().is_err() {
+        return runner::skip_test("no DXC");
+    }
+    const SAMPLES: u32 = 4;
+    const MS_CLEAR: [f32; 4] = [0.25; 4];
+    let el = |name: &str, sv: u32, ct: u32, reg: u32, mask: u8| DxbcSig {
+        name: name.into(),
+        index: 0,
+        system_value: sv,
+        component_type: ct,
+        register: reg,
+        mask,
+        rw_mask: mask,
+        stream: 0,
+    };
+    let target = el("SV_Target", 64, 3, 0, 0xF);
+    let outputs = vec![target, el("SV_Coverage", 66, 1, 0xFFFF_FFFF, 1)];
+    // `input_ena`: persp center (v0..v1) + `SV_Position.x` (v2)
+    let psi = PsInterface { inputs: vec![], outputs, input_ena: 0x102, attrs: None };
+    let vs_src = "float4 main(float2 p : POSITION) : SV_Position { return float4(p, 0.5, 1.0); }\n";
+    let vs = dxc::compile(vs_src, "main", "vs_6_6", &[]).expect("VS");
+    // one triangle over the whole target
+    let tri = [-1.0f32, -1.0, -1.0, 3.0, 3.0, -1.0];
+    let pos = DXGI_FORMAT_R32G32_FLOAT;
+    let layout = [runner::VertexElement { semantic: "POSITION", index: 0, format: pos, offset: 0 }];
+    // v4 = 1.0, v5 = 0b0101, v6 = 0b1010
+    let plain: &[(&str, u64)] = &[("TGT", 8), ("EN", 0x4), ("VSRC0", 4), ("VSRC2", 5)];
+    let compr: &[(&str, u64)] =
+        &[("TGT", 8), ("EN", 0xC), ("COMPR", 1), ("VSRC1", 6), ("VSRC2", 5)];
+    let mrt0: &[(&str, u64)] = &[
+        ("TGT", 0), ("EN", 0xF), ("VSRC0", 4), ("VSRC1", 4), ("VSRC2", 4), ("VSRC3", 4),
+        ("DONE", 1), ("VM", 1),
+    ];
+    let cases = [
+        (false, plain, 0b0101u32), (false, compr, 0b1010),
+        (true, plain, 0b0101), (true, compr, 0b1010),
+    ];
+    for (wave64, mrtz, mask) in cases {
+        // a wave32 or a wave64 program (its EXEC and VCC 32 or 64 bits)
+        let b = if wave64 { "B64" } else { "B32" };
+        let (save, mov) = (format!("S_AND_SAVEEXEC_{b}"), format!("S_MOV_{b}"));
+        let insts: [(&str, &str, &[(&str, u64)]); 10] = [
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", 242)]),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 5), ("SRC0", 133)]),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 6), ("SRC0", 138)]),
+            // vcc = 4.0 < SV_Position.x
+            ("V_CMP_LT_F32", "ENC_VOPC", &[("SRC0", 246), ("VSRC1", 2)]),
+            (&save, "ENC_SOP1", &[("SDST", 2), ("SSRC0", 106)]),
+            ("S_CBRANCH_EXECZ", "ENC_SOPP", &[("SIMM16", 2)]),
+            ("EXP", "ENC_EXP", mrtz),
+            (&mov, "ENC_SOP1", &[("SDST", 126), ("SSRC0", 2)]),
+            ("EXP", "ENC_EXP", mrt0),
+            ("S_ENDPGM", "ENC_SOPP", &[]),
+        ];
+        let code: Vec<u8> =
+            insts.iter().flat_map(|&(n, e, f)| encode(n, e, f, None).unwrap()).collect();
+        let o = KernelOptions { wave64, split: false, mem_windows: 1, sampler_base: 0 };
+        let ps = translate_pixel(&code, o, &psi).expect("translate PS");
+        if validate::validator_supported() {
+            assert_valid(&ps.dxil);
+        }
+        let px = runner::draw_msaa(&vs, &ps.dxil, &layout, &tri, 8, SAMPLES, SIZE, MS_CLEAR)
+            .expect("MSAA draw");
+        for y in 0..SIZE {
+            for x in 0..SIZE {
+                for s in 0..SAMPLES {
+                    let want = if x < 4 || mask >> s & 1 == 1 { [1.0; 4] } else { MS_CLEAR };
+                    let got = px[((y * SIZE + x) * SAMPLES + s) as usize];
+                    let at = format!("wave64 {wave64}, mask {mask:#06b}, pixel ({x}, {y})");
+                    assert_eq!(got, want, "{at} sample {s}");
+                }
+            }
+        }
+    }
+}
