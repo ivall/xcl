@@ -260,7 +260,14 @@ impl Ir for DxilIr {
     /// doesn't know). A register it touches that is neither an input nor an output refuses the
     /// instruction: `Lw` would read that register's value at the program's start. Blocks it makes
     /// (a guarded access, the memory window switch) end the `Ir` block in the last of them.
-    fn foreign(&mut self, d: &Decoded, guard: Value, inputs: &[(Var, Value)], outputs: &[Var]) -> Result<Vec<Value>, String> {
+    fn foreign(
+        &mut self,
+        d: &Decoded,
+        guard: Value,
+        mask: Option<(Value, Value)>,
+        inputs: &[(Var, Value)],
+        outputs: &[Var],
+    ) -> Result<Vec<Value>, String> {
         use crate::gpu::dxil::lower::{VAR_BUDGET, VAR_SCC, VAR_VGPR};
         let var = |v: Var| match v {
             Var::S(r) => r as u32,
@@ -278,7 +285,7 @@ impl Ir for DxilIr {
         // form a ballot of this half is enough, and an exchange there would wait at a barrier
         // for a half that is elsewhere when only one half reaches this block
         self.lw.local_masks = true;
-        let r = self.lw.inst_guarded(d, guard, None);
+        let r = self.lw.inst_guarded(d, guard, mask);
         self.lw.local_masks = false;
         let used = std::mem::replace(&mut self.lw.init.touched, before);
         self.lw.init.touched.extend(&used);
@@ -950,6 +957,74 @@ mod tests {
             let t = translate(&bytes, &Options { mode: Mode::Compute(cs.clone()), wave64: false, ..Default::default() }).unwrap();
             let hlsl = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap();
             assert_eq!(runner::dispatch(&hlsl, [3, 1, 1], &[100, 0], &mem).unwrap(), gpu);
+        }
+    }
+
+    /// Bridged DPP16 / DPP8 instructions (non-native VALU ops such as float ops, and DPP source
+    /// modifiers) receive the per-lane active mask and agree with HLSL on wave32 and wave64,
+    /// including under narrowed EXEC where inactive source lanes must not be read.
+    #[test]
+    fn bridged_dpp_agrees_with_hlsl_on_the_gpu() {
+        if !gpu() {
+            return;
+        }
+        if dxc::location().is_err() {
+            runner::skip_test("no DXC");
+            return;
+        }
+        let wave64_ok = runner::wave64_supported() == Ok(true);
+        for w64 in [false, true] {
+            let lanes = if w64 { 64 } else { 32 };
+            if w64 && !wave64_ok {
+                runner::skip_test("bridged_dpp, wave64: no wave64");
+                continue;
+            }
+            let saveexec = if w64 { "S_AND_SAVEEXEC_B64" } else { "S_AND_SAVEEXEC_B32" };
+            let movexec = if w64 { "S_MOV_B64" } else { "S_MOV_B32" };
+            let lines: &[I] = &[
+                // v1 = (float)(v0 + 1); v2..v7 seeded so BOUND_CTRL=0 / row_mask preservation is checked
+                ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 129), ("VSRC1", 0)]),
+                ("V_CVT_F32_U32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 257)]),
+                ("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 242)]),
+                ("V_MOV_B32", "ENC_VOP1", &[("VDST", 3), ("SRC0", 242)]),
+                ("V_MOV_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", 242)]),
+                ("V_MOV_B32", "ENC_VOP1", &[("VDST", 5), ("SRC0", 242)]),
+                ("V_MOV_B32", "ENC_VOP1", &[("VDST", 6), ("SRC0", 242)]),
+                ("V_MOV_B32", "ENC_VOP1", &[("VDST", 7), ("SRC0", 242)]),
+                // DPP16 float add (row_shr:1, BOUND_CTRL=1)
+                ("V_ADD_F32", "VOP2_VOP_DPP16", &[("VDST", 2), ("SRC0", 0xFA), ("VSRC0", 1), ("VSRC1", 1), ("DPP_CTRL", 0x111), ("ROW_MASK", 0xF), ("BANK_MASK", 0xF), ("BOUND_CTRL", 1)]),
+                // DPP16 float max with SRC0_NEG=1, quad_perm [3,2,1,0], ROW_MASK=0xA, BOUND_CTRL=0
+                ("V_MAX_F32", "VOP2_VOP_DPP16", &[("VDST", 3), ("SRC0", 0xFA), ("VSRC0", 1), ("VSRC1", 1), ("DPP_CTRL", 0x1B), ("SRC0_NEG", 1), ("ROW_MASK", 0xA), ("BANK_MASK", 0xF), ("BOUND_CTRL", 0)]),
+                // DPP8 float add (FI=0, reversed 8-lane perm)
+                ("V_ADD_F32", "VOP2_VOP_DPP8", &[("VDST", 4), ("SRC0", 0xE9), ("VSRC0", 1), ("VSRC1", 1), ("LANE_SEL_0", 7), ("LANE_SEL_1", 6), ("LANE_SEL_2", 5), ("LANE_SEL_3", 4), ("LANE_SEL_4", 3), ("LANE_SEL_5", 2), ("LANE_SEL_6", 1), ("LANE_SEL_7", 0)]),
+                // Narrow EXEC to even lanes only: source lane (l - 1) is inactive in EXEC
+                ("V_AND_B32", "ENC_VOP2", &[("VDST", 8), ("SRC0", 129), ("VSRC1", 0)]),
+                ("V_CMP_EQ_U32", "ENC_VOPC", &[("SRC0", 128), ("VSRC1", 8)]),
+                (saveexec, "ENC_SOP1", &[("SDST", 4), ("SSRC0", 106)]),
+                ("V_ADD_F32", "VOP2_VOP_DPP16", &[("VDST", 5), ("SRC0", 0xFA), ("VSRC0", 1), ("VSRC1", 1), ("DPP_CTRL", 0x111), ("ROW_MASK", 0xF), ("BANK_MASK", 0xF), ("BOUND_CTRL", 0)]),
+                ("V_ADD_F32", "VOP2_VOP_DPP16", &[("VDST", 6), ("SRC0", 0xFA), ("VSRC0", 1), ("VSRC1", 1), ("DPP_CTRL", 0x111), ("ROW_MASK", 0xF), ("BANK_MASK", 0xF), ("BOUND_CTRL", 1)]),
+                ("V_ADD_F32", "VOP2_VOP_DPP8", &[("VDST", 7), ("SRC0", 0xE9), ("VSRC0", 1), ("VSRC1", 1), ("LANE_SEL_0", 7), ("LANE_SEL_1", 6), ("LANE_SEL_2", 5), ("LANE_SEL_3", 4), ("LANE_SEL_4", 3), ("LANE_SEL_5", 2), ("LANE_SEL_6", 1), ("LANE_SEL_7", 0)]),
+                (movexec, "ENC_SOP1", &[("SDST", 126), ("SSRC0", 4)]),
+                ("S_ENDPGM", "ENC_SOPP", &[]),
+            ];
+            let (s, v) = state(lanes);
+            let mut st = runner::KernelState::default();
+            st.sgpr.copy_from_slice(&s);
+            for (l, regs) in v.iter().enumerate() {
+                st.vgpr[l][..regs.len()].copy_from_slice(regs);
+            }
+            let bytes: Vec<u8> = lines.iter().flat_map(encode_line).collect();
+            let t = translate(&bytes, &Options { wave64: w64, ..Default::default() }).unwrap();
+            assert!(t.complete(), "wave{lanes}: {:?}", t.unsupported_why);
+            let hlsl = runner::run(&dxc::compile(&t.hlsl, "main", "cs_6_6", &["-Gis"]).unwrap(), &st, &[]).unwrap();
+            let insts = decode(lines);
+            let (dxil, _) = super::kernel(&insts, w64).unwrap_or_else(|e| panic!("wave{lanes}: {e}"));
+            let direct = runner::run(&dxil, &st, &[]).unwrap();
+            for l in 0..lanes {
+                for r in 1..=7 {
+                    assert_eq!(direct.vgpr[l][r], hlsl.vgpr[l][r], "wave{lanes}: lane {l} v{r}: {:#x} vs {:#x}", direct.vgpr[l][r], hlsl.vgpr[l][r]);
+                }
+            }
         }
     }
 

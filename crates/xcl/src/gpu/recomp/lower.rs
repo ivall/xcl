@@ -99,7 +99,14 @@ pub trait Ir: Sink {
     /// `inputs` are the registers it reads, `guard` (i1) decides this lane's register writes and
     /// memory effects, and the values of `outputs` after it come back in order. Err when there
     /// is no such lowering or it refuses `d`.
-    fn foreign(&mut self, _d: &Decoded, _guard: Self::V, _inputs: &[(Var, Self::V)], _outputs: &[Var]) -> R<Vec<Self::V>> {
+    fn foreign(
+        &mut self,
+        _d: &Decoded,
+        _guard: Self::V,
+        _mask: Option<(Self::V, Self::V)>,
+        _inputs: &[(Var, Self::V)],
+        _outputs: &[Var],
+    ) -> R<Vec<Self::V>> {
         Err("no foreign lowering".into())
     }
     fn io_load(&mut self, dword: Self::V) -> Self::V;
@@ -798,12 +805,25 @@ impl<'a, I: Ir> Lower<'a, I> {
             return Ok(());
         }
         if matches!(d.variant, Variant::Dpp16 | Variant::Dpp8) {
+            if d.inst.name.starts_with("V_CMP") {
+                return Err(format!("{}: DPP compare", d.inst.name));
+            }
+            if !Self::NATIVE_VALU.contains(&d.inst.name) {
+                return Err(format!("unsupported {}", d.inst.name));
+            }
             self.dpp(b, d)?;
         }
         let r = self.valu_op(b, d);
         (self.dpp_src, self.dpp_en) = (None, None);
         r
     }
+
+    const NATIVE_VALU: &'static [&'static str] = &[
+        "V_MOV_B32", "V_CNDMASK_B32",
+        "V_ADD_NC_U32", "V_ADD_U32", "V_SUB_NC_U32", "V_SUB_U32", "V_SUBREV_NC_U32", "V_SUBREV_U32", "V_AND_B32", "V_OR_B32", "V_XOR_B32",
+        "V_MUL_LO_U32", "V_LSHL_ADD_U32", "V_ADD_LSHL_U32", "V_LSHL_OR_B32", "V_AND_OR_B32", "V_OR3_B32", "V_XOR3_B32", "V_ADD3_U32",
+        "V_LSHLREV_B32", "V_LSHRREV_B32", "V_ASHRREV_I32",
+    ];
 
     fn valu_op(&mut self, b: usize, d: &Decoded) -> R<()> {
         let name = d.inst.name;
@@ -1781,7 +1801,22 @@ impl<I: Ir> Lower<'_, I> {
         }
         let old_exec = if cmpx { Some(self.read_bit(b, EXEC)?) } else { None };
         let guard = if cmpx || in_guarded_run || !self.guarded.contains(&d.pc) { self.ir.boolean(true) } else { self.read_bit(b, EXEC)? };
-        let vals = self.ir.foreign(d, guard, &inputs, &outputs)?;
+        let mask = if matches!(d.variant, Variant::Dpp16 | Variant::Dpp8) {
+            let fi = if d.variant == Variant::Dpp16 {
+                let e = super::emit::ext_encoding(d).ok_or("DPP encoding")?;
+                rdna2::field_value(e, &d.words, "FI").unwrap_or(0) == 1
+            } else {
+                rdna2::field_value(d.enc, &d.words, "SRC0").unwrap_or(0) == 0xEA
+            };
+            if fi {
+                self.all_lanes(b, "DPP fetch-inactive")?;
+            }
+            let [el, eh] = self.exec_words(b, true)?;
+            Some((el, eh))
+        } else {
+            None
+        };
+        let vals = self.ir.foreign(d, guard, mask, &inputs, &outputs)?;
         for (&var, &v) in outputs.iter().zip(&vals) {
             match var {
                 Var::V(_) => self.ssa.write(b, var, v),

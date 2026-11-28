@@ -26,7 +26,7 @@ use super::{Bin, Cmp, Ir, Lower, Var, EXEC, R};
 use crate::gpu::rdna2::{self, Decoded, Variant};
 
 impl<I: Ir> Lower<'_, I> {
-    fn all_lanes(&self, b: usize, what: &str) -> R<()> {
+    pub(super) fn all_lanes(&self, b: usize, what: &str) -> R<()> {
         if self.partial[b] {
             Err(format!("{what} where some lanes are elsewhere"))
         } else {
@@ -129,7 +129,7 @@ impl<I: Ir> Lower<'_, I> {
     }
 
     /// The lanes in EXEC, as numbers; with `half`, only this lane's half is right.
-    fn exec_words(&mut self, b: usize, half: bool) -> R<[I::V; 2]> {
+    pub(super) fn exec_words(&mut self, b: usize, half: bool) -> R<[I::V; 2]> {
         // split: the other half's word comes through an exchange, which both halves must reach
         if !half && self.ir.whole_needs_exchange() {
             self.all_lanes(b, "EXEC as a number in the split form")?;
@@ -244,7 +244,7 @@ impl<I: Ir> Lower<'_, I> {
         let e = super::super::emit::ext_encoding(d).ok_or("DPP encoding")?;
         let f = |n: &str| rdna2::field_value(e, &d.words, n).unwrap_or(0);
         if ["SRC0_ABS", "SRC0_NEG", "SRC1_ABS", "SRC1_NEG"].iter().any(|m| f(m) != 0) {
-            return Err(format!("{name}: DPP modifiers"));
+            return Err(format!("unsupported {name}: DPP modifiers"));
         }
         let v = self.read(b, Var::V(f("VSRC0") as u16));
         let (val, en) = if d.variant == Variant::Dpp16 {
