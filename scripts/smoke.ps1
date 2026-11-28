@@ -20,6 +20,11 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 
+# A native child can have a different current directory from the PowerShell location.
+if ($Game -notmatch '^(?:[a-zA-Z]:[\\/]|[\\/]{2})') {
+    $Game = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Game)
+}
+
 if ($PSBoundParameters.ContainsKey('Title')) {
     $Title = $Title.Trim()
     # control, format and line/paragraph separator characters would split the line for pr_check.py
