@@ -303,6 +303,52 @@ pub(super) fn level_pages() -> bool {
 #[cfg(test)]
 pub(super) static LEVEL_PAGES_FOR_TEST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// New placed textures whose first mapping call was waited for (`wait_new_mappings`): how many,
+/// the microseconds waited in all, and how many were not done within the wait.
+static NEW_MAPPINGS_WAITED: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// The mapping call of a texture just placed (`Pages::null_all`) has run on the GPU before this
+/// returns, so that the title can name the texture in a descriptor: `MAPPED_WAIT` at most (a
+/// device that hangs is not waited for). Called without the `PAGES` lock. The call takes some
+/// tens of microseconds, so this spins for the first half millisecond and yields after that.
+unsafe fn wait_new_mappings(fence: &ID3D12Fence, value: u64) {
+    const MAPPED_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
+    const SPIN: std::time::Duration = std::time::Duration::from_micros(500);
+    use std::sync::atomic::Ordering::Relaxed;
+    let start = std::time::Instant::now();
+    // (`fence_completed`: XCL's own fence, without the title's hook)
+    while super::real::fence_completed(fence) < value {
+        let waited = start.elapsed();
+        if waited >= MAPPED_WAIT {
+            if NEW_MAPPINGS_WAITED[2].fetch_add(1, Relaxed) < 8 {
+                crate::xlog_warn!("D3D12.X: a new texture's tile mappings were not done after {} ms: it is named all the same", MAPPED_WAIT.as_millis());
+            }
+            break;
+        }
+        if waited < SPIN {
+            std::hint::spin_loop();
+        } else {
+            std::thread::yield_now();
+        }
+    }
+    let waited = start.elapsed().as_micros() as u64;
+    let n = NEW_MAPPINGS_WAITED[0].fetch_add(1, Relaxed) + 1;
+    let us = NEW_MAPPINGS_WAITED[1].fetch_add(waited, Relaxed) + waited;
+    if n.is_power_of_two() && n >= 1024 {
+        crate::xlog_info!("D3D12.X: {n} new textures waited for their tile mappings so far, {} us each on average", us / n);
+    }
+}
+
+/// For a test: how many new textures with lazy levels on `dev` had their tiles mapped to no
+/// memory by a call, and whether every mapping call made on `dev` has run on the GPU (its mapping
+/// fence is at the last value signalled). `None` while `dev` has no pages.
+#[cfg(test)]
+pub(super) fn new_textures_settled_for_test(dev: usize) -> Option<(u64, bool)> {
+    let g = PAGES.lock().unwrap();
+    let p = g.get(&dev)?.as_ref()?;
+    Some((p.new_settled, unsafe { super::real::fence_completed(&p.fence) } >= p.value))
+}
+
 /// Of the textures with lazy levels there are now: how many, the tiles they stand for, and the
 /// tiles of them that have pages; and the level groups given pages so far.
 static LEVEL_STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
@@ -600,6 +646,8 @@ struct Pages {
     /// signalled after each mapping; title queues wait for it before their next work
     fence: ID3D12Fence,
     value: u64,
+    /// new textures with lazy levels whose tiles a call mapped to no memory (`null_all`)
+    new_settled: u64,
     /// per-device timestamp of the last periodic reclaim check
     last_reclaim: std::time::Instant,
     /// pool heaps by `Tile` index (a reclaimed one's slot is empty, as `TilePool::live` has it)
@@ -648,6 +696,7 @@ impl Pages {
             queue,
             fence,
             value: 0,
+            new_settled: 0,
             last_reclaim: std::time::Instant::now(),
             pools: PoolHeaps::new(),
             pool: TilePool::new(),
@@ -769,6 +818,30 @@ impl Pages {
         );
         self.value += 1;
         let _ = self.queue.Signal(&self.fence, self.value);
+    }
+
+    /// Every tile of the new texture `res` mapped to no memory by a call, and the mapping fence
+    /// signalled after it: the fence and the value `wait_new_mappings` waits for (outside the
+    /// `PAGES` lock), or `None` when the signal failed (a removed device: nothing to wait for).
+    ///
+    /// A title makes a streamed texture and points a descriptor at it in one go, while lists that
+    /// read that descriptor are already on its queues. A reserved texture made a while ago and
+    /// never mapped reads as zeros, but on NVIDIA a read by a list ALREADY SUBMITTED of a
+    /// reserved texture made since, on which no mapping call has run yet, is a GPU page fault
+    /// and the device is removed after the Windows time-out (found and reproduced without a
+    /// title by psuedo-tty in #2572). With lazy levels a placed texture gets its first mapping
+    /// only with its first texels, so its placement makes that call: one NULL range for the whole
+    /// resource. Waiting for a fence alone or running an empty list does not help; one mapping
+    /// call that has run does.
+    unsafe fn null_all(&mut self, res: &ID3D12Resource) -> Option<(ID3D12Fence, u64)> {
+        let flag = D3D12_TILE_RANGE_FLAG_NULL;
+        self.queue.UpdateTileMappings(res, 1, None, None, None, 1, Some(&flag), None, None, D3D12_TILE_MAPPING_FLAG_NONE);
+        // (the value moves on only with a signal that was made: nobody waits for one that was not)
+        let value = self.value + 1;
+        self.queue.Signal(&self.fence, value).ok()?;
+        self.value = value;
+        self.new_settled += 1;
+        Some((self.fence.clone(), value))
     }
 
     fn release_tiles(&mut self, used: Vec<usize>, used_extra: Vec<(usize, usize)>, now: std::time::Instant, immediate_cool: bool) {
@@ -1027,25 +1100,30 @@ unsafe fn place_on_pages(
         dev.GetResourceTiling(res, Some(&mut total), None, None, None, 0, std::ptr::null_mut());
         None
     };
-    let bound = {
+    let (bound, new_mappings) = {
         let mut g = PAGES.lock().unwrap();
         if let Some(Some(pages)) = g.get_mut(&dev_key) {
             if levels.is_some() {
-                // nothing mapped yet: a level gets its pages with its first texels (`map_levels`)
+                // no pages yet: a level gets its pages with its first texels (`map_levels`). Its
+                // tiles are mapped to no memory by a call all the same (`null_all`).
                 LEVEL_STATS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 LEVEL_STATS[1].fetch_add(total as u64, std::sync::atomic::Ordering::Relaxed);
                 pages.targets.insert(raw as usize, Target { va, console_bytes, total, mapped: true, used: Vec::new(), used_extra: Vec::new(), levels });
-                true
+                (true, pages.null_all(res))
             } else if let Some((used, used_extra)) = pages.bind(dev, res, va, console_bytes, total) {
                 pages.targets.insert(raw as usize, Target { va, console_bytes, total, mapped: true, used, used_extra, levels: None });
-                true
+                (true, None)
             } else {
-                false
+                (false, None)
             }
         } else {
-            false
+            (false, None)
         }
     };
+    // (outside the lock: submits and releases of other threads take `PAGES` too)
+    if let Some((fence, value)) = new_mappings {
+        wait_new_mappings(&fence, value);
+    }
     if !bound {
         drop(windows::core::IUnknown::from_raw(raw));
         *ppv = std::ptr::null_mut();

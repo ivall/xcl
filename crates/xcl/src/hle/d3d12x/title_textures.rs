@@ -4695,6 +4695,7 @@ pub(super) mod tests {
             let dev_key = dev.as_raw() as usize;
             let dev_pages = || super::super::vram::page_bytes_for(dev_key).0;
             let p0 = dev_pages();
+            let settled0 = super::super::vram::new_textures_settled_for_test(dev_key).map_or(0, |s| s.0);
             let small = place_tex(at);
             super::super::vram::LEVEL_PAGES_FOR_TEST.store(false, Ordering::Relaxed);
             if !super::super::vram::has_lazy_levels(small.as_raw() as usize) {
@@ -4705,6 +4706,13 @@ pub(super) mod tests {
             }
             super::super::vram::LEVEL_PAGES_FOR_TEST.store(true, Ordering::Relaxed);
             assert_eq!(dev_pages(), p0, "no pages before the first upload");
+            // A texture with lazy levels has no pages, but its tiles were mapped to no memory by a
+            // call that has run before the placement returned (`Pages::null_all`, waited for): a
+            // title names it in a descriptor at once, and lists already on the GPU that read the
+            // descriptor fault on a new texture no mapping call has run on (NVIDIA, #2572).
+            let (settled, done) = super::super::vram::new_textures_settled_for_test(dev_key).expect("the device has its pages");
+            assert_eq!(settled, settled0 + 1, "the new texture's tiles were mapped to no memory by a call when it was placed");
+            assert!(done, "a new texture's mapping call has run when its placement returns");
             // the tiles of mip 0 and of all of it, as this driver lays them out
             let (mut all, mut n, mut mip0) = (0u32, 1u32, D3D12_SUBRESOURCE_TILING::default());
             dev.GetResourceTiling(&small, Some(&mut all), None, None, Some(&mut n), 0, &mut mip0);
