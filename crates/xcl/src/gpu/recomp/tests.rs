@@ -9244,6 +9244,110 @@ fn gpu_signed_bfe_arithmetic_shift() {
 }
 
 #[test]
+fn gpu_alignbit_alignbyte_and_perm_b32() {
+    fn alignbit_ref(s0: u32, s1: u32, s2: u32) -> u32 {
+        ((((s0 as u64) << 32) | (s1 as u64)) >> (s2 & 31)) as u32
+    }
+    fn alignbyte_ref(s0: u32, s1: u32, s2: u32) -> u32 {
+        ((((s0 as u64) << 32) | (s1 as u64)) >> ((s2 & 3) * 8)) as u32
+    }
+    fn perm_b32_ref(s0: u32, s1: u32, sel: u32) -> u32 {
+        let mut out = 0u32;
+        for i in 0..4u32 {
+            let k = (sel >> (8 * i)) & 0xFF;
+            let b: u32 = match k {
+                0..=3 => (s1 >> (8 * k)) & 0xFF,
+                4..=7 => (s0 >> (8 * (k - 4))) & 0xFF,
+                8 => if (s1 >> 15) & 1 != 0 { 0xFF } else { 0x00 },
+                9 => if (s1 >> 31) & 1 != 0 { 0xFF } else { 0x00 },
+                10 => if (s0 >> 15) & 1 != 0 { 0xFF } else { 0x00 },
+                11 => if (s0 >> 31) & 1 != 0 { 0xFF } else { 0x00 },
+                12 => 0x00,
+                _ => 0xFF,
+            };
+            out |= b << (8 * i);
+        }
+        out
+    }
+
+    const SGPR_SIGN_SEL: u32 = 0x0B0A_0908;
+    // (src0, src1, shift_or_byte, perm_sel): 32 cases so wave32 hits every edge case.
+    const CASES: [(u32, u32, u32, u32); 32] = [
+        // Distinct bytes + shift=0 (guards against HLSL `s0 << 32` wrap) and identity S1
+        (0xA7A6_A5A4, 0xB3B2_B1B0, 0, 0x0302_0100),
+        // Small bit shifts & byte offsets 1..3 + identity S0, byte-swaps, cross-register mixes
+        (0xA7A6_A5A4, 0xB3B2_B1B0, 1, 0x0706_0504),
+        (0xA7A6_A5A4, 0xB3B2_B1B0, 2, 0x0001_0203),
+        (0xA7A6_A5A4, 0xB3B2_B1B0, 3, 0x0405_0607),
+        // Byte offset 4 masks to 0 (& 3), bit shift 4 shifts by 4
+        (0xA7A6_A5A4, 0xB3B2_B1B0, 4, 0x0703_0501),
+        (0x1122_3344, 0x5566_7788, 5, 0x0602_0400),
+        (0x1122_3344, 0x5566_7788, 7, 0x0000_0000),
+        (0x1122_3344, 0x5566_7788, 8, 0x0707_0707),
+        (0xDEAD_BEEF, 0x1234_5678, 15, 0x0502_0601),
+        (0xDEAD_BEEF, 0x1234_5678, 16, 0x0104_0307),
+        (0xDEAD_BEEF, 0x1234_5678, 17, 0x0202_0505),
+        (0xDEAD_BEEF, 0x1234_5678, 24, 0x0706_0100),
+        (0xCAFE_BABE, 0x0123_4567, 30, 0x0302_0504),
+        (0xCAFE_BABE, 0x0123_4567, 31, 0x0604_0200),
+        // Masked shift counts >= 32: 32 -> 0, 33 -> 1, 34 -> 2, 35 -> 3, 63 -> 31
+        (0xDEAD_BEEF, 0x1234_5678, 32, 0x0302_0100),
+        (0xDEAD_BEEF, 0x1234_5678, 33, 0x0706_0504),
+        (0xF0E1_D2C3, 0x0A1B_2C3D, 34, 0x0004_0105),
+        (0xF0E1_D2C3, 0x0A1B_2C3D, 35, 0x0206_0307),
+        (0xF0E1_D2C3, 0x0A1B_2C3D, 63, 0x0400_0703),
+        // One-hot sign bits (s1[15], s1[31], s0[15], s0[31]) to distinguish selectors 8..11
+        (0x0000_0000, 0x0000_8000, 0xFC, 0x0B0A_0908),
+        (0x0000_0000, 0x8000_0000, 0xFD, 0x0B0A_0908),
+        (0x0000_8000, 0x0000_0000, 0xFE, 0x0B0A_0908),
+        (0x8000_0000, 0x0000_0000, 0xFF, 0x0B0A_0908),
+        // One-cold sign bits + near-miss bits (14/30 set, 15/31 clear)
+        (0x8000_8000, 0x8000_7FFF, 0xFFFF_FFE0, 0x0B0A_0908),
+        (0x8000_8000, 0x7FFF_8000, 0xFFFF_FFE1, 0x0B0A_0908),
+        (0x8000_7FFF, 0x8000_8000, 0xFFFF_FFE2, 0x0B0A_0908),
+        (0x7FFF_8000, 0x8000_8000, 0xFFFF_FFFF, 0x0B0A_0908),
+        (0x7FFF_7FFF, 0x7FFF_7FFF, 9, 0x0B0A_0908),
+        // Signed i16 sign-extension idioms with selectors 8..11
+        (0x8123_7456, 0x789A_8BCD, 12, 0x0808_0100),
+        (0x8123_7456, 0x789A_8BCD, 20, 0x0B0B_0706),
+        // Constant 0x00 (sel=12) on all-ones; constant 0xFF (sel=13, 20, 28, 255) catches `& 15` masking
+        (0xFFFF_FFFF, 0xFFFF_FFFF, 36, 0x0C0C_0C0C),
+        (0x1234_5678, 0x9ABC_DEF0, 64, 0xFF1C_140D),
+    ];
+
+    let p = prog(&[
+        ("V_ALIGNBIT_B32", "ENC_VOP3", &[("VDST", 4), ("SRC0", V + 0), ("SRC1", V + 1), ("SRC2", V + 2)], None),
+        ("V_ALIGNBIT_B32", "ENC_VOP3", &[("VDST", 5), ("SRC0", V + 0), ("SRC1", V + 1), ("SRC2", 128)], None),
+        ("V_ALIGNBYTE_B32", "ENC_VOP3", &[("VDST", 6), ("SRC0", V + 0), ("SRC1", V + 1), ("SRC2", V + 2)], None),
+        ("V_ALIGNBYTE_B32", "ENC_VOP3", &[("VDST", 7), ("SRC0", V + 0), ("SRC1", V + 1), ("SRC2", 131)], None),
+        ("V_PERM_B32", "ENC_VOP3", &[("VDST", 8), ("SRC0", V + 0), ("SRC1", V + 1), ("SRC2", V + 3)], None),
+        ("V_PERM_B32", "ENC_VOP3", &[("VDST", 9), ("SRC0", V + 0), ("SRC1", V + 1), ("SRC2", 0)], None),
+    ]);
+
+    let t = translate(&p, &Options::default()).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+
+    for wave64 in gpu_waves() {
+        let mut st = KernelState::default();
+        st.sgpr[0] = SGPR_SIGN_SEL;
+        for (l, r) in st.vgpr.iter_mut().enumerate() {
+            let (s0, s1, sh, sel) = CASES[l % CASES.len()];
+            (r[0], r[1], r[2], r[3]) = (s0, s1, sh, sel);
+        }
+        let (r, lanes) = run_wave(&p, &st, wave64);
+        for (l, v) in r.vgpr.iter().take(lanes).enumerate() {
+            let (s0, s1, sh, sel) = CASES[l % CASES.len()];
+            assert_eq!(v[4], alignbit_ref(s0, s1, sh), "wave{lanes} lane {l} v_alignbit_b32({s0:#010x}, {s1:#010x}, {sh:#x})");
+            assert_eq!(v[5], alignbit_ref(s0, s1, 0), "wave{lanes} lane {l} v_alignbit_b32({s0:#010x}, {s1:#010x}, 0)");
+            assert_eq!(v[6], alignbyte_ref(s0, s1, sh), "wave{lanes} lane {l} v_alignbyte_b32({s0:#010x}, {s1:#010x}, {sh:#x})");
+            assert_eq!(v[7], alignbyte_ref(s0, s1, 3), "wave{lanes} lane {l} v_alignbyte_b32({s0:#010x}, {s1:#010x}, 3)");
+            assert_eq!(v[8], perm_b32_ref(s0, s1, sel), "wave{lanes} lane {l} v_perm_b32({s0:#010x}, {s1:#010x}, {sel:#010x})");
+            assert_eq!(v[9], perm_b32_ref(s0, s1, SGPR_SIGN_SEL), "wave{lanes} lane {l} v_perm_b32({s0:#010x}, {s1:#010x}, s0)");
+        }
+    }
+}
+
+#[test]
 fn gpu_cmp_class_f16_preserves_snan() {
     for wave64 in gpu_waves() {
         let p = prog(&[
