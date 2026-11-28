@@ -4354,7 +4354,8 @@ pub(super) unsafe extern "system" fn dispatch_x(this: *mut c_void, x: u32, y: u3
 
 /// command list #146 console compute/UAV barrier (used by `XboxBvhBuilder.dll` between BVH
 /// build passes): emits a global UAV barrier so UMA writes become visible to the next pass
-pub(super) unsafe extern "system" fn uav_barrier_x(this: *mut c_void, _n: u32, _barriers: *const c_void) {
+pub(super) unsafe extern "system" fn uav_barrier_x(this: *mut c_void, n: u32, groups: *const c_void) {
+    note_depth_uav_barrier_groups(n, groups);
     let b = D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
         Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
@@ -5606,6 +5607,10 @@ pub(super) unsafe extern "system" fn resource_barrier_x(this: *mut c_void, n: u3
             }
         }
         if ty == 2 {
+            let r = (b[2] as u64 | (b[3] as u64) << 32) as usize;
+            if r != 0 {
+                note_depth_uav_barrier(r, UavUse::UavBarrier);
+            }
             // UAV (resource +8): translated shaders reach title memory through XCL's memory
             // window buffers – other resources over the same memory – which a UAV barrier for
             // the title's resource alone does not order (AMD drivers wait and flush for any UAV
@@ -5636,6 +5641,9 @@ pub(super) unsafe extern "system" fn resource_barrier_x(this: *mut c_void, n: u3
             }
             // UAV writes before (or after) the transition: the same holds for the window buffers
             uav_transition |= (b[5] | b[6]) & UNORDERED_ACCESS != 0;
+            if (b[5] | b[6]) & UNORDERED_ACCESS != 0 {
+                note_depth_uav_barrier((b[2] as u64 | (b[3] as u64) << 32) as usize, UavUse::Transition(b[5], b[6]));
+            }
         }
         out.push(b);
     }
@@ -5658,6 +5666,78 @@ const BUFFER_ONLY_STATES: u32 = 0x1 | 0x2;
 
 /// D3D12_RESOURCE_STATE_UNORDERED_ACCESS
 const UNORDERED_ACCESS: u32 = 0x8;
+
+/// A console depth buffer that shaders write too, as the PC has it: ALLOW_DEPTH_STENCIL without
+/// ALLOW_UNORDERED_ACCESS (`device_x::pc_resource_desc` drops it) – its UAVs are null views
+/// (`real::dev_create_uav_x`), so what shaders write through them is lost (#970).
+fn depth_without_uav(flags: i32) -> bool {
+    flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 != 0 && flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0
+}
+
+/// How a barrier of the title uses a resource as a UAV (`note_depth_uav_barrier`).
+pub(super) enum UavUse {
+    /// a transition from or to UNORDERED_ACCESS (before, after)
+    Transition(u32, u32),
+    /// a UAV barrier naming the resource
+    UavBarrier,
+    /// an enhanced texture barrier (#146) with the UNORDERED_ACCESS layout or access: layouts
+    /// before, after
+    Layout(i32, i32),
+}
+
+/// A barrier of the title that uses such a depth buffer as a UAV. Counted; the first 8 and
+/// every power of two are logged.
+pub(super) unsafe fn note_depth_uav_barrier(res: usize, how: UavUse) {
+    let r = res as *mut c_void;
+    let Some(d) = ID3D12Resource::from_raw_borrowed(&r).map(|x| x.GetDesc()) else { return };
+    if !depth_without_uav(d.Flags.0) {
+        return;
+    }
+    static N: AtomicU64 = AtomicU64::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 8 || n.is_power_of_two() {
+        let what = match how {
+            UavUse::Transition(before, after) => format!("a transition {before:#x} → {after:#x}"),
+            UavUse::UavBarrier => "a UAV barrier".into(),
+            UavUse::Layout(before, after) => format!("a texture barrier, layout {before} → {after},"),
+        };
+        crate::xlog_warn!(
+            "D3D12.X: {what} uses a depth buffer as a UAV ({}x{}x{}, format {}); its UAVs are null views, what shaders write there is lost ({n} so far)",
+            d.Width, d.Height, d.DepthOrArraySize, d.Format.0
+        );
+    }
+}
+
+/// Whether an enhanced texture barrier moves its texture into or out of unordered access
+/// (layout UNORDERED_ACCESS before or after, or the UNORDERED_ACCESS access bit).
+fn barrier_uses_uav(layouts: (i32, i32), access: (i32, i32)) -> bool {
+    let layout = D3D12_BARRIER_LAYOUT_UNORDERED_ACCESS.0;
+    layouts.0 == layout || layouts.1 == layout || (access.0 | access.1) & D3D12_BARRIER_ACCESS_UNORDERED_ACCESS.0 != 0
+}
+
+/// #146 Barrier(n, groups): the title's enhanced barriers (D3D12_BARRIER_GROUP) – XCL turns them
+/// into one global UAV barrier and their description is not read (`uav_barrier_x`). Its texture
+/// barriers that use a depth buffer without UAVs as one are counted (`note_depth_uav_barrier`).
+pub(super) unsafe fn note_depth_uav_barrier_groups(n: u32, groups: *const c_void) {
+    let group_bytes = std::mem::size_of::<D3D12_BARRIER_GROUP>();
+    if n == 0 || n > 1024 || groups.is_null() || !crate::gpu::shader::readable(groups as usize, n as usize * group_bytes) {
+        return;
+    }
+    let groups = std::slice::from_raw_parts(groups as *const D3D12_BARRIER_GROUP, n as usize);
+    for g in groups.iter().filter(|g| g.Type == D3D12_BARRIER_TYPE_TEXTURE) {
+        let (t, k) = (g.Anonymous.pTextureBarriers, g.NumBarriers as usize);
+        if k == 0 || t.is_null() || !crate::gpu::shader::readable(t as usize, k * std::mem::size_of::<D3D12_TEXTURE_BARRIER>()) {
+            continue;
+        }
+        for b in std::slice::from_raw_parts(t, k) {
+            if barrier_uses_uav((b.LayoutBefore.0, b.LayoutAfter.0), (b.AccessBefore.0, b.AccessAfter.0)) {
+                if let Some(r) = b.pResource.as_ref() {
+                    note_depth_uav_barrier(r.as_raw() as usize, UavUse::Layout(b.LayoutBefore.0, b.LayoutAfter.0));
+                }
+            }
+        }
+    }
+}
 
 /// Whether `res` is a buffer (null / unknown: taken as one – its states are left alone).
 unsafe fn is_buffer(res: usize) -> bool {
@@ -6495,6 +6575,42 @@ mod tests {
             on_release(key);
             super::super::alloc_pool::forget(alloc.as_raw() as usize);
         }
+    }
+
+    /// Only a depth buffer without unordered access (what `pc_resource_desc` makes of a console
+    /// one shaders write too) counts as one whose UAVs are null.
+    #[test]
+    fn a_depth_buffer_without_unordered_access_is_one_with_null_uavs() {
+        let (ds, ua, rt) = (D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0);
+        assert!(depth_without_uav(ds));
+        assert!(depth_without_uav(ds | D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE.0));
+        assert!(!depth_without_uav(ds | ua), "a depth buffer the PC lets have UAVs");
+        assert!(!depth_without_uav(ua), "a plain UAV texture");
+        assert!(!depth_without_uav(rt | ua));
+        assert!(!depth_without_uav(0));
+        // the console desc's flags as `pc_resource_desc` leaves them (depth + UAV: 0x6 → 0x2)
+        let mut x = [0u8; 0x38];
+        x[0..4].copy_from_slice(&(D3D12_RESOURCE_DIMENSION_TEXTURE2D.0 as u32).to_le_bytes());
+        x[0x20..0x24].copy_from_slice(&40u32.to_le_bytes());
+        x[0x30..0x34].copy_from_slice(&((ds | ua) as u32).to_le_bytes());
+        let d = device_x::pc_resource_desc(&x);
+        assert!(depth_without_uav(u32::from_le_bytes(d[0x30..0x34].try_into().unwrap()) as i32));
+    }
+
+    /// The enhanced barriers a retail title gives its shadow maps: into and out of the
+    /// UNORDERED_ACCESS layout counts, depth write ↔ shader resource does not.
+    #[test]
+    fn an_enhanced_barrier_into_or_out_of_unordered_access_is_a_uav_use() {
+        let l = |x: D3D12_BARRIER_LAYOUT| x.0;
+        let a = |x: D3D12_BARRIER_ACCESS| x.0;
+        let (uav, dsw, srv) = (l(D3D12_BARRIER_LAYOUT_UNORDERED_ACCESS), l(D3D12_BARRIER_LAYOUT_DEPTH_STENCIL_WRITE), l(D3D12_BARRIER_LAYOUT_SHADER_RESOURCE));
+        let (a_uav, a_dsw, a_srv) = (a(D3D12_BARRIER_ACCESS_UNORDERED_ACCESS), a(D3D12_BARRIER_ACCESS_DEPTH_STENCIL_WRITE), a(D3D12_BARRIER_ACCESS_SHADER_RESOURCE));
+        assert!(barrier_uses_uav((srv, uav), (a_srv, a_uav)), "shader resource → unordered access");
+        assert!(barrier_uses_uav((uav, dsw), (a_uav, a_dsw)), "unordered access → depth write");
+        assert!(barrier_uses_uav((l(D3D12_BARRIER_LAYOUT_COMMON), l(D3D12_BARRIER_LAYOUT_COMMON)), (0, a_uav)), "the access alone");
+        assert!(!barrier_uses_uav((dsw, srv), (a_dsw, a_srv)));
+        assert!(!barrier_uses_uav((l(D3D12_BARRIER_LAYOUT_UNDEFINED), dsw), (a(D3D12_BARRIER_ACCESS_NO_ACCESS), a_dsw)));
+        assert!(!barrier_uses_uav((dsw, dsw), (a_dsw, a(D3D12_BARRIER_ACCESS_RENDER_TARGET))), "RENDER_TARGET (0x8) is not UNORDERED_ACCESS (0x10)");
     }
 
     static RESET_TEST_HR: AtomicU32 = AtomicU32::new(0);

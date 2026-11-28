@@ -540,7 +540,8 @@ unsafe extern "system" fn cl_copy_texture_region(this: *mut c_void, dst: *const 
     w.extend_from_slice(&bx.as_ref().copied().unwrap_or([0; 6]));
     push(this as usize, &w);
 }
-unsafe extern "system" fn cl_barrier(this: *mut c_void, _n: u32, _barriers: *const c_void) {
+unsafe extern "system" fn cl_barrier(this: *mut c_void, n: u32, groups: *const c_void) {
+    super::list_x::note_depth_uav_barrier_groups(n, groups);
     push(this as usize, &[BARRIER_MARKER]);
 }
 unsafe extern "system" fn cl_allocate_upload_memory(this: *mut c_void, size: usize, align: usize) -> *mut u8 {
@@ -826,6 +827,15 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                         let t: Vec<(usize, u32, D3D12_RESOURCE_STATES)> =
                             b.chunks_exact(4).filter(|c| c[0] as u32 == 0).map(|c| (c[1] as usize, c[2] as u32, D3D12_RESOURCE_STATES(c[3] as u32 as i32))).collect();
                         super::list_x::note_texture_transitions(st.pc, &t);
+                    }
+                    for c in b.chunks_exact(4) {
+                        let (ty, res) = (c[0] as u32, c[1] as usize);
+                        let (before, after) = ((c[2] >> 32) as u32, c[3] as u32);
+                        if ty == 0 && (before | after) & D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32 != 0 {
+                            super::list_x::note_depth_uav_barrier(res, super::list_x::UavUse::Transition(before, after));
+                        } else if ty == 2 && res != 0 {
+                            super::list_x::note_depth_uav_barrier(res, super::list_x::UavUse::UavBarrier);
+                        }
                     }
                     list.ResourceBarrier(std::slice::from_raw_parts(b.as_ptr() as *const D3D12_RESOURCE_BARRIER, n));
                 }
