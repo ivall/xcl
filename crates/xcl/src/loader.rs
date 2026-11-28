@@ -94,13 +94,17 @@ fn map_image_ex(path: &Path, is_main: bool) -> Result<Arc<MappedModule>, String>
         let hdr = (pe.size_of_headers as usize).min(file.len()).min(size);
         std::ptr::copy_nonoverlapping(file.as_ptr(), base as *mut u8, hdr);
         for s in &pe.sections {
-            let raw = (s.raw_size as usize).min(s.mapped_size() as usize);
+            let mapped = s.mapped_size() as usize;
+            if s.va as usize + mapped > size {
+                return fail(format!("{name}: section {} outside the image", s.name));
+            }
+            let raw = (s.raw_size as usize).min(mapped);
             if raw == 0 {
                 continue;
             }
             let src = s.raw_ptr as usize;
-            if src + raw > file.len() || s.va as usize + raw > size {
-                return fail(format!("{name}: section {} outside the file/image", s.name));
+            if src + raw > file.len() {
+                return fail(format!("{name}: section {} outside the file", s.name));
             }
             std::ptr::copy_nonoverlapping(file.as_ptr().add(src), (base + s.va as usize) as *mut u8, raw);
         }
@@ -113,19 +117,29 @@ fn map_image_ex(path: &Path, is_main: bool) -> Result<Arc<MappedModule>, String>
             Err(e) => return fail(format!("{name}: relocations: {e}")),
         };
         for r in relocs {
-            let p = base + r.rva as usize;
-            unsafe {
-                match r.kind {
-                    pe::IMAGE_REL_BASED_DIR64 => {
+            let rva = r.rva as usize;
+            match r.kind {
+                pe::IMAGE_REL_BASED_DIR64 => {
+                    if rva + 8 > size {
+                        return fail(format!("{name}: relocation @ {:#x} outside image", r.rva));
+                    }
+                    let p = base + rva;
+                    unsafe {
                         let v = (p as *mut u64).read_unaligned();
                         (p as *mut u64).write_unaligned((v as i64 + delta) as u64);
                     }
-                    pe::IMAGE_REL_BASED_HIGHLOW => {
+                }
+                pe::IMAGE_REL_BASED_HIGHLOW => {
+                    if rva + 4 > size {
+                        return fail(format!("{name}: relocation @ {:#x} outside image", r.rva));
+                    }
+                    let p = base + rva;
+                    unsafe {
                         let v = (p as *mut u32).read_unaligned();
                         (p as *mut u32).write_unaligned((v as i64 + delta) as u32);
                     }
-                    k => crate::xlog_warn!("{name}: unsupported relocation type {k} @ {:#x}", r.rva),
                 }
+                k => crate::xlog_warn!("{name}: unsupported relocation type {k} @ {:#x}", r.rva),
             }
         }
     }
@@ -174,12 +188,22 @@ fn map_image_ex(path: &Path, is_main: bool) -> Result<Arc<MappedModule>, String>
     }
     for dll in &all {
         for e in &dll.entries {
+            let iat = e.iat_rva as usize;
+            if iat + 8 > size {
+                modules::unregister_mapped(base);
+                return fail(format!("{name}: import IAT slot @ {:#x} outside image", e.iat_rva));
+            }
             let addr = resolver::resolve_import(&dll.dll, &e.what, &name, dll.delay);
-            unsafe { ((base + e.iat_rva as usize) as *mut u64).write_unaligned(addr as u64) };
+            unsafe { ((base + iat) as *mut u64).write_unaligned(addr as u64) };
         }
         if dll.delay && dll.module_handle_rva != 0 {
+            let hmod = dll.module_handle_rva as usize;
+            if hmod + 8 > size {
+                modules::unregister_mapped(base);
+                return fail(format!("{name}: delay-load module handle @ {:#x} outside image", dll.module_handle_rva));
+            }
             let h = resolver::load_library(&dll.dll).unwrap_or(1);
-            unsafe { ((base + dll.module_handle_rva as usize) as *mut u64).write_unaligned(h as u64) };
+            unsafe { ((base + hmod) as *mut u64).write_unaligned(h as u64) };
         }
     }
 
@@ -209,10 +233,11 @@ fn map_image_ex(path: &Path, is_main: bool) -> Result<Arc<MappedModule>, String>
         VirtualProtect(base as *const c_void, pe.size_of_headers as usize, PAGE_READONLY, &mut old);
         for s in &pe.sections {
             let len = ((s.mapped_size() as usize) + 0xFFF) & !0xFFF;
-            if len == 0 {
+            if len == 0 || s.va as usize >= size {
                 continue;
             }
-            VirtualProtect((base + s.va as usize) as *const c_void, len, section_protection(s.characteristics), &mut old);
+            let protect_len = len.min(size.saturating_sub(s.va as usize));
+            VirtualProtect((base + s.va as usize) as *const c_void, protect_len, section_protection(s.characteristics), &mut old);
         }
         windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache(
             windows_sys::Win32::System::Threading::GetCurrentProcess(),
