@@ -9415,6 +9415,85 @@ fn gpu_sdwa_f16_inline_constants() {
     }
 }
 
+/// 32-bit high-half multiplies (`v_mul_hi_u32` / `_i32`) and 24-bit integer multiplies /
+/// multiply-adds (`v_mul_u32_u24`, `v_mul_hi_u32_u24`, `v_mul_i32_i24`, `v_mul_hi_i32_i24`,
+/// `v_mad_u32_u24`, `v_mad_i32_i24`) on the GPU against exact 64-bit CPU arithmetic: covers
+/// 24-bit sign boundaries (`0x007F_FFFF` / `0x0080_0000`), ignored upper 8 bits, 32-bit signed
+/// and unsigned extremes, and wrapping accumulation.
+#[test]
+fn gpu_mul_hi_and_24bit_integer_ops() {
+    if !gpu_ready() {
+        return;
+    }
+    let cases: [(u32, u32, u32); 16] = [
+        (0, 0, 0),
+        (1, 1, 0),
+        (0x007F_FFFF, 0x007F_FFFF, 0),
+        (0x0080_0000, 0x0080_0000, 0),
+        (0x007F_FFFF, 0x0080_0000, 1),
+        (0x00FF_FFFF, 0x00FF_FFFF, 0xFFFF_FFFF),
+        (0xFF00_0000, 0xAA00_0005, 0x1234_5678),
+        (0xAB7F_FFFF, 0xCD80_0000, 0x8000_0000),
+        (0x55FF_FFFF, 0x99FF_FFFE, 0x7FFF_FFFF),
+        (0xFFFF_FFFF, 0xFFFF_FFFF, 1),
+        (0x8000_0000, 0x8000_0000, 0x8000_0000),
+        (0x7FFF_FFFF, 0x7FFF_FFFF, 0x7FFF_FFFF),
+        (0x8000_0000, 0x7FFF_FFFF, 0xFFFF_FFFF),
+        (0x1234_5678, 0x9ABC_DEF0, 0x0FED_CBA9),
+        (0x0001_0000, 0x0001_0000, 0xFFFF_0000),
+        (0xFEFF_FF01, 0x0180_0001, 0xDEAD_BEEF),
+    ];
+    let vop2 = |n: &str, d: u64| ins(n, "ENC_VOP2", &[("VDST", d), ("SRC0", V + 1), ("VSRC1", 2)], None);
+    let vop3_2 = |n: &str, d: u64| ins(n, "ENC_VOP3", &[("VDST", d), ("SRC0", V + 1), ("SRC1", V + 2)], None);
+    let vop3_3 = |n: &str, d: u64| {
+        ins(n, "ENC_VOP3", &[("VDST", d), ("SRC0", V + 1), ("SRC1", V + 2), ("SRC2", V + 3)], None)
+    };
+    let code = program_of(&[
+        vop3_2("V_MUL_HI_U32", 10),
+        vop3_2("V_MUL_HI_I32", 11),
+        vop2("V_MUL_U32_U24", 12),
+        vop2("V_MUL_HI_U32_U24", 13),
+        vop2("V_MUL_I32_I24", 14),
+        vop2("V_MUL_HI_I32_I24", 15),
+        vop3_3("V_MAD_U32_U24", 16),
+        vop3_3("V_MAD_I32_I24", 17),
+    ]);
+    let mut st = KernelState::default();
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        let (a, b, c) = cases[l % cases.len()];
+        r[1] = a;
+        r[2] = b;
+        r[3] = c;
+    }
+    let r = runner::run_code(&code, &st, &[]).unwrap();
+    let i24 = |x: u32| (((x << 8) as i32) >> 8) as i64;
+    let u24 = |x: u32| (x & 0x00FF_FFFF) as u64;
+    let mut bad = Vec::new();
+    for (l, v) in r.vgpr.iter().enumerate().take(cases.len()) {
+        let (a, b, c) = cases[l];
+        let u64_prod = (a as u64).wrapping_mul(b as u64);
+        let i64_prod = (a as i32 as i64).wrapping_mul(b as i32 as i64);
+        let u24_prod = u24(a).wrapping_mul(u24(b));
+        let i24_prod = i24(a).wrapping_mul(i24(b));
+        let checks = [
+            ("v_mul_hi_u32", v[10], (u64_prod >> 32) as u32),
+            ("v_mul_hi_i32", v[11], (i64_prod >> 32) as u32),
+            ("v_mul_u32_u24", v[12], u24_prod as u32),
+            ("v_mul_hi_u32_u24", v[13], (u24_prod >> 32) as u32),
+            ("v_mul_i32_i24", v[14], i24_prod as u32),
+            ("v_mul_hi_i32_i24", v[15], (i24_prod >> 32) as u32),
+            ("v_mad_u32_u24", v[16], (u24_prod as u32).wrapping_add(c)),
+            ("v_mad_i32_i24", v[17], (i24_prod as i32).wrapping_add(c as i32) as u32),
+        ];
+        for (n, got, want) in checks {
+            if got != want {
+                bad.push(format!("{n}({a:#010x}, {b:#010x}, {c:#010x}) = {got:#010x}, want {want:#010x}"));
+            }
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
 #[test]
 fn fspx_compute_user_sgprs_from_rsrc2() {
     use crate::gpu::xbox::tests::container;
