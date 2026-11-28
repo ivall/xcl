@@ -1,4 +1,7 @@
 from pathlib import Path
+import subprocess
+import sys
+import tempfile
 import unittest
 
 from pr_check import check, smoke_blocks
@@ -101,6 +104,39 @@ class SmokeBlockTests(unittest.TestCase):
         problems = self.smoke_problems(run + "frames shown: 100\n", run + "frames shown: many\n")
         self.assertIn("the PR's regression run (`xcl-smoke` block of commit 1234567890) "
                       "has a non-numeric `frames shown`: many", problems)
+
+
+class LocalMainRefTests(unittest.TestCase):
+    def test_local_check_uses_requested_main_ref(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            def git(*args):
+                return subprocess.check_output(["git", "-c", "user.name=Test", "-c", "user.email=test@example.com",
+                                                "-c", "commit.gpgSign=false", *args], cwd=tmp, text=True).strip()
+
+            git("init", "--quiet")
+            git("commit", "--quiet", "--allow-empty", "-m", "Fork main")
+            git("update-ref", "refs/remotes/origin/main", "HEAD")
+            git("commit", "--quiet", "--allow-empty", "-m", "Upstream main")
+            git("update-ref", "refs/remotes/upstream/main", "HEAD")
+            base = git("rev-parse", "HEAD")
+
+            body = Path(tmp) / "body.md"
+            files = Path(tmp) / "files.tsv"
+            run = ("title: G\nseconds: 60\nexit: 0x0\nframes shown: 100\n"
+                   "device removals: 0\ncrashes: 0\npeak commit: 4000 MB\n")
+            body.write_text(BODY + "".join(f"```\nxcl-smoke v1\ncommit: {sha}\n{run}```\n"
+                                           for sha in (base, HEAD)), encoding="utf-8")
+            files.write_text("crates/xcl/src/lib.rs\tmodified\tfalse\tunused\n", encoding="utf-8")
+            script = Path(__file__).resolve().with_name("pr_check.py")
+            command = [sys.executable, str(script), "--body", str(body), "--head", HEAD, "--files", str(files), "--local"]
+
+            default = subprocess.run(command, cwd=tmp, capture_output=True, text=True)
+            self.assertEqual(1, default.returncode, default.stderr)
+            self.assertIn("made on a commit of main", default.stdout)
+
+            upstream = subprocess.run([*command, "--main-ref", "upstream/main"], cwd=tmp, capture_output=True, text=True)
+            self.assertEqual(0, upstream.returncode, upstream.stdout + upstream.stderr)
+            self.assertIn("description ok", upstream.stdout)
 
 
 class TemplatePlaceholderTests(unittest.TestCase):
