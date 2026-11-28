@@ -1822,6 +1822,120 @@ fn gpu_typed_buffer_loads_and_stores() {
     assert_eq!(r.sgpr[50], 1 | 1 << 5, "s_bitset1");
 }
 
+#[test]
+fn buffer_load_format_decodes_only_requested_components() {
+    let cases = [
+        ("BUFFER_LOAD_FORMAT_X", "ENC_MUBUF", 1usize, 0usize),
+        ("BUFFER_LOAD_FORMAT_XY", "ENC_MUBUF", 2, 0),
+        ("BUFFER_LOAD_FORMAT_XYZ", "ENC_MUBUF", 3, 0),
+        ("BUFFER_LOAD_FORMAT_XYZW", "ENC_MUBUF", 0, 4),
+        ("TBUFFER_LOAD_FORMAT_X", "ENC_MTBUF", 1, 0),
+        ("BUFFER_LOAD_FORMAT_D16_X", "ENC_MUBUF", 1, 0),
+        ("BUFFER_LOAD_FORMAT_D16_HI_X", "ENC_MUBUF", 1, 0),
+        ("BUFFER_LOAD_FORMAT_D16_XY", "ENC_MUBUF", 2, 0),
+        ("BUFFER_LOAD_FORMAT_D16_XYZ", "ENC_MUBUF", 3, 0),
+        ("BUFFER_LOAD_FORMAT_D16_XYZW", "ENC_MUBUF", 0, 4),
+    ];
+    for &(inst, enc, want_sel, want_comp) in &cases {
+        let mut fields = vec![("VDATA", 10), ("SRSRC", 3), ("SOFFSET", 128)];
+        if enc == "ENC_MTBUF" {
+            fields.push(("FORMAT", 64));
+        }
+        let code = prog(&[(inst, enc, &fields, None)]);
+        let t = translate(&code, &Options::default()).unwrap();
+        assert!(t.complete(), "{inst}: {:?}", t.unsupported_why);
+        let body = t.hlsl.split("void main(").nth(1).expect("main");
+        assert_eq!(body.matches("fmt_sel(").count(), want_sel, "{inst}: fmt_sel count\n{body}");
+        assert_eq!(body.matches("fmt_comp(").count(), want_comp, "{inst}: fmt_comp count\n{body}");
+        if super::dxc::location().is_ok() && matches!(inst, "BUFFER_LOAD_FORMAT_X" | "BUFFER_LOAD_FORMAT_D16_XYZ" | "BUFFER_LOAD_FORMAT_XYZW") {
+            super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{inst}: {e}\n{}", t.hlsl));
+        }
+    }
+}
+
+#[test]
+fn gpu_buffer_load_format_swizzled_narrow_loads() {
+    if !gpu_ready() {
+        return;
+    }
+    let swiz = |x: u32, y: u32, z: u32, w: u32| x | (y << 3) | (z << 6) | (w << 9);
+    let vs = |base: u32, fmt: u32, sel: u32| [base, 0, 0x100, sel | fmt << 12];
+    let code = prog(&[
+        ("BUFFER_LOAD_FORMAT_X", "ENC_MUBUF", &[("VDATA", 10), ("SRSRC", 3), ("SOFFSET", 128)], None),
+        ("BUFFER_LOAD_FORMAT_X", "ENC_MUBUF", &[("VDATA", 11), ("SRSRC", 4), ("SOFFSET", 128)], None),
+        ("BUFFER_LOAD_FORMAT_X", "ENC_MUBUF", &[("VDATA", 12), ("SRSRC", 5), ("SOFFSET", 128)], None),
+        ("BUFFER_LOAD_FORMAT_X", "ENC_MUBUF", &[("VDATA", 13), ("SRSRC", 6), ("SOFFSET", 128)], None),
+        ("BUFFER_LOAD_FORMAT_X", "ENC_MUBUF", &[("VDATA", 14), ("SRSRC", 7), ("SOFFSET", 128)], None),
+        ("BUFFER_LOAD_FORMAT_X", "ENC_MUBUF", &[("VDATA", 15), ("SRSRC", 8), ("SOFFSET", 128)], None),
+        ("BUFFER_LOAD_FORMAT_X", "ENC_MUBUF", &[("VDATA", 16), ("SRSRC", 9), ("SOFFSET", 128)], None),
+        ("BUFFER_LOAD_FORMAT_X", "ENC_MUBUF", &[("VDATA", 17), ("SRSRC", 10), ("SOFFSET", 128)], None),
+        ("BUFFER_LOAD_FORMAT_XY", "ENC_MUBUF", &[("VDATA", 18), ("SRSRC", 11), ("SOFFSET", 128)], None),
+        ("BUFFER_LOAD_FORMAT_XYZ", "ENC_MUBUF", &[("VDATA", 20), ("SRSRC", 12), ("SOFFSET", 128)], None),
+        ("TBUFFER_LOAD_FORMAT_X", "ENC_MTBUF", &[("VDATA", 23), ("SRSRC", 13), ("SOFFSET", 128), ("FORMAT", 64)], None),
+        ("BUFFER_LOAD_FORMAT_D16_X", "ENC_MUBUF", &[("VDATA", 24), ("SRSRC", 14), ("SOFFSET", 128)], None),
+        ("BUFFER_LOAD_FORMAT_D16_HI_X", "ENC_MUBUF", &[("VDATA", 25), ("SRSRC", 15), ("SOFFSET", 128)], None),
+        ("BUFFER_LOAD_FORMAT_D16_XYZ", "ENC_MUBUF", &[("VDATA", 26), ("SRSRC", 16), ("SOFFSET", 128)], None),
+        ("BUFFER_LOAD_FORMAT_X", "ENC_MUBUF", &[("VDATA", 28), ("SRSRC", 12), ("SOFFSET", 128), ("OFFSET", 0x200)], None),
+        ("BUFFER_LOAD_FORMAT_D16_HI_X", "ENC_MUBUF", &[("VDATA", 29), ("SRSRC", 12), ("SOFFSET", 128), ("OFFSET", 0x200)], None),
+    ]);
+    let mut mem = vec![0u32; 512];
+    mem[0x100 / 4] = u32::from_le_bytes([0x10, 0x80, 0xFF, 0x40]); // 8_8_8_8_UNORM
+    mem[0x110 / 4] = 11;
+    mem[0x114 / 4] = 22;
+    mem[0x118 / 4] = 33;
+    mem[0x11C / 4] = 44; // 32_32_32_32_UINT
+    mem[0x120 / 4] = 0x3E00 | (0xC100 << 16); // 16_16_FLOAT (1.5, -2.5)
+    mem[0x124 / 4] = 7 | (9 << 16); // 16_16_UINT (7, 9)
+    mem[0x130 / 4] = f(1.5);
+    mem[0x134 / 4] = f(-3.25); // 32_32_FLOAT
+    let mut st = KernelState::default();
+    let descriptors = [
+        vs(0x100, 56, swiz(6, 0, 0, 0)), // SRSRC 3: Z of 8_8_8_8_UNORM
+        vs(0x100, 56, swiz(5, 0, 0, 0)), // SRSRC 4: Y of 8_8_8_8_UNORM
+        vs(0x110, 75, swiz(7, 0, 0, 0)), // SRSRC 5: W of 32_32_32_32_UINT
+        vs(0x120, 29, swiz(6, 0, 0, 0)), // SRSRC 6: missing Z on 16_16_FLOAT -> 0.0f
+        vs(0x120, 29, swiz(7, 0, 0, 0)), // SRSRC 7: missing W on 16_16_FLOAT -> 1.0f
+        vs(0x124, 27, swiz(7, 0, 0, 0)), // SRSRC 8: missing W on 16_16_UINT -> 1u
+        vs(0x124, 27, swiz(1, 0, 0, 0)), // SRSRC 9: SEL_1 on 16_16_UINT -> 1u
+        vs(0x120, 29, swiz(0, 0, 0, 0)), // SRSRC 10: SEL_0 on 16_16_FLOAT -> 0.0f
+        vs(0x110, 75, swiz(7, 5, 0, 0)), // SRSRC 11: XY = [W, Y]
+        vs(0x110, 75, swiz(6, 1, 4, 0)), // SRSRC 12: XYZ = [Z, 1, X]
+        vs(0x130, 0, swiz(5, 0, 0, 0)),  // SRSRC 13: tbuffer Y of 32_32_FLOAT
+        vs(0x120, 29, swiz(5, 0, 0, 0)), // SRSRC 14: d16_x Y of 16_16_FLOAT
+        vs(0x124, 27, swiz(7, 0, 0, 0)), // SRSRC 15: d16_hi_x missing W on 16_16_UINT -> 1u
+        vs(0x120, 29, swiz(5, 7, 0, 4)), // SRSRC 16: d16_xyz = [Y (-2.5), W (1.0), 0]
+    ];
+    for (i, v) in descriptors.iter().enumerate() {
+        st.sgpr[12 + 4 * i..16 + 4 * i].copy_from_slice(v);
+    }
+    for r in &mut st.vgpr {
+        r[25] = 0xDEAD_BEEF;
+        r[28] = 0x1234_5678;
+        r[29] = 0xCAFE_BABE;
+    }
+    let r = runner::run_code(&code, &st, &mem).unwrap();
+    let near = |got: u32, want: f32| (got as i64 - want.to_bits() as i64).abs() <= 2;
+    for l in 0..64 {
+        let v = &r.vgpr[l];
+        assert_eq!(v[10], f(1.0), "lane {l} unorm8 Z");
+        assert!(near(v[11], 128.0 / 255.0), "lane {l} unorm8 Y: {:#x}", v[11]);
+        assert_eq!(v[12], 44, "lane {l} uint4 W");
+        assert_eq!(v[13], 0, "lane {l} missing Z float");
+        assert_eq!(v[14], f(1.0), "lane {l} missing W float");
+        assert_eq!(v[15], 1, "lane {l} missing W uint");
+        assert_eq!(v[16], 1, "lane {l} SEL_1 uint");
+        assert_eq!(v[17], 0, "lane {l} SEL_0 float");
+        assert_eq!([v[18], v[19]], [44, 22], "lane {l} XY swizzle");
+        assert_eq!([v[20], v[21], v[22]], [33, 1, 11], "lane {l} XYZ swizzle");
+        assert_eq!(f32::from_bits(v[23]), -3.25, "lane {l} tbuffer X swizzle");
+        assert_eq!(v[24], 0xC100, "lane {l} d16_x swizzle");
+        assert_eq!(v[25], 0x0001_BEEF, "lane {l} d16_hi_x swizzle + low half preserved");
+        assert_eq!([v[26], v[27]], [0x3C00_C100, 0x0000_0000], "lane {l} d16_xyz swizzle");
+        assert_eq!(v[28], 0, "lane {l} out-of-range narrow load");
+        assert_eq!(v[29], 0x0000_BABE, "lane {l} out-of-range d16_hi_x preserves low half");
+    }
+}
+
 fn el(name: &str, index: u32, sv: u32, ct: u32, reg: u32, mask: u8) -> crate::gpu::dxbc::SigElement {
     crate::gpu::dxbc::SigElement { name: name.into(), index, system_value: sv, component_type: ct, register: reg, mask, rw_mask: mask, stream: 0 }
 }

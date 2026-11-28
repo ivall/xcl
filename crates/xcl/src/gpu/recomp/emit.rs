@@ -2253,13 +2253,26 @@ impl Em {
                 self.line(&format!("bool {t}_int = ((({t}_info >> 3) & 7u) == 4u) || ((({t}_info >> 3) & 7u) == 5u);"));
                 self.line(&format!("bool {t}_ok = and(({t}_info & 7u) != 0u, {});", in_range(format!("fmt_bytes({t}_info)"))));
                 self.line(&format!("uint4 {t}_r = ld_raw({t}_a);"));
-                self.line(&format!(
-                    "uint4 {t}_c = uint4(fmt_comp({t}_r, {t}_info, 0u), fmt_comp({t}_r, {t}_info, 1u), fmt_comp({t}_r, {t}_info, 2u), fmt_comp({t}_r, {t}_info, 3u));"
-                ));
+                let n_comp = d16_format.map_or(count, |(_, components, _)| components);
+                if n_comp == 4 {
+                    self.line(&format!(
+                        "uint4 {t}_c = uint4(fmt_comp({t}_r, {t}_info, 0u), fmt_comp({t}_r, {t}_info, 1u), fmt_comp({t}_r, {t}_info, 2u), fmt_comp({t}_r, {t}_info, 3u));"
+                    ));
+                }
+                let sel_expr = |component: u64| {
+                    let sel = format!("(({d3} >> {}u) & 7u)", 3 * component);
+                    if n_comp == 4 {
+                        format!("dst_sel({t}_c, {sel}, {t}_int)")
+                    } else {
+                        format!("fmt_sel({t}_r, {t}_info, {sel}, {t}_int)")
+                    }
+                };
                 if let Some((_, components, high)) = d16_format {
+                    for c in 0..components {
+                        self.line(&format!("uint {t}_s{c} = {};", sel_expr(c)));
+                    }
                     let half = |component: u64| {
-                        let selected = format!("dst_sel({t}_c, ({d3} >> {}u) & 7u, {t}_int)", 3 * component);
-                        format!("select({t}_int, {selected} & 0xFFFFu, f32tof16(asfloat({selected})))")
+                        format!("select({t}_int, {t}_s{component} & 0xFFFFu, f32tof16(asfloat({t}_s{component})))")
                     };
                     let mut assigns = Vec::new();
                     if high {
@@ -2279,7 +2292,7 @@ impl Em {
                 let mut assigns = Vec::new();
                 for i in 0..count {
                     let v = self.vreg(vdata + i);
-                    assigns.push(format!("{v} = select({t}_ok, dst_sel({t}_c, ({d3} >> {}u) & 7u, {t}_int), 0u);", 3 * i));
+                    assigns.push(format!("{v} = select({t}_ok, {}, 0u);", sel_expr(i)));
                 }
                 self.line(&format!("if ({act}) {{ {} }}", assigns.join(" ")));
             }
@@ -6271,6 +6284,7 @@ void st_bytes(uint a, uint4 r, uint n) {
     if (s != 0u && s + 8u * n > 32u) st_part(b + 4u, m >> (32u - s), r.x >> (32u - s));
 }
 uint dst_sel(uint4 c, uint sel, bool isint) { return select(sel == 0u, 0u, select(sel == 1u, select(isint, 1u, 0x3F800000u), pick4(c, (sel - 4u) & 3u))); }
+uint fmt_sel(uint4 r, uint info, uint sel, bool isint) { return select(sel == 0u, 0u, select(sel == 1u, select(isint, 1u, 0x3F800000u), fmt_comp(r, info, (sel - 4u) & 3u))); }
 "#;
 
 /// Split wave64: whether the halves of a hardware group of `threads` meet through bounded
