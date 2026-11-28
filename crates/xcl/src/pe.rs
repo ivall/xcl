@@ -419,7 +419,10 @@ impl<'a> Pe<'a> {
             } else {
                 let hn = (v & 0x7FFF_FFFF) as u32;
                 let hint = self.u16_at(hn).ok_or(PeError::BadRva(hn))?;
-                let name = self.cstr_at(hn.wrapping_add(2)).ok_or(PeError::BadRva(hn))?;
+                // wrapping_add would turn a hint at the top of the address space into RVA 0
+                // and read the DOS header as the import name
+                let name_rva = hn.checked_add(2).ok_or(PeError::BadRva(hn))?;
+                let name = self.cstr_at(name_rva).ok_or(PeError::BadRva(hn))?;
                 ImportName::Name { hint, name }
             };
             out.push(ImportEntry { iat_rva: iat_rva.checked_add(i * 8).ok_or(PeError::BadRva(iat_rva))?, what });
@@ -666,6 +669,26 @@ mod tests {
         data[sec + 20..sec + 24].copy_from_slice(&0x200u32.to_le_bytes());
         data[0x200..].copy_from_slice(payload);
         data
+    }
+
+    #[test]
+    fn import_name_at_the_top_of_the_address_space_is_error() {
+        // Hint/name RVA 0xFFFFFFFE is inside a section there; +2 must not wrap to RVA 0
+        // (the DOS header) and be accepted as the import name.
+        let base = 0xFFFF_FF00u32;
+        let mut payload = vec![0u8; 0x100];
+        let int_rva = base + 0x40;
+        let dll_rva = base + 0x50;
+        payload[0..4].copy_from_slice(&int_rva.to_le_bytes());
+        payload[12..16].copy_from_slice(&dll_rva.to_le_bytes());
+        payload[16..20].copy_from_slice(&int_rva.to_le_bytes());
+        payload[0x40..0x48].copy_from_slice(&0xFFFF_FFFEu64.to_le_bytes());
+        payload[0x50..0x52].copy_from_slice(b"k\0");
+        payload[0xFE..0x100].copy_from_slice(&1u16.to_le_bytes());
+        let data = directory_at_rva(DIR_IMPORT, base, &payload);
+        let pe = Pe::parse(&data, Layout::File).unwrap();
+        assert_eq!(pe.u16_at(0xFFFF_FFFE), Some(1));
+        assert!(matches!(pe.imports(), Err(PeError::BadRva(_))));
     }
 
     #[test]
