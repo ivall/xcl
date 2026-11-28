@@ -26,7 +26,8 @@
 //!
 //! `XCL_GPU_WATCH=0`: no watch thread (the ring is still written, the stop file still read).
 
-use std::cell::Cell;
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -189,11 +190,63 @@ const SLOTS: usize = 64;
 static SINCE: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
 static WHAT: [AtomicU32; SLOTS] = [const { AtomicU32::new(0) }; SLOTS];
 static TID: [AtomicU32; SLOTS] = [const { AtomicU32::new(0) }; SLOTS];
-static NEXT_SLOT: AtomicUsize = AtomicUsize::new(0);
+static OWNED: AtomicU64 = AtomicU64::new(0);
+// Even: stable; odd: a writer is changing this slot. The reader may skip a changing slot,
+// but must not combine the old call's time with a new call's kind or thread ID.
+static VERSION: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
+
+fn claim_slot(owned: &AtomicU64) -> Option<usize> {
+    let mut bits = owned.load(Ordering::Relaxed);
+    loop {
+        let slot = (!bits).trailing_zeros() as usize;
+        if slot >= SLOTS {
+            return None;
+        }
+        match owned.compare_exchange_weak(bits, bits | (1u64 << slot), Ordering::Acquire, Ordering::Relaxed) {
+            Ok(_) => return Some(slot),
+            Err(current) => bits = current,
+        }
+    }
+}
+
+/// The TLS owner and an active outer call share the lease. Even if TLS is torn down first,
+/// the slot cannot be reused until the guard has cleared its call. Rc also keeps it !Send.
+struct SlotLease(usize);
+
+impl Drop for SlotLease {
+    fn drop(&mut self) {
+        let slot = self.0;
+        VERSION[slot].fetch_add(1, Ordering::SeqCst);
+        SINCE[slot].store(0, Ordering::SeqCst);
+        WHAT[slot].store(0, Ordering::SeqCst);
+        TID[slot].store(0, Ordering::SeqCst);
+        VERSION[slot].fetch_add(1, Ordering::SeqCst);
+        OWNED.fetch_and(!(1u64 << slot), Ordering::Release);
+    }
+}
+
+fn record_call(slot: usize, since: u64, call: Call, tid: u32) {
+    VERSION[slot].fetch_add(1, Ordering::SeqCst);
+    TID[slot].store(tid, Ordering::SeqCst);
+    WHAT[slot].store(call as u32, Ordering::SeqCst);
+    SINCE[slot].store(since, Ordering::SeqCst);
+    VERSION[slot].fetch_add(1, Ordering::SeqCst);
+}
+
+fn read_call(slot: usize) -> Option<(u64, u32, u32)> {
+    let version = VERSION[slot].load(Ordering::SeqCst);
+    if version & 1 != 0 {
+        return None;
+    }
+    let since = SINCE[slot].load(Ordering::SeqCst);
+    let what = WHAT[slot].load(Ordering::SeqCst);
+    let tid = TID[slot].load(Ordering::SeqCst);
+    (since != 0 && VERSION[slot].load(Ordering::SeqCst) == version).then_some((since, what, tid))
+}
 
 thread_local! {
-    /// this thread's slot (`usize::MAX`: none yet; `SLOTS`: none left)
-    static SLOT: Cell<usize> = const { Cell::new(usize::MAX) };
+    /// A failed claim stays None, so a later call can retry after another thread exits.
+    static SLOT: RefCell<Option<Rc<SlotLease>>> = const { RefCell::new(None) };
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -221,48 +274,50 @@ const SLOW_MS: u64 = 250;
 
 /// The thread is inside a driver call until this is dropped.
 pub(super) struct InDriver {
-    slot: usize,
+    slot: Option<Rc<SlotLease>>,
     since: u64,
+    call: Call,
 }
 
 /// The calling thread enters `call` (one the driver returns from at once when it works).
 pub(super) fn in_driver(call: Call) -> InDriver {
-    let slot = SLOT.with(|s| {
-        if s.get() == usize::MAX {
-            s.set(NEXT_SLOT.fetch_add(1, Ordering::Relaxed).min(SLOTS));
-            if s.get() < SLOTS {
-                TID[s.get()].store(unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() }, Ordering::Relaxed);
+    let slot = SLOT.try_with(|s| {
+        let mut owner = s.borrow_mut();
+        if owner.is_none() {
+            if let Some(slot) = claim_slot(&OWNED) {
+                *owner = Some(Rc::new(SlotLease(slot)));
             } else {
                 static SAID: AtomicBool = AtomicBool::new(false);
                 if !SAID.swap(true, Ordering::Relaxed) {
-                    crate::xlog_warn!("D3D12: {SLOTS} threads have called into the driver – the calls of further threads are not timed");
+                    crate::xlog_warn!("D3D12: {SLOTS} live threads own driver timing slots – further threads retry when a slot is released");
                 }
             }
         }
-        s.get()
-    });
+        owner.clone()
+    }).ok().flatten();
+    let Some(slot) = slot else { return InDriver { slot: None, since: 0, call } };
+    let k = slot.0;
     // (a call inside a call of the same thread is the outer one's time)
-    if slot >= SLOTS || SINCE[slot].load(Ordering::Relaxed) != 0 {
-        return InDriver { slot: SLOTS, since: 0 };
+    if SINCE[k].load(Ordering::Relaxed) != 0 {
+        return InDriver { slot: None, since: 0, call };
     }
     let since = now_ms();
-    WHAT[slot].store(call as u32, Ordering::Relaxed);
-    SINCE[slot].store(since, Ordering::Release);
-    InDriver { slot, since }
+    record_call(k, since, call, unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() });
+    InDriver { slot: Some(slot), since, call }
 }
 
 impl Drop for InDriver {
     fn drop(&mut self) {
-        if self.slot >= SLOTS {
-            return;
-        }
-        SINCE[self.slot].store(0, Ordering::Release);
+        let Some(slot) = self.slot.as_ref() else { return };
+        VERSION[slot.0].fetch_add(1, Ordering::SeqCst);
+        SINCE[slot.0].store(0, Ordering::SeqCst);
+        VERSION[slot.0].fetch_add(1, Ordering::SeqCst);
         let took = now_ms().saturating_sub(self.since);
         if took >= SLOW_MS {
             static N: AtomicU64 = AtomicU64::new(0);
             let n = N.fetch_add(1, Ordering::Relaxed) + 1;
             if n <= 16 || n.is_power_of_two() {
-                crate::xlog_warn!("D3D12: {} took {took} ms in the driver ({n} such calls so far)", call_name(WHAT[self.slot].load(Ordering::Relaxed)));
+                crate::xlog_warn!("D3D12: {} took {took} ms in the driver ({n} such calls so far)", call_name(self.call as u32));
             }
         }
     }
@@ -271,10 +326,7 @@ impl Drop for InDriver {
 /// The call that has been in the driver longest: (milliseconds, which, thread).
 fn longest_call(now: u64) -> Option<(u64, u32, u32)> {
     (0..SLOTS)
-        .filter_map(|k| {
-            let since = SINCE[k].load(Ordering::Acquire);
-            (since != 0).then(|| (now.saturating_sub(since), WHAT[k].load(Ordering::Relaxed), TID[k].load(Ordering::Relaxed)))
-        })
+        .filter_map(|k| read_call(k).map(|(since, what, tid)| (now.saturating_sub(since), what, tid)))
         .max()
 }
 
@@ -304,8 +356,7 @@ fn wait_while(hold: &AtomicBool) {
 
 /// The calling thread is inside a timed call (`in_driver`).
 fn in_timed_call() -> bool {
-    let slot = SLOT.with(|s| s.get());
-    slot < SLOTS && SINCE[slot].load(Ordering::Relaxed) != 0
+    SLOT.try_with(|s| s.borrow().as_ref().is_some_and(|slot| SINCE[slot.0].load(Ordering::Relaxed) != 0)).unwrap_or(false)
 }
 
 fn stall_ms() -> u64 {
@@ -621,6 +672,106 @@ mod tests {
         })
         .join()
         .unwrap();
+    }
+
+    #[test]
+    fn driver_timing_survives_more_than_64_exited_threads() {
+        for n in 0..SLOTS + 1 {
+            std::thread::spawn(move || {
+                let call = in_driver(Call::Execute);
+                assert!(in_timed_call(), "exited threads must return their slot, thread {n}");
+                drop(call);
+                assert!(!in_timed_call());
+            }).join().unwrap();
+        }
+    }
+
+    #[test]
+    fn exhausted_driver_slots_can_be_claimed_after_release() {
+        // Own pool: the rest of the suite can keep using the real driver-timing slots.
+        let owned = AtomicU64::new(0);
+        for k in 0..SLOTS {
+            assert_eq!(claim_slot(&owned), Some(k));
+        }
+        assert_eq!(claim_slot(&owned), None);
+        owned.fetch_and(!(1u64 << 17), Ordering::Release);
+        assert_eq!(claim_slot(&owned), Some(17));
+        assert_eq!(claim_slot(&owned), None);
+    }
+
+    #[test]
+    fn simultaneous_driver_slot_claims_are_distinct() {
+        let owned = std::sync::Arc::new(AtomicU64::new(0));
+        let start = std::sync::Arc::new(std::sync::Barrier::new(16));
+        let threads: Vec<_> = (0..16).map(|_| {
+            let (owned, start) = (owned.clone(), start.clone());
+            std::thread::spawn(move || {
+                start.wait();
+                claim_slot(&owned).expect("one slot for each claimant")
+            })
+        }).collect();
+        let mut slots: Vec<_> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+        slots.sort_unstable();
+        assert_eq!(slots, (0..16).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn an_outer_driver_guard_keeps_its_lease_after_the_tls_owner_drops() {
+        std::thread::spawn(|| {
+            let call = in_driver(Call::Execute);
+            let slot = call.slot.as_ref().expect("slot for the call").0;
+            // Models TLS destructor order: a guard in another TLS value may be dropped later.
+            SLOT.with(|owner| drop(owner.borrow_mut().take()));
+            assert_ne!(OWNED.load(Ordering::Acquire) & (1u64 << slot), 0);
+            assert_ne!(SINCE[slot].load(Ordering::Acquire), 0);
+            drop(call);
+            // Another thread may claim the slot now; the lease itself has no remaining owner.
+            assert!(SLOT.with(|owner| owner.borrow().is_none()));
+        }).join().unwrap();
+    }
+
+    #[test]
+    fn a_nested_driver_guard_does_not_end_a_later_outer_call() {
+        std::thread::spawn(|| {
+            let first = in_driver(Call::Execute);
+            let nested = in_driver(Call::Present);
+            let slot = first.slot.as_ref().expect("slot for the call").0;
+            drop(first);
+            assert!(!in_timed_call());
+            let second = in_driver(Call::Present);
+            drop(nested);
+            assert!(in_timed_call());
+            assert_eq!(WHAT[slot].load(Ordering::Acquire), Call::Present as u32);
+            drop(second);
+            assert!(!in_timed_call());
+        }).join().unwrap();
+    }
+
+    #[test]
+    fn a_driver_snapshot_never_combines_two_calls() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let lease = SlotLease(claim_slot(&OWNED).expect("slot for the writer"));
+            record_call(lease.0, 11, Call::Execute, 111);
+            tx.send(lease.0).unwrap();
+            for _ in 0..30_000 {
+                record_call(lease.0, 22, Call::Present, 222);
+                record_call(lease.0, 11, Call::Execute, 111);
+            }
+            tx.send(lease.0).unwrap();
+            done_rx.recv_timeout(Duration::from_secs(10)).expect("reader finished");
+        });
+        let slot = rx.recv_timeout(Duration::from_secs(10)).expect("writer started");
+        for _ in 0..30_000 {
+            if let Some(call) = read_call(slot) {
+                assert!(call == (11, Call::Execute as u32, 111) || call == (22, Call::Present as u32, 222), "mixed snapshot: {call:?}");
+            }
+        }
+        assert_eq!(rx.recv_timeout(Duration::from_secs(10)).expect("writer finished"), slot);
+        assert_eq!(read_call(slot), Some((11, Call::Execute as u32, 111)), "a stable call is observed");
+        done_tx.send(()).unwrap();
+        writer.join().unwrap();
     }
 
     #[test]
