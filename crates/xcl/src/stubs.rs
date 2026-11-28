@@ -80,17 +80,19 @@ pub fn new_info(dll: &str, name: &str, ret: u64) -> &'static StubInfo {
     info
 }
 
-/// Allocate `size` bytes of executable memory for generated thunks.
+/// Allocate at least `size` bytes of 16-byte-aligned executable memory for generated thunks.
+/// Panics if the size cannot be aligned or Windows cannot allocate the arena.
 pub fn alloc_code(size: usize) -> *mut u8 {
     use windows_sys::Win32::System::Memory::{VirtualAlloc, MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READWRITE};
-    let size = (size + 15) & !15;
+    let size = size.checked_add(15).expect("stub allocation size overflow") & !15;
     let mut a = ARENA.lock().unwrap();
-    if a.0 == 0 || a.0 + size > a.1 {
+    if a.0 == 0 || size > a.1 - a.0 {
+        let capacity = ARENA_CHUNK.max(size);
         let p = unsafe {
-            VirtualAlloc(std::ptr::null(), ARENA_CHUNK, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE)
+            VirtualAlloc(std::ptr::null(), capacity, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE)
         } as usize;
         assert!(p != 0, "VirtualAlloc for stub arena failed");
-        *a = (p, p + ARENA_CHUNK);
+        *a = (p, p + capacity);
     }
     let p = a.0;
     a.0 += size;
@@ -265,6 +267,31 @@ pub fn db() -> &'static StubDb {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn executable_allocations_cover_the_requested_size() {
+        use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READWRITE};
+
+        for size in [ARENA_CHUNK + 1, 1, ARENA_CHUNK * 2 + 17] {
+            let p = alloc_code(size);
+            let mut info = std::mem::MaybeUninit::<MEMORY_BASIC_INFORMATION>::zeroed();
+            assert_eq!(
+                unsafe { VirtualQuery(p.cast(), info.as_mut_ptr(), std::mem::size_of::<MEMORY_BASIC_INFORMATION>()) },
+                std::mem::size_of::<MEMORY_BASIC_INFORMATION>()
+            );
+            let info = unsafe { info.assume_init() };
+            assert_eq!(info.State, MEM_COMMIT);
+            assert_eq!(info.Protect, PAGE_EXECUTE_READWRITE);
+            let available = info.RegionSize - (p as usize - info.BaseAddress as usize);
+            assert!(available >= size, "requested {size} bytes, only {available} bytes committed");
+        }
+    }
+
+    #[test]
+    #[should_panic]
+    fn executable_allocation_rejects_size_overflow() {
+        alloc_code(usize::MAX);
+    }
 
     #[test]
     fn stub_returns_configured_value_and_counts_calls() {
