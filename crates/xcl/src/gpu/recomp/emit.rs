@@ -2518,6 +2518,23 @@ impl Em {
 
     // ---------------------------------------------------------------- images (MIMG)
 
+    /// SM 6.6 has no comparison sample with gradients. For each pixel in a quad, build a
+    /// footprint centered at its coordinate and let SampleCmp do its usual filtering.
+    /// Evaluate all four samples before selecting so the texture derivatives see the whole quad.
+    fn sample_cmp_grad(&mut self, t: &str, ty: &str, coord: &str, dx: &str, dy: &str, args: &str) -> String {
+        self.line(&format!("int2 {t}_xy = int2(xi.xcl_pos.x > QuadReadAcrossX(xi.xcl_pos.x), xi.xcl_pos.y > QuadReadAcrossY(xi.xcl_pos.y));"));
+        self.line(&format!("float4 {t}_values; [unroll] for (uint {t}_q = 0; {t}_q < 4; ++{t}_q) {{"));
+        self.line(&format!("    int2 {t}_delta = {t}_xy - int2({t}_q & 1u, {t}_q >> 1);"));
+        self.line(&format!("    {ty} {t}_p = QuadReadLaneAt({coord}, {t}_q);"));
+        self.line(&format!("    {ty} {t}_dx = QuadReadLaneAt({dx}, {t}_q), {t}_dy = QuadReadLaneAt({dy}, {t}_q);"));
+        // Keep the coordinate on each stationary axis even for a nonfinite gradient (0 * inf is NaN).
+        self.line(&format!("    {t}_p = {t}_delta.x == 0 ? {t}_p : {t}_p + {t}_delta.x * {t}_dx;"));
+        self.line(&format!("    {t}_p = {t}_delta.y == 0 ? {t}_p : {t}_p + {t}_delta.y * {t}_dy;"));
+        self.line(&format!("    {t}_values[{t}_q] = {t}_T.SampleCmp({t}_S, {args});"));
+        self.line("}");
+        format!("{t}_values[{t}_xy.x + 2 * {t}_xy.y].xxxx")
+    }
+
     /// MIMG → SM 6.6 dynamic resources. XCL image descriptors (T#, 8 dwords) keep the GFX10
     /// layout, but BASE_ADDRESS (word 0) holds the index of the SRV in the CBV/SRV/UAV heap
     /// (UAV at +1); FORMAT (word 1 [28:20]) selects the typed view (float/uint/sint).
@@ -2784,8 +2801,10 @@ impl Em {
             }
             let samp = if has_c { "SamplerComparisonState" } else { "SamplerState" };
             let gather = base.starts_with("gather4");
-            let implicit_lod = ps && !gather && !has_lz && grads.is_none() && lod.is_none();
-            let idx = if implicit_lod {
+            // Implicit derivatives, and a comparison with gradients (`sample_cmp_grad`), need every
+            // lane of the quad, including the helper lanes that EXEC leaves out without s_wqm.
+            let whole_quad = ps && !gather && !has_lz && lod.is_none() && (grads.is_none() || has_c);
+            let idx = if whole_quad {
                 self.line(&format!("uint {t}_tw0 = select({t}_ok, {tw0}, 0u);"));
                 format!("{t}_tw0")
             } else {
@@ -2821,6 +2840,21 @@ impl Em {
                     None => l,
                 };
                 match (&cmp, &grads, &lod, &bias) {
+                    (Some(z), Some((dx, dy)), _, _) if ps => {
+                        let ty = ["float", "float2", "float3"][dx.len() - 1];
+                        let vector = |v: &[String]| if v.len() == 1 { v[0].clone() } else { format!("{ty}({})", v.join(", ")) };
+                        // Array layers have no derivatives. Cube gradients are in face space:
+                        // project the footprint back to directions on the selected pixel's face.
+                        let location = match dim {
+                            3 => {
+                                let face = format!("QuadReadLaneAt({}, {t}_q)", coords[2]);
+                                format!("float4(cube_dir({t}_p.x, {t}_p.y, {face}), cube_slice({face}))")
+                            }
+                            4 | 5 => format!("float{}({t}_p, round({}))", dx.len() + 1, coords[dx.len()]),
+                            _ => format!("{t}_p"),
+                        };
+                        self.sample_cmp_grad(&t, ty, &vector(&coords[..dx.len()]), &vector(dx), &vector(dy), &tail(format!("{location}, {z}")))
+                    }
                     (Some(z), _, _, _) if has_lz || !ps => format!("float4({t}_T.SampleCmpLevelZero({t}_S, {coord}, {z}).xxxx)"),
                     (Some(z), _, _, _) => format!("float4({t}_T.SampleCmp({t}_S, {}).xxxx)", tail(format!("{coord}, {z}"))),
                     // cube maps: RDNA takes face-space 2D gradients, HLSL wants direction-space 3D
@@ -2873,7 +2907,7 @@ impl Em {
                     _ => format!("{t}_T.Sample({t}_S, {})", tail(coord.clone())),
                 }
             };
-            if implicit_lod {
+            if whole_quad {
                 self.line(&format!("uint4 {t}_r = ({t}_ok ? asuint({call}) : uint4(0u, 0u, 0u, 0u));"));
             } else {
                 self.line(&format!("{t}_r = asuint({call}); }}"));

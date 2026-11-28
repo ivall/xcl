@@ -962,7 +962,9 @@ fn draw_gs_views(
         pd.RTVFormats[0] = DXGI_FORMAT_R32G32B32A32_FLOAT;
         let pso: ID3D12PipelineState = dev.CreateGraphicsPipelineState(&pd).map_err(|x| format!("CreateGraphicsPipelineState: {x}"))?;
         let draw = Draw { sgprs: sgprs.to_vec(), scissor: [0, 0, size as i32, size as i32] };
-        draw_indexed_on(dev, &pso, &rs, vertices, stride, indices, &[draw], mem, textures, samplers, size, clear)
+        // the GPU lock is held: submit on its queue rather than creating one per draw (#350)
+        gpu.value += 1;
+        draw_indexed_on(dev, &gpu.queue, &gpu.fence, gpu.value, &pso, &rs, vertices, stride, indices, &[draw], mem, textures, samplers, size, clear)
     }
 }
 
@@ -1083,13 +1085,22 @@ pub fn draw_on_multi(
     size: u32,
     clear: [f32; 4],
 ) -> Result<Vec<[f32; 4]>, String> {
-    draw_indexed_on(dev, pso, rs, vertices, stride, &[], draws, mem, textures, samplers, size, clear)
+    unsafe {
+        let queue: ID3D12CommandQueue =
+            dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).map_err(e)?;
+        let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(e)?;
+        draw_indexed_on(dev, &queue, &fence, 1, pso, rs, vertices, stride, &[], draws, mem, textures, samplers, size, clear)
+    }
 }
 
-/// `draw_on_multi`, the draws indexed when there are `indices` (one index buffer for all).
+/// `draw_on_multi`, the draws indexed when there are `indices` (one index buffer for all),
+/// submitted on `queue` and waited for with `fence` reaching `value`.
 #[allow(clippy::too_many_arguments)]
 fn draw_indexed_on(
     dev: &ID3D12Device,
+    queue: &ID3D12CommandQueue,
+    fence: &ID3D12Fence,
+    value: u64,
     pso: &ID3D12PipelineState,
     rs: &ID3D12RootSignature,
     vertices: &[f32],
@@ -1103,10 +1114,6 @@ fn draw_indexed_on(
     clear: [f32; 4],
 ) -> Result<Vec<[f32; 4]>, String> {
     unsafe {
-        let queue: ID3D12CommandQueue =
-            dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).map_err(e)?;
-        let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(e)?;
-
         let tex = D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
             Width: size as u64,
@@ -1223,7 +1230,7 @@ fn draw_indexed_on(
         list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
         list.Close().map_err(e)?;
         queue.ExecuteCommandLists(&[Some(list.cast().map_err(e)?)]);
-        wait_for_submission(dev, &queue, &fence, 1, "draw")?;
+        wait_for_submission(dev, queue, fence, value, "draw")?;
         let mut p = std::ptr::null_mut();
         readback.Map(0, None, Some(&mut p)).map_err(e)?;
         let pitch = layout_fp.Footprint.RowPitch as usize;
