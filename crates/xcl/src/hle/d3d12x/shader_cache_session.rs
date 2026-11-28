@@ -49,6 +49,11 @@ fn disk_stores() -> &'static Mutex<HashMap<(u128, u64), Arc<Mutex<Store>>>> {
     S.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn memory_stores() -> &'static Mutex<HashMap<(u128, u64), Arc<Mutex<Store>>>> {
+    static STORES: OnceLock<Mutex<HashMap<(u128, u64), Arc<Mutex<Store>>>>> = OnceLock::new();
+    STORES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 #[repr(C)]
 struct Session {
     vtbl: *const [usize; 12],
@@ -101,9 +106,10 @@ pub(super) unsafe fn create_fallback(
         return S_FALSE;
     }
     let d = desc.read_unaligned();
-    let (store, shared_key) = if d.Mode == D3D12_SHADER_CACHE_MODE_DISK {
+    let (store, shared_key) = if d.Mode == D3D12_SHADER_CACHE_MODE_DISK || d.Mode == D3D12_SHADER_CACHE_MODE_MEMORY {
         let key = (d.Identifier.to_u128(), d.Version);
-        let mut g = disk_stores().lock().unwrap();
+        let stores = if d.Mode == D3D12_SHADER_CACHE_MODE_MEMORY { memory_stores() } else { disk_stores() };
+        let mut g = stores.lock().unwrap();
         let s = g.entry(key).or_insert_with(|| Arc::new(Mutex::new(Store::new()))).clone();
         (s, Some(key))
     } else {
@@ -151,7 +157,7 @@ unsafe extern "system" fn release(this: *mut Session) -> u32 {
     let prev = (*this).refs.fetch_sub(1, Ordering::AcqRel);
     if prev == 1 {
         let boxed = Box::from_raw(this);
-        if boxed.delete_on_destroy.load(Ordering::Acquire) {
+        if boxed.desc.Mode != D3D12_SHADER_CACHE_MODE_MEMORY && boxed.delete_on_destroy.load(Ordering::Acquire) {
             boxed.store.lock().unwrap().clear();
             if let Some(k) = boxed.shared_key {
                 disk_stores().lock().unwrap().remove(&k);
@@ -159,6 +165,16 @@ unsafe extern "system" fn release(this: *mut Session) -> u32 {
         }
         if !boxed.device.is_null() {
             drop(ID3D12Device::from_raw(boxed.device));
+        }
+        if boxed.desc.Mode == D3D12_SHADER_CACHE_MODE_MEMORY {
+            let key = (boxed.desc.Identifier.to_u128(), boxed.desc.Version);
+            let mut stores = memory_stores().lock().unwrap();
+            // Serialize this drop with opens and other closes. Only the registry owns the
+            // store after the final session closes, so a subsequent open starts empty.
+            drop(boxed.store);
+            if stores.get(&key).is_some_and(|store| Arc::strong_count(store) == 1) {
+                stores.remove(&key);
+            }
         }
         return 0;
     }
@@ -266,6 +282,45 @@ unsafe extern "system" fn get_desc(
 mod tests {
     use super::*;
     use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+
+    #[test]
+    fn memory_sessions_share_entries_until_the_last_release() {
+        unsafe {
+            let open = |id: u128| {
+                let desc = D3D12_SHADER_CACHE_SESSION_DESC {
+                    Identifier: GUID::from_u128(id),
+                    Mode: D3D12_SHADER_CACHE_MODE_MEMORY,
+                    ..Default::default()
+                };
+                let mut raw = std::ptr::null_mut();
+                assert_eq!(create_fallback(std::ptr::null_mut(), &desc, &ID3D12ShaderCacheSession::IID, &mut raw), S_OK);
+                ID3D12ShaderCacheSession::from_raw(raw)
+            };
+            let id = 0x9564ae90_1c46_424c_a49a_ed92db828d0e;
+            let first = open(id);
+            let second = open(id);
+            let other = open(id + 1);
+            let key = b"key";
+            let value = b"shared";
+            first.StoreValue(key.as_ptr().cast(), key.len() as u32, value.as_ptr().cast(), value.len() as u32).unwrap();
+            first.SetDeleteOnDestroy();
+            drop(first);
+            let duplicate = second.clone();
+            drop(second);
+
+            let mut out = [0; 6];
+            let mut size = out.len() as u32;
+            duplicate.FindValue(key.as_ptr().cast(), key.len() as u32, out.as_mut_ptr().cast(), &mut size).unwrap();
+            assert_eq!(&out, value);
+            let lookup = |session: &ID3D12ShaderCacheSession| {
+                let mut size = 0;
+                session.FindValue(key.as_ptr().cast(), key.len() as u32, std::ptr::null_mut(), &mut size)
+            };
+            assert_eq!(lookup(&other).unwrap_err().code().0, DXGI_ERROR_NOT_FOUND);
+            drop(duplicate);
+            assert_eq!(lookup(&open(id)).unwrap_err().code().0, DXGI_ERROR_NOT_FOUND);
+        }
+    }
 
     #[test]
     fn rejected_create_shader_cache_session_falls_back_to_working_in_memory_session() {
