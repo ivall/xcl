@@ -154,7 +154,10 @@ unsafe extern "system" fn release(this: *mut Session) -> u32 {
         if boxed.delete_on_destroy.load(Ordering::Acquire) {
             boxed.store.lock().unwrap().clear();
             if let Some(k) = boxed.shared_key {
-                disk_stores().lock().unwrap().remove(&k);
+                let mut g = disk_stores().lock().unwrap();
+                if g.get(&k).is_some_and(|cur| Arc::ptr_eq(cur, &boxed.store)) {
+                    g.remove(&k);
+                }
             }
         }
         if !boxed.device.is_null() {
@@ -329,6 +332,52 @@ mod tests {
             session.SetDeleteOnDestroy();
             drop(session);
             assert!(!disk_stores().lock().unwrap().contains_key(&(id.to_u128(), 7)));
+        }
+    }
+
+    #[test]
+    fn stale_delete_on_destroy_does_not_evict_newer_disk_store() {
+        unsafe {
+            let id = GUID::from_u128(0x55667788_1122_3344_aabb_ccddeeff0011);
+            let desc = D3D12_SHADER_CACHE_SESSION_DESC {
+                Identifier: id,
+                Mode: D3D12_SHADER_CACHE_MODE_DISK,
+                Flags: D3D12_SHADER_CACHE_FLAG_NONE,
+                MaximumInMemoryCacheSizeBytes: 1024,
+                MaximumInMemoryCacheEntries: 16,
+                MaximumValueFileSizeBytes: 4096,
+                Version: 3,
+            };
+            let open = || -> ID3D12ShaderCacheSession {
+                let mut raw = std::ptr::null_mut();
+                let hr = create_fallback(
+                    std::ptr::null_mut(),
+                    &desc,
+                    &ID3D12ShaderCacheSession::IID as *const GUID,
+                    &mut raw,
+                );
+                assert_eq!(hr, S_OK);
+                ID3D12ShaderCacheSession::from_raw(raw)
+            };
+
+            let s1 = open();
+            let s2 = open();
+            s1.SetDeleteOnDestroy();
+            s2.SetDeleteOnDestroy();
+            // Dropping s1 removes the shared Arc1 from disk_stores().
+            drop(s1);
+            // s3 opens a fresh Arc2 for the same (id, version) and stores a value.
+            let s3 = open();
+            s3.StoreValue(b"k".as_ptr() as *const c_void, 1, b"val".as_ptr() as *const c_void, 3).unwrap();
+            // Dropping stale s2 must NOT evict s3's newer Arc2 from disk_stores().
+            drop(s2);
+            let s4 = open();
+            let mut sz = 0u32;
+            s4.FindValue(b"k".as_ptr() as *const c_void, 1, std::ptr::null_mut(), &mut sz)
+                .expect("s2's stale SetDeleteOnDestroy must not evict s3's newer disk store");
+            assert_eq!(sz, 3);
+            s4.SetDeleteOnDestroy();
+            drop((s3, s4));
         }
     }
 }
