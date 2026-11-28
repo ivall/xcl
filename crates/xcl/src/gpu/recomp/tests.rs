@@ -3146,6 +3146,28 @@ fn gpu_image_load_reads_a_store_of_the_same_dispatch() {
     assert!(bad.is_empty(), "image_load after image_store of the same dispatch (want 1000 + lane, 1000 + (lane ^ 1)):\n{}", bad.join("\n"));
 }
 
+#[test]
+fn static_samplers_follow_writes_only_within_the_image_block() {
+    let sample = ("IMAGE_SAMPLE_LZ", "ENC_MIMG", &[("VDATA", 10), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 1), ("DIM", 1)][..], None);
+    let code = prog(&[
+        ("S_MOV_B64", "ENC_SOP1", &[("SDST", 24), ("SSRC0", 128)], None),
+        ("S_MOV_B64", "ENC_SOP1", &[("SDST", 26), ("SSRC0", 128)], None),
+        sample,
+        ("S_MOVK_I32", "ENC_SOPK", &[("SDST", 24), ("SIMM16", 1)], None),
+        sample,
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 24), ("SSRC0", 0)], None), // unknown before the next sample
+        sample,
+        ("S_MOVK_I32", "ENC_SOPK", &[("SDST", 24), ("SIMM16", 2)], None),
+        ("S_CBRANCH_SCC0", "ENC_SOPP", &[("SIMM16", 1)], None),
+        ("S_NOP", "ENC_SOPP", &[], None),
+        sample, // branch target: none of the four words are known in this block
+    ]);
+    let t = translate(&code, &Options::default()).unwrap();
+    assert!(t.complete());
+    assert_eq!(t.static_samplers, vec![([0; 4], false), ([1, 0, 0, 0], false)]);
+    assert_eq!(t.hlsl.matches("SamplerDescriptorHeap[").count(), 2);
+}
+
 /// Static samplers: the program builds two S# from constants (point / linear, clamp) – as
 /// the console compiler places a root signature's static samplers – and samples the same
 /// texel boundary with each; they become static samplers of the root signature.

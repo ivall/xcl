@@ -1550,20 +1550,33 @@ fn scalar_constant(d: &Decoded, code: u64) -> Option<u32> {
 /// samplers of a root signature: for each MIMG instruction whose four sampler SGPRs were all
 /// set by s_mov / s_movk / s_brev with constants earlier in its block, those words.
 pub(crate) fn constant_samplers(insts: &[Decoded], leaders: &BTreeSet<u64>) -> BTreeMap<u64, [u32; 4]> {
-    let mut known: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
+    let mut known = std::collections::HashMap::new();
     let mut out = BTreeMap::new();
-    for d in insts {
+    let mut pending = 0;
+    for (i, d) in insts.iter().enumerate() {
         if leaders.contains(&d.pc) {
             known.clear();
+            pending = i;
         }
-        let f = |n: &str| rdna2::field_value(d.enc, &d.words, n);
-        if d.enc.name == "ENC_MIMG" {
-            if let Some(s) = f("SSAMP").map(|v| v * rdna2::register_scale("SSAMP")) {
-                if let (Some(a), Some(b), Some(c), Some(e)) = (known.get(&s), known.get(&(s + 1)), known.get(&(s + 2)), known.get(&(s + 3))) {
-                    out.insert(d.pc, [*a, *b, *c, *e]);
-                }
+        if d.enc.name != "ENC_MIMG" {
+            continue;
+        }
+        // Only propagate writes that reach an image in this block. The image reads its
+        // descriptor before its own writes take effect for the next image.
+        update_sampler_constants(&insts[pending..i], &mut known);
+        pending = i;
+        if let Some(s) = rdna2::field_value(d.enc, &d.words, "SSAMP").map(|v| v * rdna2::register_scale("SSAMP")) {
+            if let (Some(a), Some(b), Some(c), Some(e)) = (known.get(&s), known.get(&(s + 1)), known.get(&(s + 2)), known.get(&(s + 3))) {
+                out.insert(d.pc, [*a, *b, *c, *e]);
             }
         }
+    }
+    out
+}
+
+fn update_sampler_constants(insts: &[Decoded], known: &mut std::collections::HashMap<u64, u32>) {
+    for d in insts {
+        let f = |n: &str| rdna2::field_value(d.enc, &d.words, n);
         let set: Vec<(u64, u32)> = match d.inst.name {
             "S_MOV_B32" => f("SDST").zip(f("SSRC0").and_then(|c| scalar_constant(d, c))).map(|(r, v)| vec![(r, v)]).unwrap_or_default(),
             "S_MOVK_I32" => f("SDST").zip(f("SIMM16")).map(|(r, v)| vec![(r, v as u16 as i16 as i32 as u32)]).unwrap_or_default(),
@@ -1588,7 +1601,6 @@ pub(crate) fn constant_samplers(insts: &[Decoded], leaders: &BTreeSet<u64>) -> B
             }
         }
     }
-    out
 }
 
 /// Does the program require `globallycoherent` flat memory windows (`mem`, `mem1`…)?
