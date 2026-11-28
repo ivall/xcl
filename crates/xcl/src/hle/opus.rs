@@ -508,6 +508,9 @@ pub fn parse_opus_head(data: &[u8]) -> Option<OpusHead> {
             return None;
         }
         let decoded_ch = sc as usize + cc as usize;
+        if decoded_ch > 255 {
+            return None;
+        }
         let map = data[21..len].to_vec();
         if map.iter().any(|&idx| idx != 255 && idx as usize >= decoded_ch) {
             return None;
@@ -1751,6 +1754,21 @@ pub(crate) mod tests {
         assert!(parse_packet(&[0xFB, 6, 0, 0, 0, 0, 0, 0], false).is_some());
         assert!(parse_packet(&[0xFB, 7, 0, 0, 0, 0, 0, 0, 0], false).is_none());
         assert!(parse_packet(&[0xFB, 0], false).is_none());
+    }
+
+    #[test]
+    fn opus_head_rejects_more_than_255_decoded_channels() {
+        let mut head = build_opus_head(3, 48_000, 0, 0);
+        head[18] = 255;
+        head[19] = 128;
+        head[20] = 127;
+        head[21..24].copy_from_slice(&[0, 254, 255]);
+        assert!(parse_opus_head(&head).is_some());
+        head[19] = 129;
+        assert!(parse_opus_head(&head).is_none());
+        head[19] = 255;
+        head[20] = 255;
+        assert!(parse_opus_head(&head).is_none());
     }
 
     #[test]
