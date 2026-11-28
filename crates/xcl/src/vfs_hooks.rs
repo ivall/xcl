@@ -956,9 +956,6 @@ struct MergedFind {
 
 static MERGED: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
 
-fn is_merged(h: HANDLE) -> bool {
-    MERGED.lock().ok().and_then(|g| g.as_ref().map(|s| s.contains(&(h as usize)))).unwrap_or(false)
-}
 
 fn name_of(d: &WIN32_FIND_DATAW) -> String {
     let n = d.cFileName.iter().position(|&c| c == 0).unwrap_or(d.cFileName.len());
@@ -1125,16 +1122,32 @@ unsafe extern "system" fn hk_find_first_a(n: *const u8, data: *mut WIN32_FIND_DA
     }
 }
 
-unsafe fn merged_next(h: HANDLE) -> Option<WIN32_FIND_DATAW> {
-    let m = &mut *(h as *mut MergedFind);
+fn merged_next(h: HANDLE) -> Option<Option<WIN32_FIND_DATAW>> {
+    let g = MERGED.lock().unwrap();
+    if !g.as_ref().is_some_and(|s| s.contains(&(h as usize))) {
+        return None;
+    }
+    // SAFETY: registration and close use the same lock, so this handle remains live
+    // and no other thread can mutably access it while the lock is held.
+    let m = unsafe { &mut *(h as *mut MergedFind) };
     let r = m.items.get(m.pos).copied();
-    m.pos += 1;
-    r
+    m.pos = m.pos.saturating_add(1);
+    Some(r)
+}
+
+fn close_merged(h: HANDLE) -> bool {
+    let mut g = MERGED.lock().unwrap();
+    if !g.as_mut().is_some_and(|s| s.remove(&(h as usize))) {
+        return false;
+    }
+    // SAFETY: only registered handles are freed, under the lock used by merged_next.
+    unsafe { drop(Box::from_raw(h as *mut MergedFind)) };
+    true
 }
 
 unsafe extern "system" fn hk_find_next_w(h: HANDLE, data: *mut WIN32_FIND_DATAW) -> i32 {
-    if is_merged(h) {
-        return match merged_next(h) {
+    if let Some(entry) = merged_next(h) {
+        return match entry {
             Some(d) => {
                 *data = d;
                 1
@@ -1149,8 +1162,8 @@ unsafe extern "system" fn hk_find_next_w(h: HANDLE, data: *mut WIN32_FIND_DATAW)
 }
 
 unsafe extern "system" fn hk_find_next_a(h: HANDLE, data: *mut WIN32_FIND_DATAA) -> i32 {
-    if is_merged(h) {
-        return match merged_next(h) {
+    if let Some(entry) = merged_next(h) {
+        return match entry {
             Some(d) => {
                 w_to_a(&d, data);
                 1
@@ -1165,13 +1178,7 @@ unsafe extern "system" fn hk_find_next_a(h: HANDLE, data: *mut WIN32_FIND_DATAA)
 }
 
 unsafe extern "system" fn hk_find_close(h: HANDLE) -> i32 {
-    let was = MERGED
-        .lock()
-        .ok()
-        .and_then(|mut g| g.as_mut().map(|s| s.remove(&(h as usize))))
-        .unwrap_or(false);
-    if was {
-        drop(Box::from_raw(h as *mut MergedFind));
+    if close_merged(h) {
         return 1;
     }
     orig!(O_FIND_CLOSE as FnFindClose)(h)
@@ -1236,6 +1243,48 @@ pub fn install() -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn merged_find_serializes_iteration_and_close() {
+        use super::*;
+        use std::sync::{Arc, Barrier};
+
+        let items: Vec<WIN32_FIND_DATAW> = (0..512).map(|n| {
+            let mut d: WIN32_FIND_DATAW = unsafe { std::mem::zeroed() };
+            d.dwFileAttributes = n;
+            d
+        }).collect();
+        let h = Box::into_raw(Box::new(MergedFind { items, pos: 0 })) as usize;
+        MERGED.lock().unwrap().get_or_insert_with(HashSet::new).insert(h);
+        let threads: Vec<_> = (0..8).map(|_| std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            while let Some(Some(d)) = merged_next(h as HANDLE) {
+                seen.push(d.dwFileAttributes);
+            }
+            seen
+        })).collect();
+        let mut all: Vec<u32> = threads.into_iter().flat_map(|t| t.join().unwrap()).collect();
+        all.sort_unstable();
+        assert_eq!(all, (0..512).collect::<Vec<_>>());
+        assert!(close_merged(h as HANDLE));
+        assert!(merged_next(h as HANDLE).is_none());
+        assert!(!close_merged(h as HANDLE));
+
+        for _ in 0..100 {
+            let d: WIN32_FIND_DATAW = unsafe { std::mem::zeroed() };
+            let h = Box::into_raw(Box::new(MergedFind { items: vec![d], pos: 0 })) as usize;
+            MERGED.lock().unwrap().get_or_insert_with(HashSet::new).insert(h);
+            let gate = Arc::new(Barrier::new(2));
+            let other = Arc::clone(&gate);
+            let reader = std::thread::spawn(move || {
+                other.wait();
+                merged_next(h as HANDLE)
+            });
+            gate.wait();
+            assert!(close_merged(h as HANDLE));
+            let _ = reader.join().unwrap();
+        }
+    }
+
     use super::*;
     use std::path::PathBuf;
     use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, GENERIC_WRITE};
