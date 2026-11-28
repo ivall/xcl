@@ -17,12 +17,15 @@
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicIsize, AtomicU64, Ordering};
-use std::sync::{Mutex, Once};
+use std::mem::ManuallyDrop;
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering};
+use std::sync::{mpsc, Condvar, Mutex, Once, OnceLock};
 use std::time::{Duration, Instant};
 
-use windows::core::{Interface, HSTRING, PCWSTR};
+use windows::core::{Interface, HSTRING, PCSTR, PCWSTR};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Graphics::Direct3D::{D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, ID3DBlob};
+use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
@@ -61,6 +64,55 @@ pub unsafe extern "system" fn present_x(queue: *mut c_void, plane_count: u32, pl
     0
 }
 
+const PLANE_STRIDE: usize = 0x48;
+const MAX_PLANES: usize = 8;
+
+/// Read `(resource, pSourceRect)` pairs from `PresentX`'s `D3D12XBOX_PRESENT_PLANE_PARAMETERS` array.
+unsafe fn extract_planes(plane_count: u32, planes: *const u8) -> Vec<(usize, Option<[i32; 4]>)> {
+    let mut out = Vec::new();
+    for i in 0..(plane_count as usize).min(MAX_PLANES) {
+        let plane = planes.add(i * PLANE_STRIDE);
+        if !crate::gpu::shader::readable(plane as usize, 0x18) {
+            break;
+        }
+        let count = (plane.add(8) as *const u32).read_unaligned();
+        let list = (plane.add(0x10) as *const usize).read_unaligned();
+        if count == 0 || !crate::gpu::shader::readable(list, 8) {
+            continue;
+        }
+        let res = (list as *const usize).read_unaligned();
+        if res == 0 {
+            continue;
+        }
+        let source_rect = if crate::gpu::shader::readable(plane as usize, 0x20) {
+            let rect_ptr = (plane.add(0x18) as *const usize).read_unaligned();
+            if rect_ptr != 0 && crate::gpu::shader::readable(rect_ptr, 16) {
+                Some([
+                    (rect_ptr as *const i32).read_unaligned(),
+                    ((rect_ptr + 4) as *const i32).read_unaligned(),
+                    ((rect_ptr + 8) as *const i32).read_unaligned(),
+                    ((rect_ptr + 12) as *const i32).read_unaligned(),
+                ])
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        out.push((res, source_rect));
+    }
+    out
+}
+
+fn source_uv_rect(rect: Option<[i32; 4]>, w: u32, h: u32) -> [f32; 4] {
+    if let Some([l, t, r, b]) = rect {
+        if w > 0 && h > 0 && l >= 0 && t >= 0 && r > l && b > t && r <= w as i32 && b <= h as i32 {
+            return [l as f32 / w as f32, t as f32 / h as f32, r as f32 / w as f32, b as f32 / h as f32];
+        }
+    }
+    [0.0, 0.0, 1.0, 1.0]
+}
+
 unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u8) {
     let frames = BOUNDARIES.fetch_add(1, Ordering::Relaxed) + 1;
     if frames % 300 == 0 {
@@ -80,26 +132,24 @@ unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u
         // plane over the game's): logged with the planes' raw words
         static LAST: AtomicU64 = AtomicU64::new(1);
         if LAST.swap(plane_count as u64, Ordering::Relaxed) != plane_count as u64 {
-            let n = 8 * plane_count as usize;
+            let n = (PLANE_STRIDE / 8) * plane_count as usize;
             let words: Vec<u64> = if crate::gpu::shader::readable(planes as usize, 8 * n) { (0..n).map(|k| (planes as *const u64).add(k).read_unaligned()).collect() } else { Vec::new() };
             crate::xlog_info!("D3D12.X: PresentX now with {plane_count} plane(s): {words:x?}");
         }
     }
-    let count = (planes.add(8) as *const u32).read_unaligned();
-    let list = (planes.add(0x10) as *const usize).read_unaligned();
-    if count == 0 || !crate::gpu::shader::readable(list, 8) || !enabled() {
-        return;
-    }
-    let res = (list as *const usize).read_unaligned();
-    if res == 0 {
+    let extracted = extract_planes(plane_count, planes);
+    if extracted.is_empty() || !enabled() {
         return;
     }
     {
         let mut p = PRESENTED.lock().unwrap();
-        if !p.contains(&res) {
-            p.push(res);
+        for &(res, _) in &extracted {
+            if !p.contains(&res) {
+                p.push(res);
+            }
         }
     }
+    let res = extracted[0].0;
     if trace_frame() {
         super::list_x::dump_pending_geometry();
     }
@@ -125,7 +175,7 @@ unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u
             crate::xlog_info!("frame trace: PresentX #{n} of {res:#x} {:?} – rt binds {}, UAV views {}, copy destination {}, clears {}; most used: {}", d, u[0], u[1], u[2], u[3], busiest.join("; "));
         }
     }
-    present_now(Duration::ZERO, Some((queue as usize, res)));
+    present_now(Duration::ZERO, Some((queue as usize, extracted)));
 }
 
 thread_local! {
@@ -239,12 +289,358 @@ unsafe fn backbuffer_like(res: usize) -> Option<D3D12_RESOURCE_DESC> {
     ok.then_some(d)
 }
 
-/// queues the title submitted work to (AddRef'd: they stay valid for `drain`)
-static QUEUES: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(super) struct QueueId {
+    raw: usize,
+    generation: u64,
+}
 
-/// The queues the title submitted work to.
-pub fn known_queues() -> Vec<usize> {
-    QUEUES.lock().unwrap().clone()
+impl QueueId {
+    #[allow(dead_code)] // Used by queue-cache invalidation in a later unit.
+    pub(super) fn raw(self) -> usize {
+        self.raw
+    }
+}
+
+#[derive(Clone)]
+#[allow(dead_code)] // Stage B marker: read by the retirement worker in a later unit.
+pub(super) struct QueueRetirementMark {
+    pub(super) fence: ID3D12Fence,
+    pub(super) value: u64,
+}
+
+enum Retiring<M> {
+    Preparing,
+    Mark(M),
+    Failed,
+}
+
+enum QueueState<M> {
+    Active,
+    Retiring(Retiring<M>),
+}
+
+struct QueueEntry<T, M> {
+    id: QueueId,
+    owner: T,
+    state: QueueState<M>,
+}
+
+struct OwnedQueues<T, M> {
+    entries: Vec<QueueEntry<T, M>>,
+    next_generation: u64,
+}
+
+impl<T: Clone, M> OwnedQueues<T, M> {
+    const fn new() -> Self {
+        Self { entries: Vec::new(), next_generation: 1 }
+    }
+
+    /// Add the first owner for `key`. `make` is not called for a duplicate, so no temporary
+    /// owner can be dropped while the registry lock is held.
+    fn ensure_with(&mut self, raw: usize, make: impl FnOnce() -> Option<T>) -> Option<QueueId> {
+        if self.entries.iter().any(|entry| entry.id.raw == raw) {
+            return None;
+        }
+        let owner = make()?;
+        let id = QueueId { raw, generation: self.next_generation };
+        self.next_generation = self.next_generation.wrapping_add(1).max(1);
+        self.entries.push(QueueEntry { id, owner, state: QueueState::Active });
+        Some(id)
+    }
+
+    fn snapshot(&self) -> Vec<T> {
+        self.entries.iter().map(|entry| entry.owner.clone()).collect()
+    }
+
+    fn active_snapshot(&self) -> Vec<T> {
+        self.entries
+            .iter()
+            .filter(|entry| matches!(&entry.state, QueueState::Active))
+            .map(|entry| entry.owner.clone())
+            .collect()
+    }
+
+    fn begin_retiring(&mut self, id: QueueId) -> bool {
+        let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == id) else { return false };
+        if !matches!(&entry.state, QueueState::Active) {
+            return false;
+        }
+        entry.state = QueueState::Retiring(Retiring::Preparing);
+        true
+    }
+
+    fn begin_retiring_if(&mut self, raw: usize, ready: impl FnOnce(&T) -> bool) -> Option<(QueueId, T)> {
+        let entry = self.entries.iter_mut().find(|entry| entry.id.raw == raw && matches!(&entry.state, QueueState::Active))?;
+        if !ready(&entry.owner) {
+            return None;
+        }
+        entry.state = QueueState::Retiring(Retiring::Preparing);
+        Some((entry.id, entry.owner.clone()))
+    }
+
+    fn mark_retiring(&mut self, id: QueueId, mark: M) -> Result<(), M> {
+        let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == id) else { return Err(mark) };
+        if !matches!(&entry.state, QueueState::Retiring(Retiring::Preparing)) {
+            return Err(mark);
+        }
+        entry.state = QueueState::Retiring(Retiring::Mark(mark));
+        Ok(())
+    }
+
+    fn fail_retiring(&mut self, id: QueueId) -> bool {
+        let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == id) else { return false };
+        if !matches!(&entry.state, QueueState::Retiring(Retiring::Preparing)) {
+            return false;
+        }
+        entry.state = QueueState::Retiring(Retiring::Failed);
+        true
+    }
+
+    /// Copy marks for completion checks after unlocking.
+    fn retirement_marks(&self) -> Vec<(QueueId, M)>
+    where
+        M: Clone,
+    {
+        self.entries
+            .iter()
+            .filter_map(|entry| match &entry.state {
+                QueueState::Retiring(Retiring::Mark(mark)) => Some((entry.id, mark.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Remove entries whose marks were found complete outside the registry lock, and return
+    /// their owners for release after unlocking.
+    fn sweep(&mut self, completed: &[QueueId]) -> Vec<(QueueId, T, M)> {
+        let (mut kept, mut gone) = (Vec::with_capacity(self.entries.len()), Vec::new());
+        for entry in std::mem::take(&mut self.entries) {
+            match entry {
+                QueueEntry { id, owner, state: QueueState::Retiring(Retiring::Mark(mark)) } if completed.contains(&id) => {
+                    gone.push((id, owner, mark));
+                }
+                entry => kept.push(entry),
+            }
+        }
+        self.entries = kept;
+        gone
+    }
+}
+
+/// Queues the title submitted work to. One process-lifetime owner per raw queue, as before.
+static QUEUES: Mutex<OwnedQueues<ID3D12CommandQueue, QueueRetirementMark>> = Mutex::new(OwnedQueues::new());
+static QUEUE_STATE_CHANGED: Condvar = Condvar::new();
+
+/// Keep the registry owner from queue creation onward, so non-owning users such as `KickoffX`
+/// can pin it safely even before the title's first ordinary submission.
+pub(super) unsafe fn track_queue(raw: usize) {
+    let mut queues = QUEUES.lock().unwrap();
+    let _ = queues.ensure_with(raw, || ID3D12CommandQueue::from_raw_borrowed(&(raw as *mut c_void)).cloned());
+}
+
+/// Strong snapshot of the queues the title submitted work to. Every AddRef happens while the
+/// registry is locked; callers own the returned references and drop them after the lock is gone.
+pub fn known_queues_held() -> Vec<ID3D12CommandQueue> {
+    QUEUES.lock().unwrap().snapshot()
+}
+
+/// Strong snapshot of queues which can still accept internal signals/submissions.
+pub(super) fn active_queues_held() -> Vec<ID3D12CommandQueue> {
+    QUEUES.lock().unwrap().active_snapshot()
+}
+
+pub(super) struct QueueCompletionSnapshot {
+    pub(super) active: Vec<ID3D12CommandQueue>,
+    pub(super) retiring: Vec<(ID3D12Fence, u64)>,
+    pub(super) blocked: bool,
+}
+
+/// Completion sources for work submitted before this instant. Active queue owners prevent their
+/// retirement transition until callers signal them; installed retirement marks cover queues which
+/// already transitioned. Preparing is allowed to install its mark; failed retirement has no
+/// trustworthy completion source and makes the snapshot fail-closed.
+pub(super) fn queue_completion_snapshot() -> QueueCompletionSnapshot {
+    let mut queues = QUEUES.lock().unwrap();
+    while queues.entries.iter().any(|entry| matches!(&entry.state, QueueState::Retiring(Retiring::Preparing))) {
+        queues = QUEUE_STATE_CHANGED.wait(queues).unwrap();
+    }
+    let mut out = QueueCompletionSnapshot { active: Vec::new(), retiring: Vec::new(), blocked: false };
+    for entry in &queues.entries {
+        match &entry.state {
+            QueueState::Active => out.active.push(entry.owner.clone()),
+            QueueState::Retiring(Retiring::Mark(mark)) => out.retiring.push((mark.fence.clone(), mark.value)),
+            QueueState::Retiring(Retiring::Preparing | Retiring::Failed) => out.blocked = true,
+        }
+    }
+    out
+}
+
+pub(super) fn queue_accepts_internal_work(raw: usize) -> bool {
+    QUEUES
+        .lock()
+        .unwrap()
+        .entries
+        .iter()
+        .find(|entry| entry.id.raw == raw)
+        .is_none_or(|entry| matches!(&entry.state, QueueState::Active))
+}
+
+pub(super) unsafe fn pin_queue_for_internal_work(raw: usize) -> Option<ID3D12CommandQueue> {
+    let queues = QUEUES.lock().unwrap();
+    if let Some(entry) = queues.entries.iter().find(|entry| entry.id.raw == raw) {
+        return matches!(&entry.state, QueueState::Active).then(|| entry.owner.clone());
+    }
+    ID3D12CommandQueue::from_raw_borrowed(&(raw as *mut c_void)).cloned()
+}
+
+#[allow(dead_code)] // Stage B API: wired to queue Release in a later unit.
+pub(super) unsafe fn begin_queue_retirement(raw: usize) -> Option<(QueueId, ID3D12CommandQueue)> {
+    let this = raw as *mut c_void;
+    let add_ref: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(super::real::orig_fn(this, 1));
+    let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(super::real::orig_fn(this, 2));
+    loop {
+        let mut queues = QUEUES.lock().unwrap();
+        if !queues.entries.iter().any(|entry| entry.id.raw == raw && matches!(&entry.state, QueueState::Active)) {
+            return None;
+        }
+        let refs_with_probe = add_ref(this);
+        let retirement = queues.begin_retiring_if(raw, |_| refs_with_probe == 2);
+        drop(queues);
+        let refs = release(this);
+        if retirement.is_some() || refs != 1 {
+            return retirement;
+        }
+        // The last pre-transition snapshot dropped while the probe was held; retry because its
+        // hooked Release could not observe the registry-only count hidden by our probe.
+    }
+}
+
+#[allow(dead_code)] // Stage B API: wired to queue Release in a later unit.
+pub(super) fn mark_queue_retirement(id: QueueId, mark: QueueRetirementMark) -> Result<(), QueueRetirementMark> {
+    let result = {
+        let mut queues = QUEUES.lock().unwrap();
+        queues.mark_retiring(id, mark)
+    };
+    QUEUE_STATE_CHANGED.notify_all();
+    result
+}
+
+#[allow(dead_code)] // Stage B API: wired to queue Release in a later unit.
+pub(super) fn fail_queue_retirement(id: QueueId) -> bool {
+    let failed = QUEUES.lock().unwrap().fail_retiring(id);
+    QUEUE_STATE_CHANGED.notify_all();
+    failed
+}
+
+#[allow(dead_code)] // Stage B API: completion is checked and owners are released in a later unit.
+pub(super) fn queue_retirement_marks() -> Vec<(QueueId, QueueRetirementMark)> {
+    QUEUES.lock().unwrap().retirement_marks()
+}
+
+#[allow(dead_code)] // Stage B API: returned owners must be dropped after this function unlocks.
+pub(super) fn sweep_queue_retirements(completed: &[QueueId]) -> Vec<(QueueId, ID3D12CommandQueue)> {
+    let retired = {
+        let mut queues = QUEUES.lock().unwrap();
+        queues.sweep(completed)
+    };
+    retired.into_iter().map(|(id, owner, mark)| {
+        drop(mark);
+        (id, owner)
+    }).collect()
+}
+
+fn quiesce_queue(raw: usize) {
+    super::list_x::stop_queue_submissions(raw);
+    let candidate = {
+        let mut candidate = CANDIDATE.lock().unwrap();
+        candidate.is_some_and(|(queue, _)| queue == raw).then(|| candidate.take().unwrap().1)
+    };
+    let presenter = {
+        let mut presenter = PRESENTER.lock().unwrap();
+        presenter.as_ref().is_some_and(|p| p.queue == raw).then(|| presenter.take().unwrap())
+    };
+    if let Some(resource) = candidate {
+        unsafe { release(resource) };
+    }
+    drop(presenter);
+}
+
+/// Remove every cache keyed by this queue's raw address after its retirement mark completes and
+/// before the final owner is released. No callee holds one subsystem lock while taking another.
+#[allow(dead_code)] // Stage C seam: called by the retirement worker in a later unit.
+pub(super) fn invalidate_queue_caches(id: QueueId) {
+    let raw = id.raw();
+    quiesce_queue(raw);
+    super::list_x::forget_queue(id);
+    super::alloc_pool::forget_queue(id);
+    super::cpu_writes::forget_queue(id);
+    super::late_release::forget_queue(id);
+    super::sparse::forget_queue(id);
+    super::title_textures::forget_queue(id);
+    super::vram::forget_queue(id);
+}
+
+fn retirement_worker() -> Option<&'static mpsc::Sender<()>> {
+    static WORKER: OnceLock<Option<mpsc::Sender<()>>> = OnceLock::new();
+    WORKER
+        .get_or_init(|| {
+            let (tx, rx) = mpsc::channel();
+            std::thread::Builder::new()
+                .name("xcl-queue-retirement".to_string())
+                .spawn(move || {
+                    while rx.recv().is_ok() {
+                        loop {
+                            let marks = queue_retirement_marks();
+                            if marks.is_empty() {
+                                break;
+                            }
+                            let completed: Vec<_> = marks
+                                .iter()
+                                .filter_map(|(id, mark)| (unsafe { mark.fence.GetCompletedValue() } >= mark.value).then_some(*id))
+                                .collect();
+                            drop(marks);
+                            for (id, owner) in sweep_queue_retirements(&completed) {
+                                invalidate_queue_caches(id);
+                                drop(owner);
+                            }
+                            if completed.is_empty() {
+                                std::thread::sleep(Duration::from_millis(10));
+                            }
+                        }
+                    }
+                })
+                .ok()
+                .map(|_| tx)
+        })
+        .as_ref()
+}
+
+/// The hooked Release found that only the registry owner remains. Atomically verify that fact,
+/// stop internal submissions, and place the final completion marker. Any marker failure pins the
+/// registry owner permanently, so its raw address cannot be reused with stale cache state.
+pub(super) unsafe fn retire_released_queue(raw: usize) {
+    let Some((id, queue)) = begin_queue_retirement(raw) else { return };
+    quiesce_queue(raw);
+    let mark = (|| {
+        let mut dev: Option<ID3D12Device> = None;
+        queue.GetDevice(&mut dev).ok()?;
+        let fence = dev?.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE).ok()?;
+        super::real::native_queue_signal(&queue, &fence, 1).ok()?;
+        Some(QueueRetirementMark { fence, value: 1 })
+    })();
+    let Some(mark) = mark else {
+        let _ = fail_queue_retirement(id);
+        return;
+    };
+    if let Err(mark) = mark_queue_retirement(id, mark) {
+        let _ = fail_queue_retirement(id);
+        drop(mark);
+        return;
+    }
+    if let Some(worker) = retirement_worker() {
+        let _ = worker.send(());
+    }
 }
 
 static EXECUTES: AtomicU64 = AtomicU64::new(0);
@@ -256,13 +652,7 @@ pub fn activity() -> (u64, u64) {
 
 pub unsafe fn note_execute(queue: *mut c_void, lists: &[*mut c_void]) {
     EXECUTES.fetch_add(1, Ordering::Relaxed);
-    {
-        let mut q = QUEUES.lock().unwrap();
-        if !q.contains(&(queue as usize)) {
-            add_ref(queue as usize);
-            q.push(queue as usize);
-        }
-    }
+    track_queue(queue as usize);
     super::late_release::drain_known(false);
     if !enabled() || IN_PRESENT.with(|c| c.get()) || PRESENTX.load(Ordering::Relaxed) {
         return;
@@ -307,7 +697,10 @@ pub fn on_queue_console_method(_info: &StubInfo, _caller: usize) {
 // window
 // ---------------------------------------------------------------------------------------
 
+pub(crate) mod preparation;
+
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    if let Some(result) = preparation::on_message(hwnd, msg, wp) { return result; }
     // keyboard and mouse as the gamepad: raw mouse input, the cursor held in the window
     if crate::hle::kbm::on_message(hwnd.0, msg, wp.0, lp.0) {
         return LRESULT(0);
@@ -373,10 +766,19 @@ impl FrameRate {
 
 /// While XCL compiles shaders (DXC, programs the disk cache did not have – the title draws
 /// nothing with those pipelines meanwhile: after an XCL update the screen stays black while
-/// thousands recompile), the window's title says so:
-/// "XCL – <game> | N FPS | compiling shaders: N running, M done[, Q pipelines queued][, F failed]".
-/// It stays 2 s after the last compile (compiles in the title's own calls come one by one),
-/// then only the game name and presented frame rate remain.
+/// thousands recompile) or the driver builds pipelines, the window's title says so
+/// (`compiling_text`). It stays 2 s after the last compile (compiles in the title's own calls
+/// come one by one), then only the game name and presented frame rate remain.
+/// "<title> | compiling shaders: DXC N running, M done | driver N building[ (W waiting for a
+/// slot)], D done[, Q pipelines queued][, F failed]": `dxc` (running, done), `driver` builds
+/// (running, waiting for a huge-compile slot, done; `real::driver_build_counts`).
+fn compiling_text(title: &str, (running, done): (usize, usize), (building, waiting, built): (usize, usize, usize), queued: usize, failed: usize) -> String {
+    let waiting = if waiting > 0 { format!(" ({waiting} waiting for a slot)") } else { String::new() };
+    let queued = if queued > 0 { format!(", {queued} pipelines queued") } else { String::new() };
+    let failed = if failed > 0 { format!(", {failed} failed") } else { String::new() };
+    format!("{title} | compiling shaders: DXC {running} running, {done} done | driver {building} building{waiting}, {built} done{queued}{failed}")
+}
+
 unsafe fn show_compiling(hwnd: HWND) {
     static SHOWN: Mutex<Option<String>> = Mutex::new(None);
     static LAST_ACTIVE: Mutex<Option<Instant>> = Mutex::new(None);
@@ -389,8 +791,9 @@ unsafe fn show_compiling(hwnd: HWND) {
         .get_or_insert_with(|| FrameRate::new(now, presented))
         .sample(now, presented);
     let (_, failed, queued) = super::pso_async::counts();
-    let (running, done) = crate::gpu::recomp::dxc::compile_counts();
-    let active = running > 0 || queued > 0;
+    let dxc = crate::gpu::recomp::dxc::compile_counts();
+    let driver = super::real::driver_build_counts();
+    let active = dxc.0 > 0 || driver.0 > 0 || driver.1 > 0 || queued > 0;
     let recent = {
         let mut last = LAST_ACTIVE.lock().unwrap();
         if active {
@@ -399,13 +802,7 @@ unsafe fn show_compiling(hwnd: HWND) {
         last.is_some_and(|t| t.elapsed() < Duration::from_secs(2))
     };
     let title = format!("XCL – {} | {fps:.1} FPS", window_name());
-    let text = if recent {
-        let queued = if queued > 0 { format!(", {queued} pipelines queued") } else { String::new() };
-        let failed = if failed > 0 { format!(", {failed} failed") } else { String::new() };
-        format!("{title} | compiling shaders: {running} running, {done} done{queued}{failed}")
-    } else {
-        title
-    };
+    let text = if recent { compiling_text(&title, dxc, driver, queued, failed) } else { title };
     let mut shown = SHOWN.lock().unwrap();
     if shown.as_deref() != Some(text.as_str()) {
         let _ = SetWindowTextW(hwnd, &HSTRING::from(text.as_str()));
@@ -449,10 +846,10 @@ fn window_thread() {
             crate::xlog_error!("could not create the XCL window");
             return;
         };
-        HWND_RAW.store(hwnd.0 as isize, Ordering::Release);
         crate::xlog_info!("XCL window created ({}x{})", cfg.window_width, cfg.window_height);
-        crate::hle::kbm::attach(hwnd.0);
+        if !preparation::active() { crate::hle::kbm::attach(hwnd.0); }
         SetTimer(Some(hwnd), COMPILE_TIMER, 500, None);
+        HWND_RAW.store(hwnd.0 as isize, Ordering::Release);
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
             let _ = TranslateMessage(&msg);
@@ -581,7 +978,7 @@ fn present_slot_count() -> usize {
 unsafe fn prepare_pipelined_slot(p: &mut Presenter, is_present_x: bool) -> Result<(), FenceError> {
     let (slot, wait_val, rotated) = p.ring.begin_present(p.value);
     if let Some(prev) = rotated {
-        p.slot_sources[prev] = p.copy_source.take();
+        p.slot_sources[prev] = std::mem::take(&mut p.copy_sources);
         // If frame N-1 had an XCL_FRAME_DUMP wait timeout, keep its readback buffers alive on
         // slot `prev` until that slot's fence completes (preventing GPU UAF).
         p.slot_dumps[prev] = std::mem::take(&mut p.dumps);
@@ -593,7 +990,7 @@ unsafe fn prepare_pipelined_slot(p: &mut Presenter, is_present_x: bool) -> Resul
         let timeout_ms = if is_present_x { 2000 } else { 100 };
         fence::wait(&p.fence, wait_val, &p.dev, Some(p.event), timeout_ms)?;
         p.ring.mark_slot_reusable(slot);
-        p.slot_sources[slot] = None;
+        p.slot_sources[slot].clear();
         p.slot_dumps[slot].clear();
     }
     Ok(())
@@ -602,10 +999,236 @@ unsafe fn prepare_pipelined_slot(p: &mut Presenter, is_present_x: bool) -> Resul
 fn mark_pipe_drained(p: &mut Presenter) {
     p.ring.mark_all_drained(p.value);
     for s in &mut p.slot_sources {
-        *s = None;
+        s.clear();
     }
     for d in &mut p.slot_dumps {
         d.clear();
+    }
+}
+
+fn compile_fx(src: &str, target: &str) -> Option<Vec<u8>> {
+    unsafe {
+        let mut blob: Option<ID3DBlob> = None;
+        let t = format!("{target}\0");
+        let r = D3DCompile(
+            src.as_ptr() as *const c_void,
+            src.len(),
+            PCSTR::null(),
+            None,
+            None,
+            PCSTR(b"main\0".as_ptr()),
+            PCSTR(t.as_ptr()),
+            0,
+            0,
+            &mut blob,
+            None,
+        );
+        match (r, blob) {
+            (Ok(()), Some(b)) => Some(std::slice::from_raw_parts(b.GetBufferPointer() as *const u8, b.GetBufferSize()).to_vec()),
+            _ => None,
+        }
+    }
+}
+
+fn compositor_shaders() -> Option<&'static (Vec<u8>, Vec<u8>)> {
+    static S: OnceLock<Option<(Vec<u8>, Vec<u8>)>> = OnceLock::new();
+    S.get_or_init(|| {
+        let vs = compile_fx(
+            "cbuffer Rect : register(b0) { float4 uv_rect; };\n\
+             struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };\n\
+             VSOut main(uint id : SV_VertexID) {\n\
+                 float2 p = float2((id & 1) ? 3.0 : -1.0, (id & 2) ? -3.0 : 1.0);\n\
+                 float2 t = float2((id & 1) ? 2.0 : 0.0, (id & 2) ? 2.0 : 0.0);\n\
+                 VSOut o;\n\
+                 o.pos = float4(p, 0.0, 1.0);\n\
+                 o.uv = lerp(uv_rect.xy, uv_rect.zw, t);\n\
+                 return o;\n\
+             }",
+            "vs_5_0",
+        )?;
+        let ps = compile_fx(
+            "Texture2D tex : register(t0);\n\
+             SamplerState smp : register(s0);\n\
+             float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {\n\
+                 return tex.Sample(smp, uv);\n\
+             }",
+            "ps_5_0",
+        )?;
+        Some((vs, ps))
+    })
+    .as_ref()
+}
+
+struct Compositor {
+    root_sig: ID3D12RootSignature,
+    psos: HashMap<i32, (ID3D12PipelineState, ID3D12PipelineState)>,
+    rtv_heap: ID3D12DescriptorHeap,
+    srv_heap: ID3D12DescriptorHeap,
+    srv_inc: u32,
+}
+
+impl Compositor {
+    unsafe fn new(dev: &ID3D12Device) -> Option<Self> {
+        let range = D3D12_DESCRIPTOR_RANGE {
+            RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+            NumDescriptors: 1,
+            BaseShaderRegister: 0,
+            RegisterSpace: 0,
+            OffsetInDescriptorsFromTableStart: 0,
+        };
+        let params = [
+            D3D12_ROOT_PARAMETER {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+                Anonymous: D3D12_ROOT_PARAMETER_0 {
+                    Constants: D3D12_ROOT_CONSTANTS { ShaderRegister: 0, RegisterSpace: 0, Num32BitValues: 4 },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_VERTEX,
+            },
+            D3D12_ROOT_PARAMETER {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+                Anonymous: D3D12_ROOT_PARAMETER_0 {
+                    DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE { NumDescriptorRanges: 1, pDescriptorRanges: &range },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
+            },
+        ];
+        let sampler = D3D12_STATIC_SAMPLER_DESC {
+            Filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+            AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+            AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+            AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+            MaxLOD: f32::MAX,
+            ShaderRegister: 0,
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
+            ..Default::default()
+        };
+        let rs_desc = D3D12_ROOT_SIGNATURE_DESC {
+            NumParameters: params.len() as u32,
+            pParameters: params.as_ptr(),
+            NumStaticSamplers: 1,
+            pStaticSamplers: &sampler,
+            Flags: D3D12_ROOT_SIGNATURE_FLAG_NONE,
+        };
+        let mut ser: Option<ID3DBlob> = None;
+        D3D12SerializeRootSignature(&rs_desc, D3D_ROOT_SIGNATURE_VERSION_1, &mut ser, None).ok()?;
+        let ser = ser?;
+        let root_sig: ID3D12RootSignature = dev
+            .CreateRootSignature(0, std::slice::from_raw_parts(ser.GetBufferPointer() as *const u8, ser.GetBufferSize()))
+            .ok()?;
+        let rtv_heap: ID3D12DescriptorHeap = dev
+            .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC { Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV, NumDescriptors: 1, ..Default::default() })
+            .ok()?;
+        let srv_heap: ID3D12DescriptorHeap = dev
+            .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                // a set per present in flight: the GPU still reads the last one's
+                NumDescriptors: (MAX_PLANES * PRESENT_SLOTS) as u32,
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                ..Default::default()
+            })
+            .ok()?;
+        let srv_inc = dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        Some(Self { root_sig, psos: HashMap::new(), rtv_heap, srv_heap, srv_inc })
+    }
+
+    unsafe fn psos_for(&mut self, dev: &ID3D12Device, fmt: DXGI_FORMAT) -> Option<(ID3D12PipelineState, ID3D12PipelineState)> {
+        if let Some(pair) = self.psos.get(&fmt.0) {
+            return Some(pair.clone());
+        }
+        let (vs, ps) = compositor_shaders()?;
+        let make_pso = |blend: bool| -> Option<ID3D12PipelineState> {
+            let mut pd = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+                pRootSignature: ManuallyDrop::new(Some(self.root_sig.clone())),
+                VS: D3D12_SHADER_BYTECODE { pShaderBytecode: vs.as_ptr() as _, BytecodeLength: vs.len() },
+                PS: D3D12_SHADER_BYTECODE { pShaderBytecode: ps.as_ptr() as _, BytecodeLength: ps.len() },
+                SampleMask: u32::MAX,
+                PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+                NumRenderTargets: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                ..Default::default()
+            };
+            pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+            pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+            pd.RasterizerState.DepthClipEnable = false.into();
+            pd.DepthStencilState.DepthEnable = false.into();
+            pd.DepthStencilState.StencilEnable = false.into();
+            pd.RTVFormats[0] = fmt;
+            let rt = &mut pd.BlendState.RenderTarget[0];
+            rt.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8;
+            if blend {
+                rt.BlendEnable = true.into();
+                rt.SrcBlend = D3D12_BLEND_ONE;
+                rt.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+                rt.BlendOp = D3D12_BLEND_OP_ADD;
+                rt.SrcBlendAlpha = D3D12_BLEND_ONE;
+                rt.DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
+                rt.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+            } else {
+                rt.BlendEnable = false.into();
+            }
+            dev.CreateGraphicsPipelineState(&pd).ok()
+        };
+        let pair = (make_pso(false)?, make_pso(true)?);
+        self.psos.insert(fmt.0, pair.clone());
+        Some(pair)
+    }
+
+    unsafe fn record(
+        &mut self,
+        dev: &ID3D12Device,
+        list: &ID3D12GraphicsCommandList,
+        dst: &ID3D12Resource,
+        dst_w: u32,
+        dst_h: u32,
+        dst_fmt: DXGI_FORMAT,
+        planes: &[(ID3D12Resource, D3D12_RESOURCE_DESC, [f32; 4])],
+        slot: usize,
+    ) -> bool {
+        let first = slot % PRESENT_SLOTS * MAX_PLANES;
+        let Some((opaque_pso, blend_pso)) = self.psos_for(dev, dst_fmt) else { return false };
+        let rtv_cpu = self.rtv_heap.GetCPUDescriptorHandleForHeapStart();
+        let rtv_desc = D3D12_RENDER_TARGET_VIEW_DESC {
+            Format: dst_fmt,
+            ViewDimension: D3D12_RTV_DIMENSION_TEXTURE2D,
+            ..Default::default()
+        };
+        dev.CreateRenderTargetView(dst, Some(&rtv_desc), rtv_cpu);
+        let srv_cpu_base = self.srv_heap.GetCPUDescriptorHandleForHeapStart();
+        for (i, (res, desc, _)) in planes.iter().take(MAX_PLANES).enumerate() {
+            let mut srv_cpu = srv_cpu_base;
+            srv_cpu.ptr += (first + i) * self.srv_inc as usize;
+            let mut srv_desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: swap_format(desc.Format).unwrap_or(desc.Format),
+                ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                ..Default::default()
+            };
+            srv_desc.Anonymous.Texture2D.MipLevels = 1;
+            dev.CreateShaderResourceView(res, Some(&srv_desc), srv_cpu);
+        }
+        list.OMSetRenderTargets(1, Some(&rtv_cpu), false, None);
+        list.RSSetViewports(&[D3D12_VIEWPORT {
+            TopLeftX: 0.0,
+            TopLeftY: 0.0,
+            Width: dst_w as f32,
+            Height: dst_h as f32,
+            MinDepth: 0.0,
+            MaxDepth: 1.0,
+        }]);
+        list.RSSetScissorRects(&[RECT { left: 0, top: 0, right: dst_w as i32, bottom: dst_h as i32 }]);
+        list.SetGraphicsRootSignature(&self.root_sig);
+        list.SetDescriptorHeaps(&[Some(self.srv_heap.clone())]);
+        list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        let srv_gpu_base = self.srv_heap.GetGPUDescriptorHandleForHeapStart();
+        for (i, (_, _, uv_rect)) in planes.iter().take(MAX_PLANES).enumerate() {
+            list.SetPipelineState(if i == 0 { &opaque_pso } else { &blend_pso });
+            list.SetGraphicsRoot32BitConstants(0, 4, uv_rect.as_ptr() as *const c_void, 0);
+            let mut gpu = srv_gpu_base;
+            gpu.ptr += ((first + i) as u64) * (self.srv_inc as u64);
+            list.SetGraphicsRootDescriptorTable(1, gpu);
+            list.DrawInstanced(3, 1, 0, 0);
+        }
+        true
     }
 }
 
@@ -619,11 +1242,12 @@ struct Presenter {
     alloc: ID3D12CommandAllocator,
     spare_alloc: Option<ID3D12CommandAllocator>,
     ring: PresentRing,
-    slot_sources: Vec<Option<ID3D12Resource>>,
+    slot_sources: Vec<Vec<ID3D12Resource>>,
     slot_dumps: Vec<Vec<FrameDump>>,
     list: ID3D12GraphicsCommandList,
     fence: ID3D12Fence,
-    copy_source: Option<ID3D12Resource>,
+    copy_sources: Vec<ID3D12Resource>,
+    compositor: Option<Compositor>,
     dumps: Vec<FrameDump>,
     disabled: bool,
     value: u64,
@@ -675,9 +1299,9 @@ unsafe fn new_presenter(queue: usize) -> Option<Presenter> {
     Some(Presenter {
         queue, dev: dev.clone(), sc: None, w: 0, h: 0, fmt: DXGI_FORMAT_UNKNOWN,
         alloc, spare_alloc, ring: PresentRing::new(actual_slots),
-        slot_sources: vec![None; actual_slots], slot_dumps: (0..actual_slots).map(|_| Vec::new()).collect(),
+        slot_sources: vec![Vec::new(); actual_slots], slot_dumps: (0..actual_slots).map(|_| Vec::new()).collect(),
         list, fence,
-        copy_source: None, dumps: Vec::new(), disabled: false, value: 0, event,
+        copy_sources: Vec::new(), compositor: None, dumps: Vec::new(), disabled: false, value: 0, event,
         last: Instant::now() - Duration::from_secs(1),
     })
 }
@@ -728,6 +1352,7 @@ unsafe fn ensure_swapchain(p: &mut Presenter, hwnd: HWND, w: u32, h: u32, fmt: D
             p.h = h;
             p.fmt = fmt;
             crate::xlog_info!("present: swap chain {w}x{h} {:?} – the game image will appear in the XCL window", fmt);
+            crate::xlog_info!("present: swap chain window {:#x}", hwnd.0 as usize);
             p.sc.is_some()
         }
         Err(e) => {
@@ -737,7 +1362,7 @@ unsafe fn ensure_swapchain(p: &mut Presenter, hwnd: HWND, w: u32, h: u32, fmt: D
     }
 }
 
-unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
+unsafe fn present_now(min_interval: Duration, frame: Option<(usize, Vec<(usize, Option<[i32; 4]>)>)>) {
     if IN_PRESENT.with(|c| c.replace(true)) {
         return;
     }
@@ -748,10 +1373,9 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
         }
     }
     let _reset = Reset;
-    let (queue, src, mut guard) = if let Some((queue, res)) = frame {
-        let raw = res as *mut c_void;
-        let Some(src) = ID3D12Resource::from_raw_borrowed(&raw) else { return };
-        (queue, src.clone(), PRESENTER.lock().unwrap())
+    let is_frame = frame.is_some();
+    let (queue, raw_planes, mut guard) = if let Some((queue, planes)) = frame {
+        (queue, planes, PRESENTER.lock().unwrap())
     } else {
         let Ok(guard) = PRESENTER.try_lock() else { return };
         if PRESENTX.load(Ordering::Relaxed) {
@@ -759,14 +1383,26 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
         }
         let candidate = CANDIDATE.lock().unwrap();
         let Some((queue, res)) = *candidate else { return };
-        let raw = res as *mut c_void;
-        let Some(src) = ID3D12Resource::from_raw_borrowed(&raw) else { return };
-        (queue, src.clone(), guard)
+        (queue, vec![(res, None)], guard)
     };
+    let Some(_queue_pin) = pin_queue_for_internal_work(queue) else { return };
+    let resolved: Vec<(ID3D12Resource, D3D12_RESOURCE_DESC, [f32; 4])> = raw_planes
+        .into_iter()
+        .filter_map(|(res, rect)| {
+            let desc = backbuffer_like(res)?;
+            let raw = res as *mut c_void;
+            let r = ID3D12Resource::from_raw_borrowed(&raw)?.clone();
+            let uv = source_uv_rect(rect, desc.Width as u32, desc.Height);
+            Some((r, desc, uv))
+        })
+        .collect();
+    if resolved.is_empty() {
+        return;
+    }
     // PresentX on another queue than the presenter was made for (the fallback presented once from
     // a queue before the title's first PresentX, issue #103): the swap chain belongs to a queue –
     // a new presenter for the title's present queue, after the old one's copy is done
-    if frame.is_some() && guard.as_ref().is_some_and(|p| p.queue != queue) {
+    if is_frame && guard.as_ref().is_some_and(|p| p.queue != queue) {
         if let Some(old) = guard.as_ref() {
             let _ = fence::wait(&old.fence, old.value, &old.dev, Some(old.event), 1000);
         }
@@ -780,23 +1416,29 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
     if p.disabled || p.last.elapsed() < min_interval {
         return;
     }
-    let Some(desc) = backbuffer_like(src.as_raw() as usize) else { return };
-    let Some(fmt) = swap_format(desc.Format) else { return };
+    let (w, h) = if resolved.len() == 1 {
+        (resolved[0].1.Width as u32, resolved[0].1.Height)
+    } else {
+        let mw = resolved.iter().map(|(_, d, _)| d.Width as u32).max().unwrap_or(0);
+        let mh = resolved.iter().map(|(_, d, _)| d.Height).max().unwrap_or(0);
+        (mw, mh)
+    };
+    let Some(fmt) = swap_format(resolved[0].1.Format) else { return };
     let Some(hwnd) = ensure_window() else { return };
     if p.queue != queue {
         return; // swap chain is bound to the first queue we presented from
     }
     // rotate to the oldest in-flight allocator slot and wait only for its fence (frame N-2)
-    if let Err(e) = prepare_pipelined_slot(p, frame.is_some()) {
+    if let Err(e) = prepare_pipelined_slot(p, is_frame) {
         p.disabled = matches!(&e, FenceError::Removed(_));
         if !matches!(&e, FenceError::Timeout(_)) {
             crate::xlog_error!("present: previous copy: {e}");
         }
         return;
     }
-    p.copy_source = None;
+    p.copy_sources.clear();
     p.dumps.clear();
-    if !ensure_swapchain(p, hwnd, desc.Width as u32, desc.Height, fmt) {
+    if !ensure_swapchain(p, hwnd, w, h, fmt) {
         return;
     }
     let Some(sc) = p.sc.clone() else { return };
@@ -804,15 +1446,77 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
     if p.alloc.Reset().is_err() || p.list.Reset(&p.alloc, None).is_err() {
         return;
     }
-    let b1 = [transition(&bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST)];
-    p.list.ResourceBarrier(&b1);
-    p.list.CopyResource(&bb, &src);
     let due = frame_dump_due();
     let mut dumps = Vec::new();
-    if due {
-        if let Some((buffer, footprint)) = readback_copy(&p.list, &src, &desc) {
-            dumps.push(FrameDump { _source: src.clone(), buffer, footprint, format: desc.Format, tag: "frame".into() });
+    let mut composited = false;
+    if resolved.len() > 1 {
+        if p.compositor.is_none() {
+            p.compositor = Compositor::new(&p.dev);
         }
+        if let Some(comp) = p.compositor.as_mut() {
+            static LOGGED: AtomicBool = AtomicBool::new(false);
+            if !LOGGED.swap(true, Ordering::Relaxed) {
+                let info: Vec<String> = resolved
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (_, d, uv))| format!("plane {i}: {}x{} {:?} uv {uv:?}", d.Width, d.Height, d.Format))
+                    .collect();
+                crate::xlog_info!("present: compositing {} planes into {w}x{h} {:?} ({})", resolved.len(), fmt, info.join(", "));
+            }
+            p.list.ResourceBarrier(&[transition(&bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET)]);
+            if comp.record(&p.dev, &p.list, &bb, w, h, fmt, &resolved, p.ring.cur) {
+                if due {
+                    p.list.ResourceBarrier(&[transition(&bb, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                    let bb_desc = bb.GetDesc();
+                    if let Some((buffer, footprint)) = readback_copy(&p.list, &bb, &bb_desc) {
+                        dumps.push(FrameDump { _source: bb.clone(), buffer, footprint, format: bb_desc.Format, tag: "frame".into() });
+                    }
+                    p.list.ResourceBarrier(&[transition(&bb, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PRESENT)]);
+                } else {
+                    p.list.ResourceBarrier(&[transition(&bb, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT)]);
+                }
+                composited = true;
+            } else {
+                p.list.ResourceBarrier(&[transition(&bb, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT)]);
+            }
+        } else {
+            static WARNED: AtomicBool = AtomicBool::new(false);
+            if !WARNED.swap(true, Ordering::Relaxed) {
+                crate::xlog_warn!("present: compositor unavailable – falling back to plane 0");
+            }
+        }
+    }
+    if !composited {
+        let (src, desc, _) = &resolved[0];
+        let b1 = [transition(&bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST)];
+        p.list.ResourceBarrier(&b1);
+        if desc.Width as u32 == p.w && desc.Height == p.h {
+            p.list.CopyResource(&bb, src);
+        } else if desc.Width > 0 && desc.Height > 0 && p.w > 0 && p.h > 0 {
+            let cw = (desc.Width as u32).min(p.w);
+            let ch = desc.Height.min(p.h);
+            let dst = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: ManuallyDrop::new(Some(bb.clone())),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+            };
+            let src_loc = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: ManuallyDrop::new(Some(src.clone())),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+            };
+            let box_ = D3D12_BOX { left: 0, top: 0, front: 0, right: cw, bottom: ch, back: 1 };
+            p.list.CopyTextureRegion(&dst, 0, 0, 0, &src_loc, Some(&box_));
+            let _ = ManuallyDrop::into_inner(dst.pResource);
+            let _ = ManuallyDrop::into_inner(src_loc.pResource);
+        }
+        if due {
+            if let Some((buffer, footprint)) = readback_copy(&p.list, src, desc) {
+                dumps.push(FrameDump { _source: src.clone(), buffer, footprint, format: desc.Format, tag: "frame".into() });
+            }
+        }
+        let b2 = [transition(&bb, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT)];
+        p.list.ResourceBarrier(&b2);
     }
     // with `XCL_TRACE_FRAME`: also the render target the title binds most (its scene / UI)
     // (and the targets the watched one's contents went on to: rt_<n>_<k>)
@@ -837,26 +1541,28 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
             dumps.push(FrameDump { _source: res, buffer, footprint, format, tag });
         }
     }
-    let b2 = [transition(&bb, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT)];
-    p.list.ResourceBarrier(&b2);
     if p.list.Close().is_err() {
         return;
     }
     let qraw = queue as *mut c_void;
     let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&qraw) else { return };
     let Ok(cl) = p.list.cast::<ID3D12CommandList>() else { return };
-    q.ExecuteCommandLists(&[Some(cl)]);
-    p.copy_source = Some(src);
+    super::real::native_queue_execute(q, &cl);
+    p.copy_sources = resolved.into_iter().map(|(r, _, _)| r).collect();
     p.dumps = dumps;
     p.value += 1;
-    if let Err(e) = q.Signal(&p.fence, p.value) {
+    if let Err(e) = super::real::native_queue_signal(q, &p.fence, p.value) {
         // The copy is already submitted. Without its signal, keep its resources and allocator.
         p.disabled = true;
         let e = fence::api_error(&p.dev, "Signal", e);
         crate::xlog_error!("present: submit copy: {e}");
         return;
     }
-    if let Err(e) = sc.Present(0, DXGI_PRESENT(0)).ok() {
+    let presented = {
+        let _stall = crate::stall::span(crate::stall::StallKind::Present);
+        sc.Present(0, DXGI_PRESENT(0)).ok()
+    };
+    if let Err(e) = presented {
         let e = fence::api_error(&p.dev, "Present", e);
         p.disabled = matches!(&e, FenceError::Removed(_));
         crate::xlog_error!("present: {e}");
@@ -870,7 +1576,7 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
                     write_frame(&dump.buffer, &dump.footprint, dump.format, &dump.tag);
                 }
                 mark_pipe_drained(p);
-                p.copy_source = None;
+                p.copy_sources.clear();
             }
             Err(e) => {
                 p.disabled = matches!(&e, FenceError::Removed(_));
@@ -883,7 +1589,7 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
     }
     let n = PRESENTS.fetch_add(1, Ordering::Relaxed);
     if n == 0 {
-        crate::xlog_info!("present: first game frame shown ({}x{})", desc.Width, desc.Height);
+        crate::xlog_info!("present: first game frame shown ({w}x{h})");
     }
 }
 
@@ -1121,6 +1827,115 @@ mod tests {
     use super::*;
 
     #[test]
+    fn owned_queue_registry_deduplicates_without_making_a_temporary_owner() {
+        let mut registry: OwnedQueues<std::sync::Arc<i32>, ()> = OwnedQueues::new();
+        assert!(registry.ensure_with(0xA, || Some(std::sync::Arc::new(1))).is_some());
+        assert!(registry.ensure_with(0xA, || -> Option<std::sync::Arc<i32>> { panic!("duplicate owner was made") }).is_none());
+        assert!(registry.ensure_with(0xB, || Some(std::sync::Arc::new(2))).is_some());
+        let values: Vec<_> = registry.snapshot().iter().map(|v| **v).collect();
+        assert_eq!(values, [1, 2]);
+    }
+
+    #[test]
+    fn owned_queue_snapshot_has_its_own_lifetime() {
+        let owner = std::sync::Arc::new(());
+        let weak = std::sync::Arc::downgrade(&owner);
+        let mut registry: OwnedQueues<std::sync::Arc<()>, ()> = OwnedQueues::new();
+        assert!(registry.ensure_with(0xA, || Some(owner)).is_some());
+        let snapshot = registry.snapshot();
+        drop(registry);
+        assert!(weak.upgrade().is_some(), "the snapshot did not keep its owner alive");
+        drop(snapshot);
+        assert!(weak.upgrade().is_none(), "the caller did not release its snapshot owner");
+    }
+
+    #[test]
+    fn retiring_queue_stays_in_snapshots_until_its_mark_completes() {
+        let mut registry: OwnedQueues<std::sync::Arc<i32>, u64> = OwnedQueues::new();
+        let owner = std::sync::Arc::new(1);
+        let weak = std::sync::Arc::downgrade(&owner);
+        let id = registry.ensure_with(0xA, || Some(owner)).unwrap();
+        assert!(registry.begin_retiring(id));
+        assert_eq!(registry.snapshot().iter().map(|v| **v).collect::<Vec<_>>(), [1]);
+        assert!(registry.retirement_marks().is_empty());
+        assert!(registry.sweep(&[id]).is_empty(), "Preparing must remain pinned");
+        assert!(registry.mark_retiring(id, 7).is_ok());
+        assert_eq!(registry.retirement_marks(), [(id, 7)]);
+        assert!(registry.sweep(&[]).is_empty());
+        assert_eq!(registry.snapshot().iter().map(|v| **v).collect::<Vec<_>>(), [1]);
+        let gone = registry.sweep(&[id]);
+        assert_eq!(gone.iter().map(|(gone_id, owner, mark)| (*gone_id, **owner, *mark)).collect::<Vec<_>>(), [(id, 1, 7)]);
+        assert!(registry.snapshot().is_empty());
+        assert!(weak.upgrade().is_some(), "sweep dropped an owner instead of returning it");
+        drop(gone);
+        assert!(weak.upgrade().is_none(), "the returned owner was not released by its caller");
+    }
+
+    #[test]
+    fn failed_retirement_is_permanently_pinned() {
+        let mut registry: OwnedQueues<std::sync::Arc<i32>, u64> = OwnedQueues::new();
+        let id = registry.ensure_with(0xA, || Some(std::sync::Arc::new(1))).unwrap();
+        assert!(registry.begin_retiring(id));
+        assert!(registry.fail_retiring(id));
+        assert_eq!(registry.mark_retiring(id, 1), Err(1), "an uninstalled mark must be returned");
+        assert!(!registry.begin_retiring(id));
+        assert!(registry.retirement_marks().is_empty());
+        assert!(registry.sweep(&[id]).is_empty());
+        assert_eq!(registry.snapshot().iter().map(|v| **v).collect::<Vec<_>>(), [1]);
+    }
+
+    #[test]
+    fn reused_raw_queue_gets_a_new_generation() {
+        let mut registry: OwnedQueues<std::sync::Arc<i32>, u64> = OwnedQueues::new();
+        let old = registry.ensure_with(0xA, || Some(std::sync::Arc::new(1))).unwrap();
+        assert!(registry.begin_retiring(old));
+        assert!(registry.mark_retiring(old, 1).is_ok());
+        drop(registry.sweep(&[old]));
+        let new = registry.ensure_with(0xA, || Some(std::sync::Arc::new(2))).unwrap();
+        assert_ne!(old, new);
+        assert!(!registry.begin_retiring(old), "a stale generation matched the reused address");
+        assert!(registry.begin_retiring(new));
+    }
+
+    #[test]
+    fn held_submission_snapshot_delays_atomic_retirement() {
+        let mut registry: OwnedQueues<std::sync::Arc<i32>, u64> = OwnedQueues::new();
+        let id = registry.ensure_with(0xA, || Some(std::sync::Arc::new(1))).unwrap();
+        let held = registry.active_snapshot();
+        assert!(registry.begin_retiring_if(0xA, |owner| std::sync::Arc::strong_count(owner) == 1).is_none());
+        assert_eq!(registry.active_snapshot().len(), 1, "failed preflight changed Active state");
+        drop(held);
+        let (retiring, token) = registry
+            .begin_retiring_if(0xA, |owner| std::sync::Arc::strong_count(owner) == 1)
+            .expect("registry became sole owner");
+        assert_eq!(retiring, id);
+        assert_eq!(*token, 1);
+    }
+
+    #[test]
+    fn preparing_queue_is_visible_but_cannot_repopulate_submission_cache() {
+        let mut registry: OwnedQueues<std::sync::Arc<i32>, u64> = OwnedQueues::new();
+        registry.ensure_with(0xA, || Some(std::sync::Arc::new(1))).unwrap();
+        let (_, token) = registry.begin_retiring_if(0xA, |_| true).unwrap();
+        assert_eq!(registry.snapshot().len(), 1, "retirement lost its diagnostic owner");
+        assert!(registry.active_snapshot().is_empty(), "a post-transition producer acquired the queue");
+        let mut cache = vec![0xA];
+        cache.clear();
+        cache.extend(registry.active_snapshot().into_iter().map(|_| 0xA));
+        assert!(cache.is_empty(), "an inactive producer repopulated invalidated state");
+        drop(token);
+    }
+
+    #[test]
+    fn the_title_counts_dxc_compiles_and_driver_builds() {
+        assert_eq!(
+            compiling_text("XCL – t | 30.0 FPS", (0, 12), (2, 1, 40), 5, 0),
+            "XCL – t | 30.0 FPS | compiling shaders: DXC 0 running, 12 done | driver 2 building (1 waiting for a slot), 40 done, 5 pipelines queued"
+        );
+        assert_eq!(compiling_text("t", (3, 4), (0, 0, 0), 0, 1), "t | compiling shaders: DXC 3 running, 4 done | driver 0 building, 0 done, 1 failed");
+    }
+
+    #[test]
     fn present_ring_overlaps_previous_frame_and_drains_cleanly() {
         let mut ring = PresentRing::new(PRESENT_SLOTS);
         // Frame 1 (p.value == 0) -> slot 0, no wait, no rotation.
@@ -1221,6 +2036,27 @@ mod tests {
             std::env::remove_var("XCL_WINDOW_POS");
         }
     }
+
+    #[test]
+    fn parse_present_planes_and_uv_rects() {
+        let mut rect0 = [160i32, 90, 800, 450];
+        let mut res0: usize = 0x1111_0000;
+        let mut res1: usize = 0x2222_0000;
+        let mut buf = [0u8; 2 * PLANE_STRIDE];
+        let write_u64 = |b: &mut [u8], off: usize, v: u64| b[off..off + 8].copy_from_slice(&v.to_le_bytes());
+        write_u64(&mut buf, 0x08, 1);
+        write_u64(&mut buf, 0x10, (&mut res0 as *mut usize) as u64);
+        write_u64(&mut buf, 0x18, rect0.as_mut_ptr() as u64);
+        write_u64(&mut buf, PLANE_STRIDE + 0x08, 1);
+        write_u64(&mut buf, PLANE_STRIDE + 0x10, (&mut res1 as *mut usize) as u64);
+        write_u64(&mut buf, PLANE_STRIDE + 0x18, 0);
+
+        let got = unsafe { extract_planes(2, buf.as_ptr()) };
+        assert_eq!(got, vec![(res0, Some(rect0)), (res1, None)]);
+        assert_eq!(source_uv_rect(got[0].1, 1600, 900), [0.1, 0.1, 0.5, 0.5]);
+        assert_eq!(source_uv_rect(got[1].1, 3840, 2160), [0.0, 0.0, 1.0, 1.0]);
+        assert_eq!(source_uv_rect(Some([0, 0, 4000, 900]), 1920, 1080), [0.0, 0.0, 1.0, 1.0]);
+    }
 }
 
 #[cfg(test)]
@@ -1246,7 +2082,13 @@ mod frame_dump_tests {
             // WARP needs no physical GPU. Fill a CPU-visible buffer with the same padded
             // footprint used by a readback, so this exercises write_frame's actual decoder.
             let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
-            let adapter: IDXGIAdapter = factory.EnumWarpAdapter().unwrap();
+            let adapter: IDXGIAdapter = match factory.EnumWarpAdapter() {
+                Ok(a) => a,
+                Err(_) => {
+                    crate::gpu::recomp::runner::skip_test("no WARP");
+                    return;
+                }
+            };
             let mut dev: Option<ID3D12Device> = None;
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut dev).unwrap();
             let dev = dev.unwrap();
@@ -1301,6 +2143,149 @@ mod frame_dump_tests {
             write_frame(&buffer, &fp, DXGI_FORMAT_R32_FLOAT, "frame");
             let json = serde_json::to_value(last_frame_dump().unwrap()).unwrap();
             assert!(json["non_dark_samples"].is_null(), "undecoded is different from dark");
+        }
+    }
+
+    #[test]
+    fn compositor_blends_ui_plane_over_scene_plane() {
+        unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
+            let adapter: IDXGIAdapter = factory.EnumWarpAdapter().unwrap();
+            let mut dev: Option<ID3D12Device> = None;
+            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut dev).unwrap();
+            let dev = dev.unwrap();
+            let queue: ID3D12CommandQueue = dev
+                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() })
+                .unwrap();
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let mut comp = Compositor::new(&dev).unwrap();
+
+            let make_tex = |w: u32, h: u32, flags: D3D12_RESOURCE_FLAGS| -> ID3D12Resource {
+                let mut r: Option<ID3D12Resource> = None;
+                dev.CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                    D3D12_HEAP_FLAG_NONE,
+                    &D3D12_RESOURCE_DESC {
+                        Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                        Width: w as u64,
+                        Height: h,
+                        DepthOrArraySize: 1,
+                        MipLevels: 1,
+                        Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                        Flags: flags,
+                        ..Default::default()
+                    },
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut r,
+                )
+                .unwrap();
+                r.unwrap()
+            };
+            let upload_tex = |tex: &ID3D12Resource, w: u32, h: u32, fill: &dyn Fn(u32, u32) -> [u8; 4]| -> ID3D12Resource {
+                let pitch = (w * 4).div_ceil(256) * 256;
+                let mut up: Option<ID3D12Resource> = None;
+                dev.CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_UPLOAD, ..Default::default() },
+                    D3D12_HEAP_FLAG_NONE,
+                    &D3D12_RESOURCE_DESC {
+                        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                        Width: (pitch * h) as u64,
+                        Height: 1,
+                        DepthOrArraySize: 1,
+                        MipLevels: 1,
+                        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                        ..Default::default()
+                    },
+                    D3D12_RESOURCE_STATE_GENERIC_READ,
+                    None,
+                    &mut up,
+                )
+                .unwrap();
+                let up = up.unwrap();
+                let mut p: *mut c_void = std::ptr::null_mut();
+                up.Map(0, None, Some(&mut p)).unwrap();
+                let bytes = std::slice::from_raw_parts_mut(p as *mut u8, (pitch * h) as usize);
+                for y in 0..h {
+                    for x in 0..w {
+                        let off = (y * pitch + x * 4) as usize;
+                        bytes[off..off + 4].copy_from_slice(&fill(x, y));
+                    }
+                }
+                up.Unmap(0, None);
+                let dst_loc = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(tex),
+                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+                };
+                let src_loc = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(&up),
+                    Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                        PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                            Offset: 0,
+                            Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                                Width: w,
+                                Height: h,
+                                Depth: 1,
+                                RowPitch: pitch,
+                            },
+                        },
+                    },
+                };
+                list.ResourceBarrier(&[transition(tex, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST)]);
+                list.CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, None);
+                list.ResourceBarrier(&[transition(tex, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON)]);
+                up
+            };
+
+            let scene = make_tex(4, 4, D3D12_RESOURCE_FLAG_NONE);
+            let ui = make_tex(8, 8, D3D12_RESOURCE_FLAG_NONE);
+            let out = make_tex(8, 8, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+            let _up0 = upload_tex(&scene, 4, 4, &|_, _| [0, 0, 255, 255]);
+            let _up1 = upload_tex(&ui, 8, 8, &|x, y| {
+                if y == 2 && x < 4 {
+                    [0, 128, 0, 128]
+                } else if x < 4 {
+                    [0, 0, 0, 0]
+                } else {
+                    [255, 0, 0, 255]
+                }
+            });
+
+            list.ResourceBarrier(&[transition(&out, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET)]);
+            let planes = [
+                (scene.clone(), scene.GetDesc(), [0.0, 0.0, 1.0, 1.0]),
+                (ui.clone(), ui.GetDesc(), [0.0, 0.0, 1.0, 1.0]),
+            ];
+            assert!(comp.record(&dev, &list, &out, 8, 8, DXGI_FORMAT_R8G8B8A8_UNORM, &planes, 0));
+            list.ResourceBarrier(&[transition(&out, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            let out_desc = out.GetDesc();
+            let (rb, fp) = readback_copy(&list, &out, &out_desc).unwrap();
+            list.Close().unwrap();
+
+            let cl: ID3D12CommandList = list.cast().unwrap();
+            queue.ExecuteCommandLists(&[Some(cl)]);
+            queue.Signal(&fence, 1).unwrap();
+            fence::wait(&fence, 1, &dev, None, 5000).unwrap();
+
+            let mut p: *mut c_void = std::ptr::null_mut();
+            rb.Map(0, None, Some(&mut p)).unwrap();
+            let px = |x: usize, y: usize| -> [u8; 4] {
+                let off = fp.Offset as usize + y * fp.Footprint.RowPitch as usize + x * 4;
+                let s = std::slice::from_raw_parts((p as *const u8).add(off), 4);
+                [s[0], s[1], s[2], s[3]]
+            };
+            assert_eq!(px(1, 1), [0, 0, 255, 255], "transparent UI exposes scene plane");
+            assert_eq!(px(6, 1), [255, 0, 0, 255], "opaque UI overwrites scene plane");
+            let blend = px(1, 2);
+            assert!(blend[0] <= 2 && (126..=130).contains(&blend[1]) && (125..=129).contains(&blend[2]) && blend[3] == 255, "unexpected blend {blend:?}");
+            rb.Unmap(0, None);
         }
     }
 }

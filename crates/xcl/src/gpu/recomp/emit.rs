@@ -17,6 +17,8 @@ pub(super) enum Flow {
 }
 
 pub(super) struct Em {
+    /// whole-wave reductions (`graphics_reductions`)
+    pub reductions: super::Reductions,
     opt: Options,
     out: String,
     pub indent: usize,
@@ -70,8 +72,27 @@ pub(super) struct Em {
     /// LDS arrival barrier (`xcl_s_barrier`) so RDNA2 early `s_endpgm`, `LOOP_GUARD` exits,
     /// or split-wave64 desyncs cannot permanently hang an NVIDIA SM at `bar.sync`.
     safe_barrier: bool,
+    /// any console group barrier; with LDS, this excludes cross-wave-local remapping
+    has_s_barrier: bool,
     /// the T# SGPRs of the program's image stores and atomics (`image_write_srsrcs`)
     img_writes: Vec<u64>,
+    /// compute program needs `globallycoherent` on flat memory windows (`needs_coherent_mem`)
+    pub coherent_mem: bool,
+    /// split wave64: what lies between the basic block's previous LDS access and here
+    x64_lds: LdsGap,
+    /// first instructions of the basic blocks (branch targets, after branches)
+    block_starts: BTreeSet<u64>,
+}
+
+/// Split wave64 (`x64_lds_meet`): since the basic block's previous LDS access
+#[derive(Clone, Copy, PartialEq)]
+enum LdsGap {
+    /// that was a write or an atomic, or there was none in the block
+    Open,
+    /// that was a read, and no exchange since
+    Read,
+    /// the halves met in an exchange since
+    Met,
 }
 
 /// The T# SGPRs (SRSRC) of a program's image stores and atomics, at most 16, sorted. An
@@ -589,9 +610,12 @@ fn to_f16_rounded_expr(dynamic_rm: bool, e: &str) -> String {
 }
 
 impl Em {
-    pub fn new(opt: Options) -> Self {
+    /// `block_starts`: the first instructions of the program's basic blocks (branch targets and
+    /// the instructions after branches): split wave64 elides no LDS meeting across them.
+    pub fn new(opt: Options, block_starts: BTreeSet<u64>) -> Self {
         Em {
             opt,
+            reductions: Default::default(),
             out: String::new(),
             indent: 1,
             sgprs: BTreeSet::new(),
@@ -619,7 +643,11 @@ impl Em {
             dynamic_f16_rm: false,
             track_frexp_denorm: false,
             safe_barrier: false,
+            has_s_barrier: false,
             img_writes: Vec::new(),
+            coherent_mem: false,
+            x64_lds: LdsGap::Open,
+            block_starts,
         }
     }
 
@@ -683,9 +711,10 @@ impl Em {
             }
         }
         self.dynamic_f16_rm = writes_nonzero_dp && self.has_f16_round_op && !self.has_f64_round_op;
+        self.has_s_barrier = has_s_barrier;
         self.safe_barrier = has_s_barrier
             && self.compute_or_mesh_hw_waves().is_some_and(|w| w > 1)
-            && std::env::var("XCL_SAFE_BARRIER").map_or(true, |v| v.trim() != "0");
+            && safe_barrier_wanted();
     }
 
     pub fn take(&mut self) -> String {
@@ -710,6 +739,12 @@ impl Em {
     /// docs/wave64-on-wave32.md).
     fn x64(&self) -> bool {
         self.opt.wave64 && self.opt.split_wave64 && matches!(self.opt.mode, Mode::Kernel | Mode::Compute(_) | Mode::Mesh(_) | Mode::Geometry(_))
+    }
+
+    /// An upper-lane spill shadow may need to distinguish a present native lane from a lane
+    /// that the PC wave did not launch.
+    fn upper_presence(&self) -> bool {
+        self.upper.as_ref().is_some_and(|u| u.shadows.iter().any(|&(_, l)| l >= 32))
     }
 
     /// `ballot` of the program's wave (both halves' words in the split form, the helper lanes'
@@ -976,6 +1011,9 @@ impl Em {
                 ballot = "ballot_px_local";
             }
         }
+        if ballot == "xcl_x_ballot" {
+            self.x64_met();
+        }
         match if ballot == "ballot_px" { quad_bits(a, cond, &m) } else { None } {
             Some((reads, q)) => {
                 if !reads.is_empty() {
@@ -1009,14 +1047,21 @@ impl Em {
         let mut flow = Flow::Next;
         let mut i = 0;
         while i < block.len() {
+            let emitted_from = self.out.len();
             if self.x64() {
                 if let Some(consumed) = self.try_emit_x64_reduction_tail(&block[i..]) {
                     i += consumed;
+                    self.x64_fail_closed_since(emitted_from);
                     continue;
                 }
             }
             let next = block.get(i + 1).map(|n| n.pc).unwrap_or(end);
             flow = self.inst(&block[i], next);
+            // A counter-paired half that timed out must not continue with the helper's
+            // placeholder value: later stores would turn a synchronization failure into
+            // plausible but undefined game output. The other half either returns here too
+            // or times out at the same exchange.
+            self.x64_fail_closed_since(emitted_from);
             if !matches!(flow, Flow::Next) {
                 break;
             }
@@ -1133,6 +1178,7 @@ impl Em {
                     self.line(&format!("uint {t}_m = WaveReadLaneAt({v}, {lane32}u);"));
                     self.line(&format!("xcl_x_put(0u, {t}_m);"));
                     self.line(&format!("uint {t}_o = xcl_x_meet() ? xcl_x_get(0u) : 0u;"));
+                    self.x64_met();
                     self.line(&format!("uint {t}_r1 = xcl_half == {}u ? {t}_m : {t}_o;", l1 >> 5));
                     self.line(&format!("uint {t}_r2 = xcl_half == {}u ? {t}_m : {t}_o;", l2 >> 5));
                     self.write32(&dst1, &format!("{t}_r1"));
@@ -1157,6 +1203,7 @@ impl Em {
                             self.line(&format!("uint {t}_m = WaveReadLaneAt({v}, {lane32}u);"));
                             self.line(&format!("xcl_x_put(0u, {t}_m);"));
                             self.line(&format!("uint {t}_o = xcl_x_meet() ? xcl_x_get(0u) : 0u;"));
+                            self.x64_met();
                             self.line(&format!("uint {r1} = xcl_half == {}u ? {t}_m : {t}_o;", l1 >> 5));
                             self.line(&format!("uint {r2} = xcl_half == {}u ? {t}_m : {t}_o;", l2 >> 5));
                             self.write32(&Dst::S(s1), &r1);
@@ -1208,6 +1255,7 @@ impl Em {
                         self.line(&format!("uint {t}_mh = WaveReadLaneAt({vh}, {lane32}u);"));
                         self.line(&format!("xcl_x_put(0u, {t}_ml); xcl_x_put(1u, {t}_mh);"));
                         self.line(&format!("bool {t}_ok = xcl_x_meet();"));
+                        self.x64_met();
                         self.line(&format!("uint {t}_ol = {t}_ok ? xcl_x_get(0u) : 0u;"));
                         self.line(&format!("uint {t}_oh = {t}_ok ? xcl_x_get(1u) : 0u;"));
                         let (h1, h2) = (l1 >> 5, l2 >> 5);
@@ -1245,6 +1293,9 @@ impl Em {
         let text = rdna2::format(d);
         self.line(&format!("// {:04x}: {text}", d.pc));
         self.cur_pc = d.pc;
+        if self.block_starts.contains(&d.pc) {
+            self.x64_lds = LdsGap::Open;
+        }
         // a far jump (`rdna2::resolve_far_jumps`) is an unconditional branch
         if let Some(t) = d.far_target {
             return Flow::Jump(t);
@@ -1266,6 +1317,7 @@ impl Em {
             *self.ignored.entry(name).or_default() += 1;
             return Flow::Next;
         }
+        let seed = self.reductions.seeds.get(&d.pc).copied();
         let r = match d.enc.name {
             "ENC_SOPP" => return self.sopp(d, &name, next),
             "ENC_SOP1" | "ENC_SOP2" | "ENC_SOPC" | "ENC_SOPK" => self.salu(d, &name),
@@ -1281,6 +1333,10 @@ impl Em {
         };
         if let Err(why) = r {
             self.unsupported(d, why);
+        }
+        if let Some(v) = seed {
+            let v = self.vreg(v);
+            self.line(&format!("uint xcl_seed_{:x} = {v};", d.pc));
         }
         Flow::Next
     }
@@ -1690,7 +1746,15 @@ impl Em {
             _ => return Err("SALU"),
         };
         self.line(&format!("uint {t} = {res};"));
-        if let Some(c) = scc {
+        // "is a lane left" of a lane mask (an AND with EXEC or VCC) in a pixel shader: over the
+        // live lanes (`mask_live`)
+        let lanes_left = matches!(name, "s_and_b32" | "s_andn2_b32")
+            && matches!(self.opt.mode, Mode::Pixel(_))
+            && d.enc.name == "ENC_SOP2"
+            && ["SSRC0", "SSRC1", "SDST"].iter().any(|f| matches!(Self::field(d, f), 106 | 126));
+        if lanes_left {
+            self.line(&format!("scc = (uint)(mask_live({t}) != 0u);"));
+        } else if let Some(c) = scc {
             self.line(&format!("scc = (uint)({c});"));
         }
         self.write32(&dst, &t);
@@ -1971,6 +2035,7 @@ impl Em {
             }
             let get: Vec<String> = vals.iter().enumerate().map(|(i, v)| format!("{v} = xcl_x_get({i}u);")).collect();
             self.line(&format!("if (xcl_x_meet() && xcl_half != 0u) {{ {} }}", get.join(" ")));
+            self.x64_met();
         }
         for (i, v) in vals.iter().enumerate() {
             let s = self.sreg(sdata + i as u64);
@@ -2458,7 +2523,8 @@ impl Em {
     /// (UAV at +1); FORMAT (word 1 [28:20]) selects the typed view (float/uint/sint).
     /// Sampler descriptors (S#, 4 dwords) hold the sampler heap index in BORDER_COLOR_PTR
     /// (word 3 [11:0]). Address layout with A16 (16-bit bias/coordinates/lod, 32-bit offset,
-    /// compare and gradients) as in AnyPS5's `componentShape` (GPL-2.0, ported 2026-11-20).
+    /// compare and gradients) as AnyPS5's `componentShape` describes it (read
+    /// as a reference for the hardware behaviour; no code taken).
     /// `float3 {t}_o{sfx}`: an MIMG texel offset (`o`, three 6-bit signed fields) in the texture
     /// coordinates of mip `level` – offset / that level's size (array layers do not move).
     fn texel_offset(&mut self, t: &str, dim: u64, o: &str, level: &str, sfx: &str) {
@@ -3220,6 +3286,10 @@ impl Em {
         let dot: Option<String> = match name {
             "v_dot2_f32_f16" => {
                 let mut c = format!("asfloat({})", src(2));
+                // SRC2 is f32: its NEG_HI bit is ABS (applied before NEG), as in v_fma_mix*
+                if neg_hi >> 2 & 1 == 1 {
+                    c = format!("abs({c})");
+                }
                 if neg >> 2 & 1 == 1 {
                     c = format!("(-{c})");
                 }
@@ -3395,9 +3465,76 @@ impl Em {
         Ok(())
     }
 
+    /// Quad-byte SAD (`v_qsad_pk_u16_u8`, `v_mqsad_pk_u16_u8`, `v_mqsad_u32_u8`): slides the
+    /// 4-byte pattern in `SRC1` across bytes 0..3, 1..4, 2..5, 3..6 of `SRC0` (skipping bytes
+    /// where `SRC1`'s byte is zero for `mqsad`) and adds into `SRC2`, saturating per element
+    /// when `CLAMP` is set.
+    fn valu_qsad(&mut self, d: &Decoded, name: &str) -> Result<(), &'static str> {
+        if d.variant != Variant::Plain {
+            return Err("quad-SAD SDWA/DPP");
+        }
+        let (outs, ins) = Self::ops(d);
+        let clamp = Self::mods(d).clamp;
+        let masked = name.starts_with("v_mqsad");
+        let wide = name == "v_mqsad_u32_u8";
+        let dst = outs.first().map(|o| Self::dst_of(d, o)).unwrap_or(Dst::Null);
+        let limit = if wide { 252 } else { 254 };
+        if matches!(dst, Dst::V(n) if n > limit) {
+            return Err("quad-SAD VDST out of range");
+        }
+        let (s0_lo, s0_hi) = self.read64(d, ins.first().ok_or("op")?, false).ok_or("op")?;
+        let s1 = self.read(d, ins.get(1).ok_or("op")?, false).ok_or("op")?;
+        let s2_op = ins.get(2).ok_or("op")?;
+        let sad = if masked { "msad_u8" } else { "sad_u8" };
+        let t = self.t();
+        self.line(&format!("uint {t}_l = {s0_lo}; uint {t}_h = {s0_hi}; uint {t}_r = {s1};"));
+        let wins = [
+            format!("{t}_l"),
+            format!("(({t}_l >> 8) | ({t}_h << 24))"),
+            format!("(({t}_l >> 16) | ({t}_h << 16))"),
+            format!("(({t}_l >> 24) | ({t}_h << 8))"),
+        ];
+        if wide {
+            let f = s2_op.field.ok_or("op")?;
+            let code = Self::field(d, f);
+            if !(256..=508).contains(&code) {
+                return Err("quad-SAD SRC2 not a 4-VGPR range");
+            }
+            let base = code - 256;
+            for (i, w) in wins.iter().enumerate() {
+                let acc = self.vreg(base + i as u64);
+                let sum = format!("{sad}({w}, {t}_r)");
+                let expr = if clamp { format!("sat_u32((uint64_t){sum} + (uint64_t){acc})") } else { format!("{sum} + {acc}") };
+                self.line(&format!("uint {t}_{i} = {expr};"));
+            }
+            if let Dst::V(dn) = dst {
+                let act = self.act();
+                let writes: Vec<String> = (0..4)
+                    .map(|i| {
+                        let vd = self.vreg(dn + i as u64);
+                        format!("{vd} = select({act}, {t}_{i}, {vd});")
+                    })
+                    .collect();
+                self.line(&writes.join(" "));
+            }
+        } else {
+            let (a_lo, a_hi) = self.read64(d, s2_op, false).ok_or("op")?;
+            self.line(&format!(
+                "uint {t}_0 = pk_sad_u16({sad}({}, {t}_r), {sad}({}, {t}_r), {a_lo}, {clamp});",
+                wins[0], wins[1]
+            ));
+            self.line(&format!(
+                "uint {t}_1 = pk_sad_u16({sad}({}, {t}_r), {sad}({}, {t}_r), {a_hi}, {clamp});",
+                wins[2], wins[3]
+            ));
+            self.write64(&dst, &format!("{t}_0"), &format!("{t}_1"));
+        }
+        Ok(())
+    }
+
     /// 16-bit VALU (f16 / u16 / i16 / b16): sources are the low halves (VOP3 op_sel picks the
     /// high half per source), results go to the low half (op_sel[3]: high half) and the other
-    /// half is preserved – AnyPS5 `write16Bits` (GPL-2.0, ported 2026-11-20).
+    /// half is preserved, as AnyPS5's `write16Bits` describes it (reference only; no code taken).
     fn valu16(&mut self, d: &Decoded, name: &str) -> Result<(), &'static str> {
         let (outs, ins) = Self::ops(d);
         let m = Self::mods(d);
@@ -3706,6 +3843,9 @@ impl Em {
         if name.starts_with("v_pk_") || name.starts_with("v_dot") {
             return self.valu_pk(d, name);
         }
+        if matches!(name, "v_qsad_pk_u16_u8" | "v_mqsad_pk_u16_u8" | "v_mqsad_u32_u8") {
+            return self.valu_qsad(d, name);
+        }
         if name.starts_with("v_movrel") {
             return self.movrel(d, name);
         }
@@ -3994,17 +4134,26 @@ impl Em {
                 let eh = if self.opt.wave64 { eh } else { "0u".into() };
                 let t = self.t();
                 let rla = self.rla_uniform_fn();
-                self.line(&format!("uint {t} = {rla}({a}, first_lane({el}, {eh}));"));
+                // (a live lane of EXEC where there is one: `first_lane_live`)
+                self.line(&format!("uint {t} = {rla}({a}, first_lane_live({el}, {eh}));"));
+                self.x64_met();
                 self.write32(&dst, &t);
                 return Ok(());
             }
             "v_readlane_b32" => {
                 let t = self.t();
+                // the end of a compiler whole-wave reduction (`graphics_reductions`)
+                if let Some(red) = self.reductions.reads.get(&d.pc).copied() {
+                    let scope = if red.scope == super::ReductionScope::Whole64 { "64" } else { "" };
+                    self.line(&format!("uint {t} = xcl_red{scope}_{}(xcl_seed_{:x});", red.op, red.seed));
+                    self.write32(&Dst::V(red.accum), &t);
+                    self.write32(&dst, &t);
+                    return Ok(());
+                }
                 let rla = self.rla_uniform_fn();
                 let read = format!("{rla}({a}, {b} & {wmask}u)");
-                // wave64 VS / PS (`upper_lanes`): in a 32-lane wave, lanes 32..63 without a lane
-                // read; a spill slot < 32 from its shadow whatever the wave size (its lane may
-                // not have been launched)
+                // wave64 VS / PS (`upper_lanes`): replace absent upper lanes with known values;
+                // read a spill slot from its shadow when its physical lane was not launched
                 let slot = super::upper_lanes::slot(d);
                 match (self.upper.as_ref().and_then(|u| u.reads.get(&d.pc)).copied(), slot) {
                     (Some(Read::Const(c)), Some(_)) => self.line(&format!("uint {t} = {c:#010x}u; if (!xcl_hw32) {t} = {read};")),
@@ -4013,9 +4162,14 @@ impl Em {
                         self.line(&format!("{t} = select(and(xcl_hw32, ({b} & 63u) >= 32u), {c:#010x}u, {t});"));
                     }
                     (Some(Read::Shadow), Some((v, l))) if l < 32 => self.line(&format!("uint {t} = xcl_sh{v}_{l};")),
-                    (Some(Read::Shadow), Some((v, l))) => self.line(&format!("uint {t} = xcl_sh{v}_{l}; if (!xcl_hw32) {t} = {read};")),
+                    (Some(Read::Shadow), Some((v, l))) => {
+                        self.line(&format!("uint {t} = xcl_sh{v}_{l};"));
+                        self.line(&format!("if (lanebit_at(xcl_present.x, xcl_present.y, {l}u)) {t} = {read};"));
+                    }
                     _ => self.line(&format!("uint {t} = {read};")),
                 }
+                // split wave64 (no `upper` there): the last arm, an exchange
+                self.x64_met();
                 self.write32(&dst, &t);
                 return Ok(());
             }
@@ -4421,6 +4575,34 @@ impl Em {
     }
 
     /// LDS (`groupshared`, compute only) and the DS cross-lane permutes.
+    /// Split wave64: the console runs an instruction in all 64 lanes before the next, so a lane
+    /// reads the LDS the other half wrote an instruction earlier with no s_barrier – the halves
+    /// meet before every LDS access (nothing exchanged: the meeting is the order). Called once
+    /// the access is known to be translated. Not in geometry mode: ES lanes write their own
+    /// items and read no other lane's before the barrier where the phases meet.
+    /// No meeting for a read right after a read of the same basic block, nor when the halves
+    /// met in an exchange since the block's previous access (`LdsGap`). Still in order: for
+    /// accesses j < i of the stream, one a write, the halves meet between them (the access
+    /// after a write and every write meet, or an exchange lies before them; a block's first
+    /// access meets), and both halves pass the same meetings: the other half's j is done
+    /// before this half's i. Two reads need no order.
+    fn x64_lds_meet(&mut self, write: bool) {
+        if self.x64() && !matches!(self.opt.mode, Mode::Geometry(_)) {
+            if self.x64_lds == LdsGap::Open || (write && self.x64_lds == LdsGap::Read) {
+                self.line("xcl_x_meet();");
+                self.line(if self.safe_barrier { "if (xcl_x_dead) { xcl_s_barrier_exit(); return; }" } else { "if (xcl_x_dead) return;" });
+            }
+            self.x64_lds = if write { LdsGap::Open } else { LdsGap::Read };
+        }
+    }
+
+    /// An exchange (`xcl_x_meet`) the current instruction always runs, in the split form.
+    fn x64_met(&mut self) {
+        if self.x64() {
+            self.x64_lds = LdsGap::Met;
+        }
+    }
+
     fn ds(&mut self, d: &Decoded, name: &str) -> Result<(), &'static str> {
         let f = |n: &str| rdna2::field_value(d.enc, &d.words, n).unwrap_or(0);
         let act = self.act();
@@ -4452,6 +4634,7 @@ impl Em {
                 self.line(&format!("uint {t}_l = (({a} + {off16}u) >> 2) & {m}u;"));
                 let rla = if self.x64() {
                     self.x64_words = 32;
+                    self.x64_met();
                     "xcl_x_rla_any"
                 } else {
                     "rla"
@@ -4482,6 +4665,7 @@ impl Em {
         }
         // ADDTID forms have no ADDR VGPR: byte address = M0[15:0] + offset16 + 4 * lane_id.
         if matches!(name, "ds_write_addtid_b32" | "ds_read_addtid_b32") {
+            self.x64_lds_meet(name == "ds_write_addtid_b32");
             self.uses_lds = true;
             let m0 = self.sreg(124);
             let at = format!("(({m0} & 0xFFFFu) + {off16}u + 4u * lane_id)");
@@ -4546,6 +4730,7 @@ impl Em {
         };
         // d16 8 / 16-bit LDS accesses (half of the VGPR)
         if let Some((bits, signed, write, half)) = ds_d16(name) {
+            self.x64_lds_meet(write);
             let at = format!("{a} + {off16}u");
             let slot = lds(at.clone());
             let sh = format!("((({at}) & 3u) * 8u)");
@@ -4571,6 +4756,7 @@ impl Em {
             _ => None,
         };
         if let Some((bits, signed, write)) = small {
+            self.x64_lds_meet(write);
             let at = format!("{a} + {off16}u");
             let slot = lds(at.clone());
             let sh = format!("((({at}) & 3u) * 8u)");
@@ -4592,6 +4778,7 @@ impl Em {
             return Ok(());
         }
         if let Some((write, n, stride, two)) = rw(name) {
+            self.x64_lds_meet(write);
             let addrs: Vec<String> = if two {
                 vec![format!("{a} + {}u", o0 * stride), format!("{a} + {}u", o1 * stride)]
             } else {
@@ -4624,6 +4811,7 @@ impl Em {
         };
         // two exchanges (ds_wrxchg2(st64)_rtn_b32): old values to VDST, VDST + 1
         if op == "wrxchg2_b32" || op == "wrxchg2st64_b32" {
+            self.x64_lds_meet(true);
             let stride = if op == "wrxchg2_b32" { 4 } else { 256 };
             let (s0, s1) = (lds(format!("{a} + {}u", o0 * stride)), lds(format!("{a} + {}u", o1 * stride)));
             let (v0, v1) = (self.vreg(f("DATA0")), self.vreg(f("DATA1")));
@@ -4639,6 +4827,7 @@ impl Em {
         let (v, v2) = if op.starts_with("cmpst_") { (d1, d0) } else { (d0, d1) };
         let slot = lds(format!("{a} + {off16}u"));
         let body = rmw32(&op, &At::Ref(slot), &v, &v2, &format!("{t}_o"), &t).ok_or("DS")?;
+        self.x64_lds_meet(true);
         self.line(&format!("uint {t}_o = 0u; if ({act}) {{ {body} }}"));
         if rtn {
             let r = self.vreg(f("VDST"));
@@ -4658,12 +4847,47 @@ impl Em {
         }
     }
 
-    /// Split wave64: meet through bounded arrival counters (`XCL_X_SPIN 1`) by default so
-    /// divergent wave32 halves can never permanently deadlock a GPU SM at an unbounded
-    /// `GroupMemoryBarrierWithGroupSync()`. Set `XCL_WAVE64_SPIN=0` to force group barriers
-    /// for 1-wave64 groups.
+    /// Split-wave64 compute whose console waves share neither LDS nor a group barrier: groups per
+    /// console group, scaled dispatch dimension, and the one-wave hardware group shape.
+    pub(crate) fn remap(&self) -> Option<(u32, usize, [u32; 3])> {
+        if self.opt.no_remap || !self.x64() || self.uses_lds || self.has_s_barrier {
+            return None;
+        }
+        let Mode::Compute(cs) = &self.opt.mode else { return None };
+        let [x, y, z] = cs.threads;
+        let threads = x.checked_mul(y)?.checked_mul(z)?;
+        if x == 0 || threads <= 64 || threads % 64 != 0 {
+            return None;
+        }
+        if x >= 64 && x % 64 == 0 && y == 1 && z == 1 {
+            return Some((x / 64, 0, [64, 1, 1]));
+        }
+        if x <= 64 && 64 % x == 0 {
+            let rows = 64 / x;
+            if rows <= y && y % rows == 0 && z == 1 {
+                return Some((y / rows, 1, [x, rows, 1]));
+            }
+        }
+        None
+    }
+
+    fn x64_hw_threads(&self) -> u32 {
+        self.remap().map_or(self.x64_threads(), |_| 64)
+    }
+
+    /// Split wave64: how the halves meet (`XCL_X_SPIN`, `x64_spin_for`).
     fn x64_spin(&self) -> bool {
-        self.x64_threads() > 64 || std::env::var("XCL_WAVE64_SPIN").map_or(true, |v| v.trim() != "0")
+        x64_spin_for(self.x64_hw_threads(), std::env::var("XCL_WAVE64_SPIN").ok().as_deref())
+    }
+
+    /// Stop a counter-paired console wave after its partner failed to arrive. Multi-wave
+    /// compute/mesh groups must first leave the emulated safe barrier's live-wave count.
+    fn x64_fail_closed_since(&mut self, from: usize) {
+        let emitted = &self.out[from..];
+        let exchanged = ["xcl_x_meet(", "xcl_x_ballot(", "xcl_x_rla_uniform(", "xcl_x_rla_any("].iter().any(|s| emitted.contains(s));
+        if self.x64() && exchanged && self.x64_spin() {
+            self.line(if self.safe_barrier { "if (xcl_x_dead) { xcl_s_barrier_exit(); return; }" } else { "if (xcl_x_dead) return;" });
+        }
     }
 
     /// The console LDS block (`xcl_lds`) is declared before the split-wave64 prelude, which
@@ -4675,7 +4899,7 @@ impl Em {
 
     /// Storage and functions of the split wave64 form (`PRELUDE_X64`).
     fn x64_prelude(&self, h: &mut String) {
-        let threads = self.x64_threads();
+        let threads = self.x64_hw_threads();
         let waves = threads.div_ceil(64).max(1) as usize;
         let slot = self.x64_words;
         // slots (console wave, half, parity), the arrival counters (console wave, half), the
@@ -4730,8 +4954,9 @@ impl Em {
         h.push_str("RWByteAddressBuffer io : register(u0);\nRWByteAddressBuffer res : register(u1);\n");
         // compute work across workgroups (bottom-up BVH builds: atomics, then reading what
         // other groups wrote) relies on GLC / cache invalidation on the console: keep the flat
-        // memory coherent across the GPU there; graphics keeps the cached (faster) view
-        let coherent = if matches!(self.opt.mode, Mode::Compute(_)) { "globallycoherent " } else { "" };
+        // memory coherent across the GPU only when the program actually uses those; otherwise
+        // keep the cached (faster) view
+        let coherent = if self.coherent_mem { "globallycoherent " } else { "" };
         let max_win = if self.opt.heap_windows { crate::gpu::uma::MAX_HEAP_WINDOWS as u32 } else { crate::gpu::uma::MAX_WINDOWS as u32 };
         let windows = self.opt.mem_windows.clamp(1, max_win);
         let _ = writeln!(h, "{coherent}RWByteAddressBuffer mem : register(u2);");
@@ -4753,12 +4978,18 @@ impl Em {
         if matches!(self.opt.mode, Mode::Pixel(_)) {
             h.push_str(PRELUDE_PIXEL);
         }
+        if !self.reductions.reads.is_empty() {
+            h.push_str(PRELUDE_REDUCE);
+        }
         if self.x64() {
             self.x64_prelude(&mut h);
         }
         if let Some(u) = &self.upper {
-            // wave64 VS / PS on a GPU with 32-lane waves only (`upper_lanes`)
-            h.push_str("// the wave has 32 lanes: it is a console wave whose lanes 32..63 are not populated\nstatic bool xcl_hw32 = false;\n");
+            // wave64 VS / PS missing-lane values (`upper_lanes`)
+            h.push_str("static bool xcl_hw32 = false;\n");
+            if self.upper_presence() {
+                h.push_str("static uint2 xcl_present = uint2(0u, 0u); // physical lanes (PS: whole live quads)\n");
+            }
             for (v, l) in &u.shadows {
                 let _ = writeln!(h, "static uint xcl_sh{v}_{l} = 0u; // v_writelane slot: v{v} lane {l}");
             }
@@ -4848,6 +5079,9 @@ impl Em {
                 if self.upper.is_some() {
                     h.push_str("    xcl_hw32 = WaveGetLaneCount() < 64u;\n");
                 }
+                if self.upper_presence() {
+                    h.push_str("    xcl_present = ballot(true);\n");
+                }
                 load_sgprs(&mut h);
                 h.push_str("    uint scc = 0u;\n    { uint2 e0 = ballot(true); exec_lo = e0.x; exec_hi = e0.y; }\n");
                 for &v in &self.vgprs {
@@ -4878,6 +5112,8 @@ impl Em {
                     h.push_str("groupshared uint xcl_lds[8192]; // D3D12 limit: 32 KB (the console allows 64 KB)\n");
                 }
                 let [x, y, z] = cs.threads;
+                let remap = self.remap();
+                let [nx, ny, nz] = remap.map_or([x, y, z], |(_, _, hw)| hw);
                 // split wave64: the same group in hardware wave32s (a console wave = two of them)
                 let hw_lanes = if self.x64() { 32 } else { lanes };
                 // 2-D / 3-D groups: the PC driver need not form its waves from consecutive
@@ -4898,12 +5134,16 @@ impl Em {
                 self.safe_barrier_prelude(&mut h);
                 let _ = writeln!(
                     h,
-                    "[WaveSize({hw_lanes})]\n[numthreads({x}, {y}, {z})]\nvoid main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint gi : SV_GroupIndex)\n{{"
+                    "[WaveSize({hw_lanes})]\n[numthreads({nx}, {ny}, {nz})]\nvoid main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint gi : SV_GroupIndex)\n{{"
                 );
                 if self.safe_barrier {
                     h.push_str("    xcl_s_barrier_init(gi);\n");
                 }
-                if self.x64() {
+                if let Some((ratio, dim, _)) = remap {
+                    let d = ["x", "y", "z"][dim];
+                    h.push_str("    uint xcl_local = xcl_x_thread(gi);\n    lane_id = xcl_local & 63u;\n    xcl_half = (xcl_local >> 5) & 1u;\n    xcl_cw = 0u;\n    xcl_xn = XCL_X_THREADS > ((xcl_local & ~31u) ^ 32u) ? min(32u, XCL_X_THREADS - ((xcl_local & ~31u) ^ 32u)) : 0u;\n");
+                    let _ = writeln!(h, "    uint xcl_tid = (gid.{d} % {ratio}u) * 64u + xcl_local;\n    gtid = uint3(xcl_tid % {x}u, (xcl_tid / {x}u) % {y}u, xcl_tid / {}u);\n    gi = xcl_tid;", x * y);
+                } else if self.x64() {
                     // the console thread's ids (`xcl_x_thread`), not this hardware thread's
                     self.x64_entry(&mut h);
                     let _ = writeln!(h, "    gtid = uint3(xcl_tid % {x}u, (xcl_tid / {x}u) % {y}u, xcl_tid / {}u);\n    gi = xcl_tid;", x * y);
@@ -4919,11 +5159,21 @@ impl Em {
                     h.push_str("    lane_id = WaveGetLaneIndex();\n");
                 }
                 load_sgprs(&mut h);
-                // a folded dispatch (`IO_GROUP_LIMIT`): the console's group in X, the groups
-                // past its count left out (the whole group returns)
+                // the console's group ids: a remapped axis runs `ratio` hardware groups for each;
+                // a folded dispatch (`IO_GROUP_LIMIT`) takes its group in X from X and Y and
+                // leaves out the groups past its count (the whole group returns). (A remap of X
+                // never runs folded: 65 535 × ratio groups are past the limit, and the dispatch
+                // takes the pipeline without the remap.)
+                let console_gid = |c: &str| match remap {
+                    Some((ratio, dim, _)) if ["x", "y", "z"][dim] == c => format!("gid.{c} / {ratio}u"),
+                    _ => format!("gid.{c}"),
+                };
                 let _ = writeln!(
                     h,
-                    "    uint3 xcl_gid = gid;\n    {{\n        uint xcl_gl = io.Load({}u);\n        if (xcl_gl != 0u) {{\n            uint xcl_f = gid.x + gid.y * {}u;\n            if (xcl_f >= xcl_gl) return;\n            xcl_gid = uint3(xcl_f, 0u, gid.z);\n        }}\n    }}",
+                    "    uint3 xcl_gid = uint3({}, {}, {});\n    {{\n        uint xcl_gl = io.Load({}u);\n        if (xcl_gl != 0u) {{\n            uint xcl_f = xcl_gid.x + xcl_gid.y * {}u;\n            if (xcl_f >= xcl_gl) return;\n            xcl_gid = uint3(xcl_f, 0u, xcl_gid.z);\n        }}\n    }}",
+                    console_gid("x"),
+                    console_gid("y"),
+                    console_gid("z"),
                     super::IO_GROUP_LIMIT * 4,
                     super::FOLD_X
                 );
@@ -4941,7 +5191,24 @@ impl Em {
                     // waves in the group: a last, partial wave counts (96 threads: 2 of 64)
                     let _ = writeln!(h, "    {} = {}u | ((gi / {lanes}u) << 6);", sname(next).unwrap(), (x * y * z).div_ceil(lanes));
                 }
-                let _ = writeln!(h, "    uint scc = 0u;\n    {{ uint2 e0 = {}(true); exec_lo = e0.x; exec_hi = e0.y; }}", self.ballot_fn());
+                h.push_str("    bool xcl_dispatch_limited = false;\n");
+                for (k, c) in ["x", "y", "z"].iter().enumerate().filter(|(k, _)| cs.threads[*k] > 1) {
+                    let slot = super::IO_THREAD_LIMIT[k] * 4;
+                    let _ = writeln!(h, "    uint xcl_limit_{c} = io.Load({slot}u);\n    xcl_dispatch_limited = xcl_dispatch_limited || xcl_limit_{c} != 0u;");
+                }
+                let _ = writeln!(h, "    uint scc = 0u;\n    {{ uint2 e0;");
+                // The limits are uniform I/O values. Make that explicit so a split-wave
+                // rendezvous is not compiled inside lane-divergent control flow.
+                let _ = writeln!(h, "        if (WaveActiveAllTrue(xcl_dispatch_limited)) {{\n            bool xcl_dispatch_live = true;");
+                for (k, c) in ["x", "y", "z"].iter().enumerate().filter(|(k, _)| cs.threads[*k] > 1) {
+                    let threads = cs.threads[k];
+                    let _ = writeln!(h, "            xcl_dispatch_live = xcl_dispatch_live && (xcl_limit_{c} == 0u || xcl_gid.{c} * {threads}u + gtid.{c} < xcl_limit_{c});");
+                }
+                let ballot = self.ballot_fn();
+                let _ = writeln!(h, "            e0 = {ballot}(xcl_dispatch_live);\n        }} else {{\n            e0 = {ballot}(true);\n        }}\n        exec_lo = e0.x; exec_hi = e0.y; }}");
+                if self.x64() && self.x64_spin() {
+                    h.push_str(if self.safe_barrier { "    if (xcl_x_dead) { xcl_s_barrier_exit(); return; }\n" } else { "    if (xcl_x_dead) return;\n" });
+                }
                 for &v in &self.vgprs {
                     let init = match v {
                         0 => "gtid.x",
@@ -4987,6 +5254,9 @@ impl Em {
                     h.push_str("    s3 = (s3 & 0xF0FFFFFFu) | (xcl_wave << 24);\n");
                 }
                 let _ = writeln!(h, "    uint scc = 0u;\n    {{ uint2 e0 = {}(true); exec_lo = e0.x; exec_hi = e0.y; }}", self.ballot_fn());
+                if self.x64() && self.x64_spin() {
+                    h.push_str(if self.safe_barrier { "    if (xcl_x_dead) { xcl_s_barrier_exit(); return; }\n" } else { "    if (xcl_x_dead) return;\n" });
+                }
                 for &v in &self.vgprs {
                     let init = if v == 5 { format!("gid.x * {t}u + xcl_slot") } else { "0u".into() };
                     let _ = writeln!(h, "    uint v{v} = {init};");
@@ -5186,6 +5456,9 @@ impl Em {
                 if self.upper.is_some() {
                     h.push_str("    xcl_hw32 = WaveGetLaneCount() < 64u;\n");
                 }
+                if self.upper_presence() {
+                    h.push_str("    xcl_present = ballot_px(true);\n");
+                }
                 load_sgprs(&mut h);
                 h.push_str("    uint scc = 0u;\n    { uint2 e0 = ballot(true); exec_lo = e0.x; exec_hi = e0.y; }\n");
                 let sys = |bit: u32| ps_input_vgpr(ps.input_ena, bit);
@@ -5215,7 +5488,7 @@ impl Em {
             }
         }
         if windows > 1 {
-            let coherent = if matches!(self.opt.mode, Mode::Compute(_)) { "globallycoherent " } else { "" };
+            let coherent = if self.coherent_mem { "globallycoherent " } else { "" };
             h = windowed(&h, windows, self.opt.heap_windows.then_some(coherent));
         }
         h
@@ -5667,13 +5940,10 @@ fn windowed(h: &str, windows: u32, heap: Option<&str>) -> String {
     out.replacen(MEM_ACCESSORS_HERE, &mem_accessors(windows, heap), 1)
 }
 
-/// The accessor functions: one per `mem` method (and overload) the translator emits.
-/// Only explicit windows `0..windows` touch GPU buffers; any out-of-range `xcl_w` hits
-/// `default` (reads return 0, stores/atomics are dropped and zero their `out` parameter) so
-/// out-of-UMA pointers can never wrap onto live memory windows.
-/// `heap`: Some(storage class) – window k is taken from the descriptor heap
-/// (`Options::heap_windows`) and the same rule is one comparison before the access.
-fn mem_accessors(windows: u32, heap: Option<&str>) -> String {
+/// The `mem` methods (and overloads) the translator emits: result, name, parameters, arguments,
+/// and what an access outside the windows does (the switch's `default`; its `break` leaves
+/// the accessor).
+fn mem_methods() -> Vec<(&'static str, String, &'static str, &'static str, &'static str)> {
     let mut sigs: Vec<(&str, String, &str, &str, &str)> = vec![
         ("uint", "Load".into(), "uint a", "a", "return 0u;"),
         ("uint2", "Load2".into(), "uint a", "a", "return uint2(0u, 0u);"),
@@ -5697,42 +5967,100 @@ fn mem_accessors(windows: u32, heap: Option<&str>) -> String {
             sigs.push(("void", format!("Interlocked{op}64"), "uint a, int64_t v, out int64_t o", "a, v, o", "o = (int64_t)0; break;"));
         }
     }
-    let mut s = String::new();
-    if let Some(coherent) = heap {
-        // one access: window k is descriptor MEM_HEAP_BASE + k; an `xcl_w` outside the windows
-        // does what the switch's `default` does
-        let _ = writeln!(s, "#define XCL_MW {coherent}RWByteAddressBuffer m = ResourceDescriptorHeap[NonUniformResourceIndex({}u + xcl_w)]", super::MEM_HEAP_BASE);
-        let _ = writeln!(s, "uint4 xcl_loadx4(uint4 a) {{ [branch] if (xcl_w >= {windows}u) {{ return uint4(0u, 0u, 0u, 0u); }} XCL_MW; return uint4(m.Load(a.x), m.Load(a.y), m.Load(a.z), m.Load(a.w)); }}");
-        for (ret, name, params, args, def) in sigs {
-            let r = if ret == "void" { "" } else { "return " };
-            // (the switch's `break` leaves the accessor)
-            let outside = def.replace("break;", "return;");
-            let _ = writeln!(s, "{ret} xcl_m{name}({params}) {{ [branch] if (xcl_w >= {windows}u) {{ {outside} }} XCL_MW; {r}m.{name}({args}); }}");
-        }
-        return s;
-    }
-    let _ = write!(s, "uint4 xcl_loadx4(uint4 a) {{ [branch] switch (xcl_w) {{ ");
-    let _ = write!(s, "case 0u: return uint4(mem.Load(a.x), mem.Load(a.y), mem.Load(a.z), mem.Load(a.w)); ");
+    sigs
+}
+
+/// The body of an accessor: the switch on the window `w` (`xcl_loadx4`).
+fn loadx4_switch(windows: u32, w: &str) -> String {
+    let mut s = format!("[branch] switch ({w}) {{ ");
+    s.push_str("case 0u: return uint4(mem.Load(a.x), mem.Load(a.y), mem.Load(a.z), mem.Load(a.w)); ");
     for k in 1..windows {
         let _ = write!(s, "case {k}u: return uint4(mem{k}.Load(a.x), mem{k}.Load(a.y), mem{k}.Load(a.z), mem{k}.Load(a.w)); ");
     }
-    let _ = writeln!(s, "default: return uint4(0u, 0u, 0u, 0u); }} }}");
-    for (ret, name, params, args, def) in sigs {
-        let _ = write!(s, "{ret} xcl_m{name}({params}) {{ [branch] switch (xcl_w) {{ ");
-        if ret == "void" {
-            let _ = write!(s, "case 0u: mem.{name}({args}); break; ");
-            for k in 1..windows {
-                let _ = write!(s, "case {k}u: mem{k}.{name}({args}); break; ");
-            }
-        } else {
-            let _ = write!(s, "case 0u: return mem.{name}({args}); ");
-            for k in 1..windows {
-                let _ = write!(s, "case {k}u: return mem{k}.{name}({args}); ");
+    s.push_str("default: return uint4(0u, 0u, 0u, 0u); }");
+    s
+}
+
+/// The body of an accessor: the switch on the window `w` (a `mem` method, `def` outside the windows).
+fn method_switch(windows: u32, w: &str, ret: &str, name: &str, args: &str, def: &str) -> String {
+    let mut s = format!("[branch] switch ({w}) {{ ");
+    if ret == "void" {
+        let _ = write!(s, "case 0u: mem.{name}({args}); break; ");
+        for k in 1..windows {
+            let _ = write!(s, "case {k}u: mem{k}.{name}({args}); break; ");
+        }
+    } else {
+        let _ = write!(s, "case 0u: return mem.{name}({args}); ");
+        for k in 1..windows {
+            let _ = write!(s, "case {k}u: return mem{k}.{name}({args}); ");
+        }
+    }
+    let _ = write!(s, "default: {def} }}");
+    s
+}
+
+/// The accessor functions: one per `mem` method (and overload) the translator emits.
+/// Only explicit windows `0..windows` touch GPU buffers; any out-of-range `xcl_w` hits
+/// `default` (reads return 0, stores/atomics are dropped and zero their `out` parameter) so
+/// out-of-UMA pointers can never wrap onto live memory windows.
+/// `heap`: Some(storage class) – window k is taken from the descriptor heap
+/// (`Options::heap_windows`) and the same rule is one comparison before the access.
+fn mem_accessors(windows: u32, heap: Option<&str>) -> String {
+    let mut s = String::new();
+    if let Some(coherent) = heap {
+        // Redirect ordinary out-of-window loads/stores to null raw UAVs without a divergent
+        // branch. Atomics keep the guard because their out parameter must be set to zero.
+        let buf = |nul: u32| format!(
+            "{{ bool xcl_o = xcl_w >= {windows}u; {coherent}RWByteAddressBuffer m = ResourceDescriptorHeap[NonUniformResourceIndex(select(xcl_o, {nul}u, {}u + xcl_w))]; ",
+            super::MEM_HEAP_BASE
+        );
+        let _ = writeln!(s, "#define XCL_MW {coherent}RWByteAddressBuffer m = ResourceDescriptorHeap[NonUniformResourceIndex({}u + xcl_w)]", super::MEM_HEAP_BASE);
+        let _ = writeln!(s, "uint4 xcl_loadx4(uint4 a) {}return uint4(m.Load(a.x), m.Load(a.y), m.Load(a.z), m.Load(a.w)); }}", buf(super::MEM_NULL_LOAD));
+        for (ret, name, params, args, def) in mem_methods() {
+            if name.starts_with("Load") || name.starts_with("Store") {
+                let nul = if name.starts_with("Store") { super::MEM_NULL_STORE } else { super::MEM_NULL_LOAD };
+                let call = if name.starts_with("Store") {
+                    format!("m.{name}(a, {});", &args[3..])
+                } else {
+                    format!("return m.{name}(a);")
+                };
+                let _ = writeln!(s, "{ret} xcl_m{name}({params}) {}{}}}", buf(nul), call);
+            } else {
+                let r = if ret == "void" { "" } else { "return " };
+                let outside = def.replace("break;", "return;");
+                let _ = writeln!(s, "{ret} xcl_m{name}({params}) {{ [branch] if (xcl_w >= {windows}u) {{ {outside} }} XCL_MW; {r}m.{name}({args}); }}");
             }
         }
-        let _ = writeln!(s, "default: {def} }} }}");
+        return s;
+    }
+    let _ = writeln!(s, "uint4 xcl_loadx4(uint4 a) {{ {} }}", loadx4_switch(windows, "xcl_w"));
+    for (ret, name, params, args, def) in mem_methods() {
+        let _ = writeln!(s, "{ret} xcl_m{name}({params}) {{ {} }}", method_switch(windows, "xcl_w", ret, &name, args, def));
     }
     s
+}
+
+/// A translated program with several memory windows as two libraries for DXC's linker: the
+/// program, whose accessors are only declared, and the accessors. DXC inlines a function when
+/// it compiles the program, before it optimises: a switch per access, and its time grows with
+/// the square of them. The linker inlines the declared ones afterwards. None: no windows, or
+/// fewer than `min_accesses` places that use them (DXC is fast enough then).
+pub(super) fn linked_form(hlsl: &str, min_accesses: usize) -> Option<(String, String)> {
+    let (windows, inline) = (2..=4).map(|w| (w, mem_accessors(w, None))).find(|(_, a)| hlsl.contains(a.as_str()))?;
+    let (head, rest) = hlsl.split_once(inline.as_str())?;
+    if rest.matches("xcl_m").count() + rest.matches("xcl_loadx4(").count() < min_accesses || rest.matches("[numthreads(").count() != 1 {
+        return None;
+    }
+    let mut declared = String::from("uint4 xcl_l_loadx4(uint w, uint4 a);\nuint4 xcl_loadx4(uint4 a) { return xcl_l_loadx4(xcl_w, a); }\n");
+    let mut library: String = head.lines().filter(|l| l.contains("RWByteAddressBuffer mem")).map(|l| format!("{l}\n")).collect();
+    let _ = writeln!(library, "export uint4 xcl_l_loadx4(uint w, uint4 a) {{ {} }}", loadx4_switch(windows, "w"));
+    for (ret, name, params, args, def) in mem_methods() {
+        let r = if ret == "void" { "" } else { "return " };
+        let _ = writeln!(declared, "{ret} xcl_l_{name}(uint w, {params});\n{ret} xcl_m{name}({params}) {{ {r}xcl_l_{name}(xcl_w, {args}); }}");
+        let _ = writeln!(library, "export {ret} xcl_l_{name}(uint w, {params}) {{ {} }}", method_switch(windows, "w", ret, &name, args, def));
+    }
+    let program = format!("{head}{declared}{}", rest.replacen("[numthreads(", "[shader(\"compute\")]\n[numthreads(", 1));
+    Some((program, library))
 }
 
 /// Sub-dword d16 forms: (bytes, sign-extend, store, half: 0 low / 1 high) by the name after
@@ -5957,6 +6285,18 @@ void st_bytes(uint a, uint4 r, uint n) {
 uint dst_sel(uint4 c, uint sel, bool isint) { return select(sel == 0u, 0u, select(sel == 1u, select(isint, 1u, 0x3F800000u), pick4(c, (sel - 4u) & 3u))); }
 "#;
 
+/// Split wave64: whether the halves of a hardware group of `threads` meet through bounded
+/// arrival counters (`XCL_X_SPIN 1`) rather than a group barrier. Several console waves per
+/// group (more than 64 threads) always use the counters: a group barrier would wait for the
+/// other console waves too, whose control flow may differ. A group of one console wave meets at
+/// a group barrier: its two halves are the whole group and take the same branches (on exchanged,
+/// wave-uniform state), so both reach every exchange, and the barrier costs a fraction of the
+/// counters (#1244). `XCL_WAVE64_SPIN` (`env`) set to anything but `0` forces the counters there
+/// too: a desynchronised pair then gives wrong output instead of hanging the dispatch.
+pub(super) fn x64_spin_for(threads: u32, env: Option<&str>) -> bool {
+    threads > 64 || env.is_some_and(|v| !v.trim().is_empty() && v.trim() != "0")
+}
+
 /// A console wave64 as two hardware wave32 halves of one thread group (docs/wave64-on-wave32.md):
 /// per-lane code is unchanged, and the halves meet ("exchange") wherever a value has to be
 /// the whole wave's – masks, lane reads, coherent scalar loads – so both hold the same SGPRs
@@ -5969,8 +6309,9 @@ const PRELUDE_X64: &str = r#"
 static uint xcl_cw = 0u;
 static uint xcl_xk = 0u;
 static uint xcl_xn = 0u;
-// the other half did not arrive in time (a desynchronised pair): no more exchanges, the
-// wave finishes with its own half's values instead of hanging the GPU
+static const uint XCL_X_FAIL = 0x80000000u;
+// the other half did not arrive in time (a desynchronised pair): the generated program
+// returns after the exchange instead of consuming a placeholder value
 static bool xcl_x_dead = false;
 // The console thread (index in the group) this hardware thread stands for. The threads of a
 // group are interchangeable, but the console forms its waves from consecutive thread
@@ -6007,14 +6348,26 @@ bool xcl_x_meet() {
     uint lanes = WaveActiveCountBits(true);
     uint ok = 1u;
     if (WaveIsFirstLane()) {
+        uint own = xcl_cw * 2u + xcl_half;
+        uint other = xcl_cw * 2u + (xcl_half ^ 1u);
         uint o;
-        InterlockedAdd(XCL_XC(xcl_cw * 2u + xcl_half), lanes, o);
+        InterlockedAdd(XCL_XC(own), lanes, o);
         uint need = (k + 1u) * xcl_xn;
-        [loop] for (uint n = 0u; ; n++) {
-            uint c;
-            InterlockedAdd(XCL_XC(xcl_cw * 2u + (xcl_half ^ 1u)), 0u, c);
-            if ((int)(c - need) >= 0) break;
-            if (n >= (1u << 20)) { ok = 0u; break; }
+        if (((o | (o + lanes) | need) & XCL_X_FAIL) != 0u) {
+            ok = 0u;
+        } else {
+            [loop] for (uint n = 0u; ; n++) {
+                uint c;
+                InterlockedAdd(XCL_XC(other), 0u, c);
+                if ((c & XCL_X_FAIL) != 0u) { ok = 0u; break; }
+                if (c >= need) break;
+                if (n >= (1u << 20)) {
+                    uint actual;
+                    InterlockedCompareExchange(XCL_XC(other), c, c | XCL_X_FAIL, actual);
+                    if (actual == c || (actual & XCL_X_FAIL) != 0u) { ok = 0u; break; }
+                    if (actual >= need) break;
+                }
+            }
         }
     }
     if (WaveReadLaneFirst(ok) == 0u) { xcl_x_dead = true; return false; }
@@ -6055,6 +6408,12 @@ uint2 xcl_x_ballot_local(bool b) {
 // DPP16, DPP8, ds_swizzle, v_permlane(x)16: the ISA keeps the source in the reader's half
 uint xcl_x_rla_half(uint v, uint l) { return WaveReadLaneAt(v, l & 31u); }
 "#;
+
+/// Whether a multi-warp Compute / Mesh `s_barrier` gets the early-exit-safe barrier
+/// (`XCL_SAFE_BARRIER=0`: the plain group barrier, in both translators).
+pub(crate) fn safe_barrier_wanted() -> bool {
+    std::env::var("XCL_SAFE_BARRIER").map_or(true, |v| v.trim() != "0")
+}
 
 /// Early-exit-safe, bounded workgroup barrier for multi-warp Compute / Mesh `s_barrier`.
 ///
@@ -6117,6 +6476,46 @@ void xcl_s_barrier() {
 }
 "#;
 
+/// Whole-wave reductions of graphics programs (`graphics_reductions`). The console combines
+/// the lanes through DPP and permlane steps that pass partial results through lanes that were
+/// never launched (`s_or_saveexec -1` runs them); here those lanes do not exist and the steps
+/// read 0 from them, so a wave that is not full lost the words of live lanes. The lanes of each
+/// half of a 64-lane hardware wave is a wave32 console wave of its own; a wave64 program reduces
+/// the launched hardware wave once. A helper lane is in no wave operation and gets the result of
+/// a live lane of its quad (every quad has one).
+const PRELUDE_REDUCE: &str = r#"
+uint xcl_red_share(uint r) {
+#ifdef XCL_PIXEL
+    uint hw = WaveGetLaneIndex();
+    uint nib = (WaveActiveBallot(true)[hw >> 5] >> (hw & 28u)) & 15u;
+    uint q0 = QuadReadLaneAt(r, 0u), q1 = QuadReadLaneAt(r, 1u), q2 = QuadReadLaneAt(r, 2u), q3 = QuadReadLaneAt(r, 3u);
+    uint k = firstbitlow(nib);
+    r = (k & 2u) != 0u ? ((k & 1u) != 0u ? q3 : q2) : ((k & 1u) != 0u ? q1 : q0);
+#endif
+    return r;
+}
+uint xcl_red_or(uint x) {
+    uint a = WaveActiveBitOr(select(xcl_half == 0u, x, 0u)), b = WaveActiveBitOr(select(xcl_half == 0u, 0u, x));
+    return xcl_red_share(select(xcl_half == 0u, a, b));
+}
+uint xcl_red_max(uint x) {
+    uint a = WaveActiveMax(select(xcl_half == 0u, x, 0u)), b = WaveActiveMax(select(xcl_half == 0u, 0u, x));
+    return xcl_red_share(select(xcl_half == 0u, a, b));
+}
+uint xcl_red_and(uint x) {
+    uint a = WaveActiveBitAnd(select(xcl_half == 0u, x, 0xFFFFFFFFu)), b = WaveActiveBitAnd(select(xcl_half == 0u, 0xFFFFFFFFu, x));
+    return xcl_red_share(select(xcl_half == 0u, a, b));
+}
+uint xcl_red_min(uint x) {
+    uint a = WaveActiveMin(select(xcl_half == 0u, x, 0xFFFFFFFFu)), b = WaveActiveMin(select(xcl_half == 0u, 0xFFFFFFFFu, x));
+    return xcl_red_share(select(xcl_half == 0u, a, b));
+}
+uint xcl_red64_or(uint x) { return xcl_red_share(WaveActiveBitOr(x)); }
+uint xcl_red64_max(uint x) { return xcl_red_share(WaveActiveMax(x)); }
+uint xcl_red64_and(uint x) { return xcl_red_share(WaveActiveBitAnd(x)); }
+uint xcl_red64_min(uint x) { return xcl_red_share(WaveActiveMin(x)); }
+"#;
+
 /// Pixel shaders: masks hold the helper lanes (#105). After `s_wqm` the helper pixels of a
 /// quad a primitive's edge splits are in EXEC and the console's `v_cmp*` / carries set their
 /// bits like any other lane's; wave ops leave helper lanes out before SM 6.7 (their ballot bits
@@ -6133,13 +6532,16 @@ const PRELUDE_PIXEL: &str = r#"
 // compare's vector operands, not of its result (`quad_bits`: AMD's compiler crashed on those,
 // #134); elsewhere ballot_px quad-reads the result.
 uint2 ballot_px_quad(uint q) {
-    uint2 m = uint2(0u, 0u);
-    [unroll] for (uint p = 0u; p < 4u; p++) {
-        uint2 w = WaveActiveBallot(((q >> p) & 1u) != 0u).xy;
-        w |= w >> 1;
-        w |= w >> 2;
-        m |= (w & 0x11111111u) << p;
-    }
+    uint2 w0 = WaveActiveBallot(((q >> 0u) & 1u) != 0u).xy;
+    w0 |= w0 >> 1; w0 |= w0 >> 2;
+    uint2 w1 = WaveActiveBallot(((q >> 1u) & 1u) != 0u).xy;
+    w1 |= w1 >> 1; w1 |= w1 >> 2;
+    uint2 w2 = WaveActiveBallot(((q >> 2u) & 1u) != 0u).xy;
+    w2 |= w2 >> 1; w2 |= w2 >> 2;
+    uint2 w3 = WaveActiveBallot(((q >> 3u) & 1u) != 0u).xy;
+    w3 |= w3 >> 1; w3 |= w3 >> 2;
+    uint2 m = ((w0 & 0x11111111u) << 0u) | ((w1 & 0x11111111u) << 1u)
+            | ((w2 & 0x11111111u) << 2u) | ((w3 & 0x11111111u) << 3u);
     return uint2(select(and(xcl_w32, xcl_half != 0u), m.y, m.x), select(xcl_w32, 0u, m.y));
 }
 uint2 ballot_px(bool b) {
@@ -6185,7 +6587,7 @@ uint rla(uint v, uint l) {
     // do not before SM 6.7), and the console's derivatives (DPP quad_perm, ds_swizzle) read the
     // helper pixels of a quad a primitive's edge splits.
     uint q0 = QuadReadLaneAt(v, 0u), q1 = QuadReadLaneAt(v, 1u), q2 = QuadReadLaneAt(v, 2u), q3 = QuadReadLaneAt(v, 3u);
-    uint q = (l & 2u) != 0u ? ((l & 1u) != 0u ? q3 : q2) : ((l & 1u) != 0u ? q1 : q0);
+    uint q = select((l & 2u) != 0u, select((l & 1u) != 0u, q3, q2), select((l & 1u) != 0u, q1, q0));
     // A helper lane of another quad: after s_wqm the console's v_readfirstlane often picks
     // one (the first lane of EXEC on a primitive's edge), and a wave read of it is undefined
     // here (0 in practice: every other quad of the wave got the wrong value, e.g. a shader's
@@ -6193,12 +6595,14 @@ uint rla(uint v, uint l) {
     // reader takes that from a live lane of the same quad.
     uint h = l + 32u * xcl_half;
     uint4 xcl_lv = WaveActiveBallot(true);
-    uint nib = (xcl_lv[min(h >> 5, 3u)] >> (h & 28u)) & 15u;
+    uint hw = h >> 5;
+    uint lv_w = select(hw < 2u, select(hw == 0u, xcl_lv.x, xcl_lv.y), select(hw == 2u, xcl_lv.z, xcl_lv.w));
+    uint nib = (lv_w >> (h & 28u)) & 15u;
     uint src = (h & ~3u) + firstbitlow(nib);
     uint r0 = WaveReadLaneAt(q0, src), r1 = WaveReadLaneAt(q1, src), r2 = WaveReadLaneAt(q2, src), r3 = WaveReadLaneAt(q3, src);
-    uint r = (l & 2u) != 0u ? ((l & 1u) != 0u ? r3 : r2) : ((l & 1u) != 0u ? r1 : r0);
-    if (nib != 0u && ((nib >> (h & 3u)) & 1u) == 0u) w = r;
-    if ((l >> 2) == (lane_id >> 2)) w = q;
+    uint r = select((l & 2u) != 0u, select((l & 1u) != 0u, r3, r2), select((l & 1u) != 0u, r1, r0));
+    w = select(and(nib != 0u, ((nib >> (h & 3u)) & 1u) == 0u), r, w);
+    w = select((l >> 2) == (lane_id >> 2), q, w);
 #endif
     return w;
 }
@@ -6234,6 +6638,35 @@ float3 cube_dir(float s, float t, float face) {
 // the cube of a cube array the face coordinate (face + 8 · slice) is in
 float cube_slice(float face) { return (float)(((uint)round(face)) / 8u); }
 uint first_lane(uint lo, uint hi) { return select(lo != 0u, firstbitlow(lo), select(hi != 0u, 32u + firstbitlow(hi), 0u)); }
+// The lane a v_readfirstlane reads. In a pixel shader EXEC holds helper lanes (s_wqm) and its
+// first lane is often one, on a primitive's edge. A helper lane's registers cannot be read once
+// a loop has run a wave op: AMD's RDNA2 driver (RX 6700 XT) gives 0 for everything a helper
+// lane holds after a WaveReadLaneAt inside a loop, quad reads included. A loop whose state the
+// console's compiler carries in a vector (v_mov v, s … v_readfirstlane s, v) then read 0 back
+// each time round and ran to the loop budget: a retail volumetric light pass took seconds a draw
+// and the GPU was reset. So the first live lane of EXEC is read if EXEC has one. The value
+// is the same there: the console's compiler reads the first lane of values that are equal in
+// every lane, or of any lane it then removes from EXEC (a waterfall loop).
+// "Is a lane left" of a lane mask in a pixel shader, over the live lanes. AMD's RDNA2 driver
+// (RX 6700 XT) also stops keeping a helper lane's registers at a loop's back edge when the
+// shader has another loop before it: from the second pass on, everything a helper lane holds
+// reads as 0. A loop that goes on as long as lanes are left in a mask (s_andn2 mask, mask, EXEC;
+// s_cbranch_scc1) then kept a helper lane's bit, whose "done" condition comes from registers
+// that no longer change, and ran to the loop budget (a retail volumetric light pass took seconds
+// a draw and the GPU was reset). The helper lanes leave with the live ones.
+uint mask_live(uint m) {
+#ifdef XCL_PIXEL
+    m &= ballot(true).x;
+#endif
+    return m;
+}
+uint first_lane_live(uint lo, uint hi) {
+#ifdef XCL_PIXEL
+    uint2 lv = ballot(true);
+    if (((lo & lv.x) | (hi & lv.y)) != 0u) { lo &= lv.x; hi &= lv.y; }
+#endif
+    return first_lane(lo, hi);
+}
 uint lanemask_lt_lo() { return lane_id >= 32u ? 0xFFFFFFFFu : (lane_id == 0u ? 0u : (0xFFFFFFFFu >> (32u - lane_id))); }
 uint lanemask_lt_hi() { return lane_id <= 32u ? 0u : (0xFFFFFFFFu >> (64u - lane_id)); }
 uint wqm(uint m) { uint q = m | (m >> 1); q = q | (q >> 2); q &= 0x11111111u; return q * 15u; }
@@ -6242,6 +6675,7 @@ uint absd8(uint a, uint b, uint k) { uint x = (a >> k) & 0xFFu; uint y = (b >> k
 uint absd16(uint a, uint b, uint k) { uint x = (a >> k) & 0xFFFFu; uint y = (b >> k) & 0xFFFFu; return max(x, y) - min(x, y); }
 uint sad_u8(uint a, uint b) { return absd8(a, b, 0u) + absd8(a, b, 8u) + absd8(a, b, 16u) + absd8(a, b, 24u); }
 uint msad_u8(uint a, uint b) { return select((b & 0xFFu) != 0u, absd8(a, b, 0u), 0u) + select(((b >> 8) & 0xFFu) != 0u, absd8(a, b, 8u), 0u) + select(((b >> 16) & 0xFFu) != 0u, absd8(a, b, 16u), 0u) + select((b >> 24) != 0u, absd8(a, b, 24u), 0u); }
+uint pk_sad_u16(uint d0, uint d1, uint acc, bool sat) { uint s0 = (acc & 0xFFFFu) + d0; uint s1 = (acc >> 16) + d1; return select(sat, min(s0, 0xFFFFu), s0 & 0xFFFFu) | (select(sat, min(s1, 0xFFFFu), s1 & 0xFFFFu) << 16); }
 uint lerp8(uint a, uint b, uint c, uint k) { return ((((a >> k) & 0xFFu) + ((b >> k) & 0xFFu) + ((c >> k) & 1u)) >> 1) << k; }
 uint lerp_u8(uint a, uint b, uint c) { return lerp8(a, b, c, 0u) | lerp8(a, b, c, 8u) | lerp8(a, b, c, 16u) | lerp8(a, b, c, 24u); }
 uint sat_u32(uint64_t r) { return select(r > (uint64_t)0xFFFFFFFFu, 0xFFFFFFFFu, (uint)r); }
@@ -6332,7 +6766,8 @@ uint cvt_norm_i16_f16(uint h) {
 uint cvt_norm_i16_f32(float f) {
     return (uint)(int)round((isnan(f) ? 0.0f : clamp(f, -1.0f, 1.0f)) * 32767.0f) & 0xFFFFu;
 }
-float frexp_mant(float x) { float e; return (isinf(x) || isnan(x)) ? x : frexp(x, e); }
+// HLSL frexp()'s mantissa is unsigned; the ISA's keeps the input's sign (as frexp_mant_d)
+float frexp_mant(float x) { float e; return (isinf(x) || isnan(x)) ? x : asfloat(asuint(frexp(x, e)) | (asuint(x) & 0x80000000u)); }
 int frexp_exp(float x) { float e; frexp(x, e); return (isinf(x) || isnan(x)) ? 0 : (int)e; }
 int frexp_exp_f32(uint bits, float legacy_src, uint denorm) {
     // 0: initial MODE unknown, 1: flush input, 2: preserve input.
@@ -6512,7 +6947,19 @@ uint fclass64(double f) {
 
 #[cfg(test)]
 mod tests {
-    use super::PRELUDE_MEM;
+    use super::{mem_accessors, PRELUDE, PRELUDE_MEM};
+
+    #[test]
+    fn heap_window_loads_and_stores_use_null_descriptors_without_branches() {
+        let h = mem_accessors(4, Some("globallycoherent "));
+        let load = format!("select(xcl_o, {}u,", super::super::MEM_NULL_LOAD);
+        let store = format!("select(xcl_o, {}u,", super::super::MEM_NULL_STORE);
+        assert!(h.contains(&load), "load accessor did not select the null-load UAV:\n{h}");
+        assert!(h.contains(&store), "store accessor did not select the null-store UAV:\n{h}");
+        assert!(h.contains("xcl_mInterlockedAdd(uint a, uint v, out uint o) { [branch] if"), "atomic guard was removed:\n{h}");
+        assert!(!h.contains("xcl_mLoad(uint a) { [branch]"), "ordinary load kept a divergent guard:\n{h}");
+        assert!(!h.contains("xcl_mStore(uint a, uint v) { [branch]"), "ordinary store kept a divergent guard:\n{h}");
+    }
 
     #[test]
     fn format_helpers_select_uint4_components_without_runtime_indexing() {
@@ -6522,5 +6969,134 @@ mod tests {
         assert!(!PRELUDE_MEM.contains("bc[tid"), "runtime local-array index remains in bvh_intersect");
         assert!(PRELUDE_MEM.contains("uint pick4(uint4 v, uint i)"));
         assert!(PRELUDE_MEM.contains("void or_at4(inout uint4 r, uint i, uint v)"));
+    }
+
+    #[test]
+    fn rla_pixel_helper_avoids_runtime_vector_indexing_and_branches() {
+        let start = PRELUDE.find("uint rla(uint v, uint l) {").expect("rla in PRELUDE");
+        let rest = &PRELUDE[start..];
+        let end = rest.find("\n}\n").expect("rla closing brace");
+        let rla = &rest[..end + 2];
+        assert!(!rla.contains("xcl_lv["), "runtime vector index remains in rla():\n{rla}");
+        assert!(!rla.contains(" ? "), "scalar ternary remains in rla():\n{rla}");
+        assert!(!rla.contains("if ("), "scalar if-branch remains in rla():\n{rla}");
+        assert!(!rla.contains("pick4("), "PRELUDE::rla() must not depend on PRELUDE_MEM::pick4():\n{rla}");
+        for comp in ["xcl_lv.x", "xcl_lv.y", "xcl_lv.z", "xcl_lv.w", "select("] {
+            assert!(rla.contains(comp), "missing {comp} in rla():\n{rla}");
+        }
+    }
+
+    #[test]
+    fn rla_pixel_shader_compiles_without_local_arrays() {
+        let Ok(dxc_dir) = super::super::dxc::location() else {
+            super::super::runner::skip_test("no DXC");
+            return;
+        };
+        let dxc_exe = dxc_dir.join("dxc.exe");
+        if !dxc_exe.is_file() {
+            super::super::runner::skip_test("no dxc.exe");
+            return;
+        }
+        // Self-contained pixel shader (no PRELUDE_MEM) with 3 dynamic-lane rla() calls.
+        let src = format!(
+            "#define XCL_PIXEL 1\n{PRELUDE}\n\
+            float4 main(float4 p : SV_Position) : SV_Target {{\n\
+                lane_id = WaveGetLaneIndex();\n\
+                uint v = (uint)p.x + ((uint)p.y << 8);\n\
+                uint a = rla(v, lane_id ^ 1u);\n\
+                uint b = rla(v, ((uint)p.x + lane_id) & 63u);\n\
+                uint c = rla(v, ((uint)p.y + 3u) & 127u);\n\
+                return float4(asfloat(a), asfloat(b), asfloat(c), 1.0);\n\
+            }}\n"
+        );
+        let dxil = super::super::dxc::compile(&src, "main", "ps_6_6", &[]).expect("DXC ps_6_6 compile");
+        let tmp = std::env::temp_dir().join(format!("xcl_rla_test_{}.dxil", std::process::id()));
+        std::fs::write(&tmp, &dxil).expect("write temp dxil");
+        let out = std::process::Command::new(&dxc_exe).args(["-dumpbin", tmp.to_str().unwrap()]).output().expect("dxc -dumpbin");
+        let _ = std::fs::remove_file(&tmp);
+        assert!(out.status.success(), "dxc -dumpbin failed: {}", String::from_utf8_lossy(&out.stderr));
+        let ir = String::from_utf8_lossy(&out.stdout);
+        let body = ir.split("define void @main(").nth(1).expect("main body in DXIL disassembly");
+        let body = body.split("\n}\n").next().unwrap_or(body);
+        let allocas = body.lines().filter(|l| l.contains(" = alloca ") || l.trim_start().starts_with("alloca ")).count();
+        let cond_branches = body.lines().filter(|l| l.trim_start().starts_with("br i1 ")).count();
+        assert_eq!(allocas, 0, "expected 0 local arrays in rla() DXIL, got {allocas}");
+        assert_eq!(cond_branches, 0, "expected 0 conditional branches in rla() DXIL, got {cond_branches}");
+    }
+
+    #[test]
+    fn gpu_rla_pixel_shader_matches_reference_including_helper_lanes() {
+        use super::super::{dxc, runner};
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32G32_FLOAT;
+        match (runner::adapter(), runner::wave64_programs_supported(), dxc::location()) {
+            (Ok(_), Ok(true), Ok(_)) => {}
+            (a, w, d) => {
+                runner::skip_test(if a.is_err() || w.is_err() {
+                    "no GPU"
+                } else if d.is_err() {
+                    "no DXC"
+                } else {
+                    "no 32/64-lane waves"
+                });
+                return;
+            }
+        }
+        let vs = dxc::compile("float4 main(float2 p : POSITION) : SV_Position { return float4(p, 0.5, 1.0); }\n", "main", "vs_6_6", &[]).unwrap();
+        let ref_rla = "\
+            uint rla_ref(uint v, uint l) {\n\
+                uint w = WaveReadLaneAt(v, l + 32u * xcl_half);\n\
+                uint q0 = QuadReadLaneAt(v, 0u), q1 = QuadReadLaneAt(v, 1u), q2 = QuadReadLaneAt(v, 2u), q3 = QuadReadLaneAt(v, 3u);\n\
+                uint q = (l & 2u) != 0u ? ((l & 1u) != 0u ? q3 : q2) : ((l & 1u) != 0u ? q1 : q0);\n\
+                uint h = l + 32u * xcl_half;\n\
+                uint4 xcl_lv = WaveActiveBallot(true);\n\
+                uint nib = (xcl_lv[min(h >> 5, 3u)] >> (h & 28u)) & 15u;\n\
+                uint src = (h & ~3u) + firstbitlow(nib);\n\
+                uint r0 = WaveReadLaneAt(q0, src), r1 = WaveReadLaneAt(q1, src), r2 = WaveReadLaneAt(q2, src), r3 = WaveReadLaneAt(q3, src);\n\
+                uint r = (l & 2u) != 0u ? ((l & 1u) != 0u ? r3 : r2) : ((l & 1u) != 0u ? r1 : r0);\n\
+                if (nib != 0u && ((nib >> (h & 3u)) & 1u) == 0u) w = r;\n\
+                if ((l >> 2) == (lane_id >> 2)) w = q;\n\
+                return w;\n\
+            }\n";
+        let src = format!(
+            "#define XCL_PIXEL 1\n{PRELUDE}\n{ref_rla}\n\
+            float4 main(float4 p : SV_Position) : SV_Target {{\n\
+                lane_id = WaveGetLaneIndex();\n\
+                uint v = ((uint)p.x + 1u) + (((uint)p.y + 1u) << 8);\n\
+                uint live0 = WaveActiveBallot(true).x;\n\
+                uint first_q = firstbitlow(wqm(live0));\n\
+                uint first_live = firstbitlow(live0);\n\
+                uint last_live = 31u - firstbithigh(live0);\n\
+                uint qx = rla(v, lane_id ^ 1u);\n\
+                uint qy = rla(v, lane_id ^ 2u);\n\
+                bool ok_q = qx == rla_ref(v, lane_id ^ 1u) && qy == rla_ref(v, lane_id ^ 2u) && rla(v, lane_id ^ 3u) == rla_ref(v, lane_id ^ 3u);\n\
+                bool ok_x = rla(v, first_q) == rla_ref(v, first_q) && rla(v, first_live) == rla_ref(v, first_live) && rla(v, last_live) == rla_ref(v, last_live);\n\
+                return float4((float)qx, (float)qy, ok_q ? 1.0 : 0.0, ok_x ? 1.0 : 0.0);\n\
+            }}\n"
+        );
+        let ps = dxc::compile(&src, "main", "ps_6_6", &[]).unwrap();
+        // Two triangles sharing the diagonal x = y so diagonal quads contain live + helper lanes.
+        let quad = [-1.0f32, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, -1.0, 1.0, 1.0, -1.0, 1.0];
+        let layout = [runner::VertexElement { semantic: "POSITION", index: 0, format: DXGI_FORMAT_R32G32_FLOAT, offset: 0 }];
+        let size = 32usize;
+        let px = runner::draw(&vs, &ps, &layout, &quad, 8, &[], &[], size as u32, [-1.0; 4]).unwrap();
+        assert_eq!(px.len(), size * size);
+        for y in 0..size {
+            for x in 0..size {
+                let p = px[y * size + x];
+                let want_x = (((x ^ 1) + 1) + ((y + 1) << 8)) as f32;
+                let want_y = ((x + 1) + (((y ^ 1) + 1) << 8)) as f32;
+                assert_eq!(p, [want_x, want_y, 1.0, 1.0], "pixel ({x}, {y}) mismatch: {p:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn quad_ballot_pixel_helper_has_no_loop_for_dxc_to_unroll() {
+        let pixel = super::PRELUDE_PIXEL;
+        let start = pixel.find("uint2 ballot_px_quad(uint q) {").expect("ballot_px_quad in PRELUDE_PIXEL");
+        let rest = &pixel[start..];
+        let quad = &rest[..rest.find("\n}\n").expect("ballot_px_quad closing brace") + 2];
+        let looped = quad.split(|c: char| !(c.is_alphanumeric() || c == '_')).any(|w| ["for", "while", "unroll"].contains(&w));
+        assert!(!looped, "a loop remains in ballot_px_quad():\n{quad}");
     }
 }

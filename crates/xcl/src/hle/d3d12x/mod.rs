@@ -10,6 +10,8 @@
 #![allow(non_snake_case)]
 
 mod alloc_pool;
+pub use alloc_pool::AllocatorSubmitStats;
+mod build_queue;
 pub mod bind;
 pub mod console_heap;
 pub mod console_list;
@@ -17,24 +19,35 @@ pub mod clamp;
 pub mod device_x;
 pub mod dxgi_device;
 mod cpu_writes;
+pub mod dred;
 mod fence_x;
 pub mod frame;
+pub(crate) mod gfx_records;
 pub mod guard;
 mod late_release;
 pub mod layout;
 pub mod list_x;
+pub mod memory_report;
 pub mod null;
 pub mod present;
 pub mod pso_async;
+mod queue_submit;
 pub mod real;
 mod shader_cache_session;
 pub mod sparse;
+mod standin;
 pub mod title_list;
 pub mod title_textures;
+mod uma_driver;
+mod used_journal;
 pub mod vram;
 
 use std::ffi::c_void;
 use std::sync::OnceLock;
+
+pub fn allocator_submit_stats() -> AllocatorSubmitStats {
+    alloc_pool::submit_stats()
+}
 
 use crate::util::{HRESULT, S_OK};
 
@@ -71,15 +84,16 @@ pub enum Backend {
 }
 
 /// Decided once: the real backend unless disabled or the driver refuses.
-pub fn backend() -> Backend {
-    static B: OnceLock<Backend> = OnceLock::new();
-    *B.get_or_init(|| {
+static BACKEND: OnceLock<Backend> = OnceLock::new();
+
+fn backend_with_remap(allow_driver_remap: bool) -> Backend {
+    *BACKEND.get_or_init(|| {
         let cfg = crate::state::config();
         if cfg.graphics.eq_ignore_ascii_case("null") {
             crate::xlog_info!("D3D12.X: backend 'null' (from the config)");
             return Backend::Null;
         }
-        match real::init() {
+        match real::init_with_remap(allow_driver_remap) {
             Ok(desc) => {
                 crate::xlog_info!("D3D12.X: backend 'real' – {desc}");
                 Backend::Real
@@ -90,6 +104,14 @@ pub fn backend() -> Backend {
             }
         }
     })
+}
+
+pub fn backend() -> Backend {
+    backend_with_remap(false)
+}
+
+pub(crate) fn backend_before_guest() -> Backend {
+    backend_with_remap(true)
 }
 
 /// Call a function of the system d3d12.dll by name.

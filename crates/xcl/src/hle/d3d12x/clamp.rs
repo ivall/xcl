@@ -262,7 +262,8 @@ mod tests {
             let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: ty, ..Default::default() }).unwrap();
             let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
             // (the last three at the top of the range: 65 535² folds into exactly 65 535 rows,
-            // one more or u32::MAX would need 65 536 rows – clamped, as `bind::fold` does)
+            // one more or u32::MAX would need 65 536 rows – clamped: the CPU's `bind::fold` does not
+            // run those)
             for (k, (args, want, io_want)) in [
                 ([72_512u32, 1, 1], [65_535u32, 2, 1], 72_512u32),
                 ([70_000, 2, 1], [65_535, 2, 1], 0),
@@ -274,7 +275,7 @@ mod tests {
             .into_iter()
             .enumerate()
             {
-                let (limit, groups) = super::super::bind::fold(args[0], args[1], args[2]);
+                let (limit, groups) = super::super::bind::fold(args).unwrap_or((0, args.map(|n| n.min(65_535))));
                 assert_eq!((groups, limit), (want, io_want), "{args:?}: the CPU's fold, which the GPU's must match");
                 let (a, ap) = visible(&dev, 256);
                 let (io, iop) = visible(&dev, 256);

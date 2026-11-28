@@ -48,6 +48,37 @@ fn copy_dir(src: &Path, dst: &Path) {
     }
 }
 
+#[test]
+fn incomplete_discovered_corpus_blocks_headless_title_entry() {
+    let xcl = Path::new(env!("CARGO_BIN_EXE_xcl"));
+    let root = temp_dir("incomplete-corpus");
+    let game = root.join("game");
+    let data = root.join("data");
+    copy_dir(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/data/testgame"), &game);
+    std::fs::copy(xcl.parent().unwrap().join("xcl_testtitle.exe"), game.join("xcl_testtitle.exe")).unwrap();
+    std::fs::create_dir_all(game.join(".xcl/pso-corpus")).unwrap();
+    let settings = data.join("XCL.TestTitle");
+    std::fs::create_dir_all(&settings).unwrap();
+    std::fs::write(settings.join("xcl.toml"), "graphics='null'\npresent='off'\n").unwrap();
+    let launch = |prepare| Command::new(xcl).arg("run").arg(&game).env("XCL_DATA_ROOT", &data)
+        .env("XCL_PREPARE", prepare).output().unwrap();
+    let out = launch("0");
+    assert!(!out.status.success(), "An incomplete corpus released the guest");
+    let log = std::fs::read_to_string(settings.join("logs/xcl.log")).unwrap();
+    assert!(log.contains("Incomplete pipeline corpus"), "{log}");
+    assert!(!log.contains("game entry point returned"), "{log}");
+    std::fs::remove_dir(game.join(".xcl/pso-corpus")).unwrap();
+    std::fs::create_dir_all(settings.join("cache")).unwrap();
+    std::fs::write(settings.join("cache/used-graphics-pipelines.bin"), b"bad history").unwrap();
+    let _ = launch("0");
+    let log = std::fs::read_to_string(settings.join("logs/xcl.log")).unwrap();
+    assert!(!log.contains("unrecognized graphics job header"), "Disabled optional preparation read local history");
+    assert!(!launch("1").status.success());
+    let log = std::fs::read_to_string(settings.join("logs/xcl.log")).unwrap();
+    assert!(log.contains("unrecognized graphics job header"), "{log}");
+    assert!(!log.contains("game entry point returned"), "{log}");
+}
+
 struct TempDir(PathBuf);
 
 impl std::ops::Deref for TempDir {
@@ -128,6 +159,9 @@ fn test_title_runs_and_game_folder_is_untouched() {
     copy_dir(&manifest.join("..").join("..").join("tests").join("data").join("testgame"), &game);
     std::fs::copy(&title, game.join("xcl_testtitle.exe")).unwrap();
     std::fs::copy(&dll, game.join("testgame_mw.dll")).unwrap();
+    // Already-compiled graphics bytecode still goes through startup discovery.
+    std::fs::create_dir(game.join("shaders")).unwrap();
+    std::fs::copy(manifest.join("../../tests/data/dxil/dxc_vs_uav.dxil"), game.join("shaders/vertex.dxbc")).unwrap();
     let before = snapshot(&game);
 
     let out = Command::new(&xcl)
@@ -156,6 +190,13 @@ fn test_title_runs_and_game_folder_is_untouched() {
     assert!(fails.is_empty(), "failed checks in the test title:\n{}", fails.join("\n"));
     assert!(stdout.contains("xcl_testtitle: done, failures: 0"), "the test title did not run to the end");
     assert!(out.status.success(), "exit code {:?}", out.status.code());
+
+    let log = std::fs::read_to_string(data.join("XCL.TestTitle/logs/xcl.log")).unwrap();
+    let backend_init = log.find("D3D12.X: backend '").expect("backend initialized");
+    let dll_init = log.find("DllMain(").expect("dependent DLL initialized");
+    assert!(backend_init < dll_init, "D3D12 backend initialized after title DLL code ran");
+    let window = |tag| log.lines().find_map(|line| line.split_once(tag).map(|(_, hwnd)| hwnd)).unwrap();
+    assert_eq!(window("Shader preparation window "), window("present: swap chain window "));
 
     // (2) the game folder is untouched
     assert_eq!(snapshot(&game), before, "GAME FOLDER WAS MODIFIED");
@@ -270,11 +311,22 @@ fn test_title_runs_and_game_folder_is_untouched() {
 /// (Graphics Tools) and the system XGameRuntime, as the run above does; skipped without them.
 #[test]
 fn test_title_draws_with_a_root_signature_under_the_debug_layer() {
+    title_under_the_debug_layer(false);
+}
+
+/// The same run with `XCL_DRED=1` too (#2298): D3D12Core makes a command list's breadcrumb
+/// buffer through the device's public CreatePlacedResource, which XCL took for the title's.
+#[test]
+fn test_title_runs_under_the_debug_layer_with_dred() {
+    title_under_the_debug_layer(true);
+}
+
+fn title_under_the_debug_layer(dred: bool) {
     let sys = PathBuf::from(std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into())).join("System32");
     for dll in ["d3d12SDKLayers.dll", "xgameruntime.dll"] {
         if !sys.join(dll).is_file() {
             use std::io::Write;
-            let _ = writeln!(std::io::stderr(), "SKIPPED test_title_draws_with_a_root_signature_under_the_debug_layer: no {dll}");
+            let _ = writeln!(std::io::stderr(), "SKIPPED the title under the debug layer (dred: {dred}): no {dll}");
             return;
         }
     }
@@ -287,7 +339,14 @@ fn test_title_draws_with_a_root_signature_under_the_debug_layer() {
     for f in ["xcl_testtitle.exe", "testgame_mw.dll"] {
         std::fs::copy(bin_dir.join(f), game.join(f)).unwrap_or_else(|e| panic!("{f}: {e} – build first: cargo build --workspace"));
     }
-    let out = Command::new(&xcl).arg("run").arg(&game).arg("--").arg("--hello").env("XCL_DATA_ROOT", &data).env("XCL_D3D12_DEBUG", "1").output().expect("spawn xcl");
+    let mut cmd = Command::new(&xcl);
+    cmd.arg("run").arg(&game).arg("--").arg("--hello").env("XCL_DATA_ROOT", &data).env("XCL_D3D12_DEBUG", "1");
+    if dred {
+        cmd.env("XCL_DRED", "1");
+    } else {
+        cmd.env_remove("XCL_DRED");
+    }
+    let out = cmd.output().expect("spawn xcl");
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "exit code {:?}\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}", out.status.code());

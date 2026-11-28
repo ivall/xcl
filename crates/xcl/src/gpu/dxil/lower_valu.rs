@@ -351,6 +351,9 @@ impl Lw {
         if name.starts_with("v_pk_") || name.starts_with("v_dot") {
             return self.valu_pk(d, name);
         }
+        if matches!(name, "v_qsad_pk_u16_u8" | "v_mqsad_pk_u16_u8" | "v_mqsad_u32_u8") {
+            return self.valu_qsad(d, name);
+        }
         if name.starts_with("v_movrel") {
             return self.movrel(d, name);
         }
@@ -387,7 +390,7 @@ impl Lw {
         let m = Self::mods(d);
         let u = self.sources(d, &ins, src_f16)?;
         if let Some(rest) = name.strip_prefix("v_cmpx_").or_else(|| name.strip_prefix("v_cmp_")) {
-            return self.vopc(d, rest, name.starts_with("v_cmpx_"), &outs, &u, &m);
+            return self.vopc(d, rest, name.starts_with("v_cmpx_"), &ins, &outs, &u, &m);
         }
         let dst = outs.first().map(|o| Self::dst_of(d, o)).unwrap_or(Dst::Null);
         let z = self.c(0);
@@ -1037,16 +1040,19 @@ impl Lw {
                 let cb = self.lane_of(l, h);
                 let cin = self.u(cb);
                 let (x, y) = if name == "v_subrev_co_ci_u32" { (b, a) } else { (a, b) };
-                let (x6, y6, c6) = (self.zext64(x), self.zext64(y), self.zext64(cin));
-                let w = if name == "v_add_co_ci_u32" {
-                    let s = self.add(x6, y6);
-                    self.add(s, c6)
+                let (t, carry) = if name == "v_add_co_ci_u32" {
+                    let t0 = self.add(x, y);
+                    let t = self.add(t0, cin);
+                    let c0 = self.cmp(Pred::ULt, t0, x);
+                    let c1 = self.cmp(Pred::ULt, t, t0);
+                    (t, self.lor(c0, c1))
                 } else {
-                    let s = self.sub(x6, y6);
-                    self.sub(s, c6)
+                    let t0 = self.sub(x, y);
+                    let t = self.sub(t0, cin);
+                    let c0 = self.cmp(Pred::ULt, x, y);
+                    let c1 = self.cmp(Pred::ULt, t0, cin);
+                    (t, self.lor(c0, c1))
                 };
-                let (t, hi) = self.unpack64(w);
-                let carry = self.nz(hi);
                 let sdst = outs.get(1).map(|o| Self::dst_of(d, o)).unwrap_or(Dst::S(106));
                 self.write_mask(&sdst, carry);
                 self.vwrite(d, &dst, t);
@@ -1178,7 +1184,7 @@ impl Lw {
         }))
     }
 
-    pub fn vopc(&mut self, d: &Decoded, rest: &str, cmpx: bool, outs: &[&Operand], u: &[Src], m: &Mods) -> LResult<()> {
+    pub fn vopc(&mut self, d: &Decoded, rest: &str, cmpx: bool, ins: &[&Operand], outs: &[&Operand], u: &[Src], m: &Mods) -> LResult<()> {
         let (opn, ty) = rest.rsplit_once('_').ok_or_else(|| format!("{}: VOPC", rdna2::format(d)))?;
         if u.len() < 2 {
             return err(d, "VOPC");
@@ -1226,14 +1232,78 @@ impl Lw {
             }
             t => t,
         };
-        let cond = match ty {
+        // Pixel shaders (#134): quad-read the compare's VGPR operands rather than its
+        // predicate result (AMD RDNA2/3/4 amdxc64 crashes on quadOp of values derived
+        // from WaveReadLaneAt, such as v_readfirstlane waterfall loops).
+        if self.gfx.as_ref().is_some_and(|g| g.ps.is_some())
+            && d.variant == Variant::Plain
+            && self.guard_override.is_none()
+            && opn != "f"
+        {
+            let dst = self.vopc_dst(d, cmpx, outs);
+            if matches!(dst, Dst::Null) && matches!(ty, "f32" | "i32" | "u32") {
+                return Ok(());
+            }
+            let is_vgpr = |o: &Operand| match o.field {
+                Some("LITERAL") | None => false,
+                Some(f) => {
+                    (o.ty.starts_with("OPR_VGPR") && d.enc.field_width(f) <= 8)
+                        || (!matches!(o.ty, "OPR_SIMM16" | "OPR_SIMM32") && Self::field(d, f) >= 256)
+                }
+            };
+            let (a_vgpr, b_vgpr) = if matches!(opn, "t" | "tru") {
+                (false, false)
+            } else {
+                (ins.first().is_some_and(|o| is_vgpr(o)), ins.get(1).is_some_and(|o| is_vgpr(o)))
+            };
+            let (el, eh) = self.exec_mask();
+            let qbase = self.andc(self.lane, !3);
+            let mut q = self.c(0);
+            for p in 0..4u32 {
+                let kp = self.c(p);
+                let qa = if a_vgpr { self.s.quad_read_lane_at(ua, kp) } else { ua };
+                let qb = if b_vgpr {
+                    if ub == ua && a_vgpr {
+                        qa
+                    } else {
+                        self.s.quad_read_lane_at(ub, kp)
+                    }
+                } else {
+                    ub
+                };
+                let cp = self.vopc_cond(d, opn, ty, qa, qb, m)?;
+                let lp = self.or(qbase, kp);
+                let ap = self.lanebit_at(el, eh, lp);
+                let bp = self.land(ap, cp);
+                let up = self.u(bp);
+                let sh = self.shlc(up, p);
+                q = self.or(q, sh);
+            }
+            let (lo, hi) = self.ballot_ps_quad(q);
+            if self.wave64 {
+                self.write64(&dst, lo, hi);
+            } else {
+                self.write32(&dst, lo);
+            }
+            return Ok(());
+        }
+        let cond = self.vopc_cond(d, opn, ty, ua, ub, m)?;
+        self.vopc_write(d, cmpx, outs, cond)
+    }
+
+    fn vopc_cond(&mut self, d: &Decoded, opn: &str, ty: &str, ua: Value, ub: Value, m: &Mods) -> LResult<Value> {
+        Ok(match ty {
             "f32" => {
                 let a = self.fsrc(m, 0, ua);
                 if opn == "class" {
-                    let cls = self.fclass(a);
-                    let s = self.bin(BinOp::LShr, ub, cls);
-                    let s = self.andc(s, 1);
-                    self.nz(s)
+                    if let Some(k) = self.s.m.const_u64(ub) {
+                        self.fclass_const(a, (k & 0x3FF) as u32)
+                    } else {
+                        let cls = self.fclass(a);
+                        let s = self.bin(BinOp::LShr, ub, cls);
+                        let s = self.andc(s, 1);
+                        self.nz(s)
+                    }
                 } else {
                     let b = self.fsrc(m, 1, ub);
                     self.float_compare(opn, a, b).ok_or_else(|| format!("{}: VOPC f32", rdna2::format(d)))?
@@ -1254,8 +1324,7 @@ impl Lw {
                 }
             }
             _ => return err(d, "VOPC type"),
-        };
-        self.vopc_write(d, cmpx, outs, cond)
+        })
     }
 
     /// The recompiler's `float_compare`: NaN tested explicitly.
@@ -1315,7 +1384,7 @@ impl Lw {
         }
     }
 
-    pub fn vopc_write(&mut self, d: &Decoded, cmpx: bool, outs: &[&Operand], cond: Value) -> LResult<()> {
+    fn vopc_dst(&self, d: &Decoded, cmpx: bool, outs: &[&Operand]) -> Dst {
         let mut dst = outs.first().map(|o| Self::dst_of(d, o)).unwrap_or(Dst::S(106));
         if d.variant == Variant::Sdwa {
             if let Some(e) = ext_encoding(d) {
@@ -1328,6 +1397,11 @@ impl Lw {
         if cmpx {
             dst = Dst::S(126);
         }
+        dst
+    }
+
+    pub fn vopc_write(&mut self, d: &Decoded, cmpx: bool, outs: &[&Operand], cond: Value) -> LResult<()> {
+        let dst = self.vopc_dst(d, cmpx, outs);
         self.write_mask(&dst, cond);
         Ok(())
     }
@@ -1355,5 +1429,112 @@ impl Lw {
             let le = self.cmpc(Pred::ULe, l, 32);
             self.selc(le, 0, m)
         }
+    }
+}
+
+#[cfg(test)]
+mod valu_carry_tests {
+    use super::super::kernel::{self, KernelOptions};
+    use super::super::validate;
+    use crate::gpu::rdna2::encode;
+    use crate::gpu::recomp::runner;
+
+    #[test]
+    fn valu_carry_ops_avoid_i64_and_match_gpu() {
+        let mut code = Vec::new();
+        for &(name, enc, fields) in &[
+            // v2 = v0 + v1 + cin(s0), carry -> s2
+            ("V_ADD_CO_CI_U32", "VOP3_SDST_ENC", &[("VDST", 2u64), ("SDST", 2), ("SRC0", 256), ("SRC1", 257), ("SRC2", 0)][..]),
+            // v3 = v0 - v1 - cin(s0), borrow -> s4
+            ("V_SUB_CO_CI_U32", "VOP3_SDST_ENC", &[("VDST", 3), ("SDST", 4), ("SRC0", 256), ("SRC1", 257), ("SRC2", 0)]),
+            // v4 = v1 - v0 - cin(s0), borrow -> s6
+            ("V_SUBREV_CO_CI_U32", "VOP3_SDST_ENC", &[("VDST", 4), ("SDST", 6), ("SRC0", 256), ("SRC1", 257), ("SRC2", 0)]),
+        ] {
+            code.extend(encode(name, enc, fields, None).unwrap_or_else(|e| panic!("{name}: {e}")));
+        }
+        code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+
+        let ko = KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 };
+        let dxil = kernel::translate(&code, ko).expect("translate valu carry ops");
+        validate::validate(&dxil).expect("validate valu carry ops");
+        let dis = validate::disassemble(&dxil).expect("disasm valu carry ops");
+        assert!(!dis.contains("64-Bit integer"), "32-bit VALU carry ops must not require Int64Ops:\n{dis}");
+        assert!(!dis.contains("zext i32"), "32-bit VALU carry ops must not widen to i64:\n{dis}");
+
+        if !matches!(runner::wave32_supported(), Ok(true)) {
+            runner::skip_test("no wave32");
+            return;
+        }
+        // Boundary triples (x, y, cin) covering overflow/underflow with and without carry/borrow-in.
+        let cases: [(u32, u32, bool); 32] = [
+            (0, 0, false),
+            (0, 0, true),
+            (0, 1, false),
+            (0, 1, true),
+            (1, 0, false),
+            (1, 0, true),
+            (1, 1, false),
+            (1, 1, true),
+            (u32::MAX, 0, false),
+            (u32::MAX, 0, true),
+            (u32::MAX, 1, false),
+            (u32::MAX, 1, true),
+            (0, u32::MAX, false),
+            (0, u32::MAX, true),
+            (u32::MAX, u32::MAX, false),
+            (u32::MAX, u32::MAX, true),
+            (u32::MAX - 1, 1, false),
+            (u32::MAX - 1, 1, true),
+            (0x7FFF_FFFF, 0x8000_0000, false),
+            (0x7FFF_FFFF, 0x8000_0000, true),
+            (0x8000_0000, 0x8000_0000, false),
+            (0x8000_0000, 0x8000_0000, true),
+            (0x8000_0000, 0x7FFF_FFFF, false),
+            (0x8000_0000, 0x7FFF_FFFF, true),
+            (2, 1, false),
+            (2, 1, true),
+            (1, 2, false),
+            (1, 2, true),
+            (0x1234_5678, 0xEDCB_A987, false),
+            (0x1234_5678, 0xEDCB_A987, true),
+            (0x1234_5678, 0xEDCB_A988, false),
+            (0x1234_5678, 0xEDCB_A988, true),
+        ];
+        let mut st = runner::KernelState::default();
+        let mut cin_mask = 0u32;
+        for (l, &(x, y, cin)) in cases.iter().enumerate() {
+            st.vgpr[l][0] = x;
+            st.vgpr[l][1] = y;
+            if cin {
+                cin_mask |= 1u32 << l;
+            }
+        }
+        st.sgpr[0] = cin_mask;
+        let r = runner::run(&dxil, &st, &[]).expect("GPU run valu carry ops");
+
+        let mut want_add_c = 0u32;
+        let mut want_sub_b = 0u32;
+        let mut want_subrev_b = 0u32;
+        for (l, &(x, y, cin)) in cases.iter().enumerate() {
+            let c = cin as u64;
+            let add64 = x as u64 + y as u64 + c;
+            assert_eq!(r.vgpr[l][2], add64 as u32, "add_co_ci lane {l} ({x:#x}, {y:#x}, {cin})");
+            if (add64 >> 32) != 0 {
+                want_add_c |= 1u32 << l;
+            }
+            let sub64 = (x as u64).wrapping_sub(y as u64).wrapping_sub(c);
+            assert_eq!(r.vgpr[l][3], sub64 as u32, "sub_co_ci lane {l} ({x:#x}, {y:#x}, {cin})");
+            if (sub64 >> 32) != 0 {
+                want_sub_b |= 1u32 << l;
+            }
+            let subrev64 = (y as u64).wrapping_sub(x as u64).wrapping_sub(c);
+            assert_eq!(r.vgpr[l][4], subrev64 as u32, "subrev_co_ci lane {l} ({x:#x}, {y:#x}, {cin})");
+            if (subrev64 >> 32) != 0 {
+                want_subrev_b |= 1u32 << l;
+            }
+        }
+        assert_eq!(r.sgpr[2], want_add_c, "add_co_ci carry-out mask");
+        assert_eq!(r.sgpr[4], want_sub_b, "sub_co_ci borrow-out mask");
+        assert_eq!(r.sgpr[6], want_subrev_b, "subrev_co_ci borrow-out mask");
     }
 }

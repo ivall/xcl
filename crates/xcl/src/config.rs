@@ -69,6 +69,9 @@ pub struct Config {
     /// left stick, the mouse the right stick (the cursor is held in the window), the mouse
     /// buttons the triggers, the wheel the bumpers (see `hle::kbm`).
     pub keyboard_mouse: bool,
+    /// Per-title keyboard and mouse bindings. Omitted fields inherit XCL Default.
+    #[serde(skip_serializing_if = "crate::hle::kbm::InputProfile::is_default")]
+    pub(crate) input_profile: crate::hle::kbm::InputProfile,
     /// How far the right stick goes for a mouse speed: 1.0 = full deflection at 4000 mouse
     /// counts a second.
     pub mouse_sensitivity: f32,
@@ -186,6 +189,7 @@ impl Default for Config {
             window_pos: "auto".into(),
             xbox_live_tokens: false,
             keyboard_mouse: true,
+            input_profile: Default::default(),
             mouse_sensitivity: 1.0,
         }
     }
@@ -233,8 +237,9 @@ impl Config {
         }
     }
 
+    /// `device_type` names the Series S in any spelling `XCL_DEVICE_TYPE` takes ([`parse_device_type`]).
     pub fn is_series_s(&self) -> bool {
-        self.device_type.eq_ignore_ascii_case("lockhart") || self.device_type.eq_ignore_ascii_case("series s")
+        parse_device_type(&self.device_type) == Some("lockhart")
     }
 
     /// Normalize and apply a `XCL_DEVICE_TYPE` override ("anaconda"/"series x"/"xsx"/"x" or
@@ -360,10 +365,16 @@ mod tests {
             lockhart_memory: Some("Advanced".into()),
             ..Default::default()
         };
-        for device in ["lockhart", "Series S"] {
+        // the spellings XCL_DEVICE_TYPE takes, in xcl.toml too
+        for device in ["lockhart", "Series S", "series_s", "xss", "S", " lockhart "] {
             let mut c = Config { device_type: device.into(), ..Config::default() };
             c.resolve(Some(&manifest));
             assert_eq!((c.title_memory.as_str(), c.title_memory_mb), ("advanced", 8_192), "{device}");
+        }
+        for device in ["anaconda", "Series X", "xsx", "x"] {
+            let mut c = Config { device_type: device.into(), ..Config::default() };
+            c.resolve(Some(&manifest));
+            assert_eq!((c.title_memory.as_str(), c.title_memory_mb), ("standard", 13_824), "{device}");
         }
         let mut c = Config::default();
         c.resolve(Some(&manifest));

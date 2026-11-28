@@ -244,11 +244,29 @@ const MEM_64K_PAGES: u32 = 0x2040_0000;
 /// Commit `[a, a + n)` of a sparse window (the title's reservations there) and give it video
 /// memory (`d3d12x::sparse`).
 unsafe fn commit_sparse(a: usize, n: usize, p: u32) -> *mut c_void {
-    let q = mem::VirtualAlloc(a as *const c_void, n, mem::MEM_COMMIT, sanitize_protect(p));
+    let protection = sanitize_protect(p);
+    let q = mem::VirtualAlloc(a as *const c_void, n, mem::MEM_COMMIT, protection);
     if !q.is_null() {
-        crate::hle::d3d12x::sparse::committed(q as usize, n);
+        crate::hle::d3d12x::sparse::committed_with_protection(q as usize, n, read_write(protection));
     }
     q
+}
+
+/// A writable protection without PAGE_GUARD.
+fn read_write(protection: u32) -> bool {
+    matches!(protection & 0xFF, 0x04 | 0x08 | 0x40 | 0x80) && protection & 0x100 == 0
+}
+
+fn own_process(process: HANDLE) -> bool {
+    if process == unsafe { thr::GetCurrentProcess() } {
+        return true;
+    }
+    let id = unsafe { thr::GetProcessId(process) };
+    id != 0 && id == unsafe { thr::GetCurrentProcessId() }
+}
+
+unsafe fn note_protection(addr: *const c_void, size: usize, protection: u32) {
+    crate::hle::d3d12x::sparse::protection_changed(addr as usize, size, read_write(protection));
 }
 
 pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: u32, p: u32) -> *mut c_void {
@@ -477,7 +495,7 @@ pub unsafe extern "system" fn VirtualFree(addr: *mut c_void, size: usize, t: u32
 }
 
 pub unsafe extern "system" fn VirtualFreeEx(proc_: HANDLE, addr: *mut c_void, size: usize, t: u32) -> BOOL {
-    if proc_ == thr::GetCurrentProcess() {
+    if own_process(proc_) {
         let a = addr as usize;
         if crate::gpu::uma::get().is_some_and(|u| u.is_sparse(a) || u.contains(a))
             || (t & 0x8000 != 0 && in_graphics_reservation(a))
@@ -489,15 +507,37 @@ pub unsafe extern "system" fn VirtualFreeEx(proc_: HANDLE, addr: *mut c_void, si
 }
 
 pub unsafe extern "system" fn VirtualAllocEx(proc_: HANDLE, addr: *const c_void, size: usize, t: u32, p: u32) -> *mut c_void {
+    if own_process(proc_) {
+        return VirtualAlloc(addr, size, t, p);
+    }
     mem::VirtualAllocEx(proc_, addr, size, sanitize_alloc_type(t), sanitize_protect(p))
 }
 
 pub unsafe extern "system" fn VirtualProtect(addr: *const c_void, size: usize, p: u32, old: *mut u32) -> BOOL {
-    mem::VirtualProtect(addr, size, sanitize_protect(p), old)
+    let protection = sanitize_protect(p);
+    let writable = read_write(protection);
+    if !writable {
+        note_protection(addr, size, protection);
+    }
+    let ok = mem::VirtualProtect(addr, size, protection, old);
+    if ok != 0 && writable {
+        note_protection(addr, size, protection);
+    }
+    ok
 }
 
 pub unsafe extern "system" fn VirtualProtectEx(proc_: HANDLE, addr: *const c_void, size: usize, p: u32, old: *mut u32) -> BOOL {
-    mem::VirtualProtectEx(proc_, addr, size, sanitize_protect(p), old)
+    let protection = sanitize_protect(p);
+    let own = own_process(proc_);
+    let writable = read_write(protection);
+    if own && !writable {
+        note_protection(addr, size, protection);
+    }
+    let ok = mem::VirtualProtectEx(proc_, addr, size, protection, old);
+    if ok != 0 && own && writable {
+        note_protection(addr, size, protection);
+    }
+    ok
 }
 
 /// XALLOC_ATTRIBUTES bit fields.
@@ -957,6 +997,11 @@ fn page_home(page: usize) -> Option<usize> {
     let blocks = PHYS_BLOCKS.lock().ok()?;
     let (&first, &(count, live, home)) = blocks.range(..=index).next_back()?;
     (live > 0 && index < first.checked_add(count)?).then(|| home.checked_add((index - first).checked_mul(PHYS_PAGE)?)).flatten()
+}
+
+/// Whether every page of `pages` (at least one) is a physical page allocated now.
+pub fn physical_pages_live(pages: &[usize]) -> bool {
+    !pages.is_empty() && pages.iter().all(|&p| page_home(p).is_some())
 }
 
 /// Whether a home is only reserved until it is used (a sparse window's, or plain memory's –
@@ -1446,9 +1491,11 @@ pub unsafe extern "system" fn XMemMapPhysicalPages(va: *mut c_void, n: usize, ar
 }
 
 /// `BOOL XMemMapPhysicalPagesScatter(void** addresses, SIZE_T count, ULONG64* pages)`: one 64 KiB
-/// page at each address (page 0: the address is unmapped)
+/// page at each address (page 0: the address is unmapped). No page array unmaps every address:
+/// a retail game unmaps that way while it streams its world and stops on its own `int3` when the
+/// call fails.
 pub unsafe extern "system" fn XMemMapPhysicalPagesScatter(addresses: *const *mut c_void, n: usize, pages: *mut u64) -> BOOL {
-    if addresses.is_null() || pages.is_null() {
+    if addresses.is_null() {
         fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
         return 0;
     }
@@ -1458,7 +1505,12 @@ pub unsafe extern "system" fn XMemMapPhysicalPagesScatter(addresses: *const *mut
     }
     let mut g = AWAY.lock().unwrap();
     let away = g.get_or_insert_with(Away::default);
-    let ok = (0..n).all(|i| !map_pages(away, *addresses.add(i), 1, pages.add(i) as *mut usize).is_null());
+    // no page array: page 0 (unmap) for every address
+    let ok = (0..n).all(|i| {
+        let mut none = 0usize;
+        let page = if pages.is_null() { &mut none as *mut usize } else { pages.add(i) as *mut usize };
+        !map_pages(away, *addresses.add(i), 1, page).is_null()
+    });
     give_back_homes(away);
     ok as BOOL
 }
@@ -2491,6 +2543,37 @@ mod tests {
             // is another test's later)
             assert!(!MapTitlePhysicalPages(std::ptr::null_mut(), N, 0, 4, pages.as_mut_ptr()).is_null());
             assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), N, pages.as_mut_ptr()), 1);
+            mem::VirtualFree(r as *mut c_void, 0, mem::MEM_RELEASE);
+        }
+    }
+
+    /// `XMemMapPhysicalPagesScatter` with no page array unmaps each address, as page 0 does (a
+    /// retail game unmaps so while it streams; refused, it stopped on its own `int3`).
+    #[test]
+    fn scatter_without_pages_unmaps() {
+        unsafe {
+            let Some(_) = crate::gpu::uma::get() else { return };
+            let mut n = 2;
+            let mut pages = [0usize; 2];
+            assert_eq!(AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut n, pages.as_mut_ptr()), 1);
+            let r = mem::VirtualAlloc(std::ptr::null(), 2 * PHYS_PAGE, mem::MEM_RESERVE, mem::PAGE_READWRITE) as usize;
+            assert!(r != 0);
+            let addrs = [r as *mut c_void, (r + PHYS_PAGE) as *mut c_void];
+            let mut ids = [pages[0] as u64, pages[1] as u64];
+            assert_eq!(XMemMapPhysicalPagesScatter(addrs.as_ptr(), 2, ids.as_mut_ptr()), 1);
+            (r as *mut u32).write_volatile(7);
+            ((r + PHYS_PAGE) as *mut u32).write_volatile(9);
+            assert_eq!(XMemMapPhysicalPagesScatter(addrs.as_ptr(), 2, std::ptr::null_mut()), 1, "no page array: unmapped, not refused");
+            for a in addrs {
+                assert!(!crate::gpu::shader::readable(a as usize, 4), "{a:p} still mapped");
+            }
+            // the pages kept what was written: mapped again, they read it
+            assert_eq!(XMemMapPhysicalPagesScatter(addrs.as_ptr(), 2, ids.as_mut_ptr()), 1);
+            assert_eq!(((r as *const u32).read_volatile(), ((r + PHYS_PAGE) as *const u32).read_volatile()), (7, 9));
+            assert_eq!(XMemMapPhysicalPagesScatter(addrs.as_ptr(), 2, std::ptr::null_mut()), 1);
+            // no addresses: the same answer with and without a page array
+            let mut none = [0u64; 1];
+            assert_eq!(XMemMapPhysicalPagesScatter(addrs.as_ptr(), 0, std::ptr::null_mut()), XMemMapPhysicalPagesScatter(addrs.as_ptr(), 0, none.as_mut_ptr()));
             mem::VirtualFree(r as *mut c_void, 0, mem::MEM_RELEASE);
         }
     }

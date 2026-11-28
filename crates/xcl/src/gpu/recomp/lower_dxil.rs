@@ -45,7 +45,7 @@ struct DxilIr {
 
 impl DxilIr {
     /// The builder state for `insts` at `entry` (a kernel or a compute program), with one memory
-    /// window; a compute program's is coherent, as the HLSL path declares it.
+    /// window; a compute program's is coherent when `needs_coherent_mem` holds, matching the HLSL path.
     fn new(insts: &[Decoded], wave64: bool, entry: &Entry) -> DxilIr {
         Self::with(insts, KernelOptions { wave64, split: false, mem_windows: 1, sampler_base: 0 }, entry)
     }
@@ -274,7 +274,12 @@ impl Ir for DxilIr {
         // the registers `Lw` touches for `d` alone
         let before = std::mem::take(&mut self.lw.init.touched);
         self.lw.pc = d.pc;
+        // the per-lane form reads back only this lane's bit of a mask `d` writes: in the split
+        // form a ballot of this half is enough, and an exchange there would wait at a barrier
+        // for a half that is elsewhere when only one half reaches this block
+        self.lw.local_masks = true;
         let r = self.lw.inst_guarded(d, guard, None);
+        self.lw.local_masks = false;
         let used = std::mem::replace(&mut self.lw.init.touched, before);
         self.lw.init.touched.extend(&used);
         r?;
@@ -347,10 +352,18 @@ pub fn kernel(insts: &[Decoded], wave64: bool) -> Result<(Vec<u8>, Vec<u8>), Str
     Ok((ir.finish([lanes, 1, 1], lanes)?.dxil, stale))
 }
 
+fn refuse_split_real_lds(insts: &[Decoded]) -> Result<(), String> {
+    if insts.iter().any(crate::gpu::dxil::kernel::real_lds_access) {
+        return Err("split wave64 LDS access needs the HLSL path".into());
+    }
+    Ok(())
+}
+
 /// `kernel` in the split form: a wave64 program as two hardware wave32s (`DxilIr::split`).
 /// EXEC at launch must be the whole console wave, as the CPU interpreter and the HLSL path
 /// start it.
 pub fn kernel_split(insts: &[Decoded]) -> Result<(Vec<u8>, Vec<u8>), String> {
+    refuse_split_real_lds(insts)?;
     let (ir, stale) = lower::lower_kernel(insts, true, DxilIr::split(insts, &Entry::Kernel))?;
     Ok((ir.finish([64, 1, 1], 32)?.dxil, stale))
 }
@@ -358,6 +371,7 @@ pub fn kernel_split(insts: &[Decoded]) -> Result<(Vec<u8>, Vec<u8>), String> {
 /// `compute` in the split form: each console wave64 as two hardware wave32s, threads numbered
 /// by arrival (`Lw::setup_lanes_compute`).
 pub fn compute_split(insts: &[Decoded], cs: &super::CsInterface) -> Result<Vec<u8>, String> {
+    refuse_split_real_lds(insts)?;
     let ir = lower::lower_compute(insts, cs, true, DxilIr::split(insts, &Entry::Compute(cs.clone())))?;
     Ok(ir.finish(cs.threads, 32)?.dxil)
 }
@@ -416,6 +430,9 @@ pub fn compute_with(code: &[u8], cs: &super::CsInterface, o: KernelOptions) -> R
         insts.push(d);
     }
     crate::gpu::rdna2::resolve_far_jumps(&mut insts);
+    if o.wave64 && o.split {
+        refuse_split_real_lds(&insts)?;
+    }
     // as `kernel::translate_entry`: a thread with a large stack, a panic is a refusal
     let cs = cs.clone();
     std::thread::Builder::new()
@@ -794,6 +811,31 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_runtime_path_leaves_split_wave64_lds_to_hlsl() {
+        let bytes = crate::gpu::rdna2::encode("DS_WRITE_B32", "ENC_DS", &[("ADDR", 0), ("DATA0", 1)], None).unwrap();
+        let cs = compute_cs();
+        let o = |wave64, split| super::KernelOptions { wave64, split, mem_windows: 1, sampler_base: 0 };
+
+        let e = super::compute_with(&bytes, &cs, o(true, true)).err().expect("split LDS translated");
+        assert!(e.contains("split wave64 LDS access needs the HLSL path"), "{e}");
+        let insts = [crate::gpu::rdna2::decode(&bytes, 0).unwrap()];
+        let e = super::kernel_split(&insts).err().expect("split kernel LDS translated");
+        assert!(e.contains("split wave64 LDS access needs the HLSL path"), "{e}");
+        let e = super::compute_split(&insts, &cs).err().expect("split compute LDS translated");
+        assert!(e.contains("split wave64 LDS access needs the HLSL path"), "{e}");
+        super::compute_with(&bytes, &cs, o(true, false)).expect("native wave64 LDS");
+        super::compute_with(&bytes, &cs, o(false, false)).expect("native wave32 LDS");
+
+        let swizzle = crate::gpu::rdna2::encode(
+            "DS_SWIZZLE_B32",
+            "ENC_DS",
+            &[("VDST", 1), ("ADDR", 0), ("OFFSET0", 0x1F), ("OFFSET1", 4)],
+            None,
+        ).unwrap();
+        super::compute_with(&swizzle, &cs, o(true, true)).expect("split cross-lane DS");
+    }
+
     /// The f64 program of `lower`'s tests, as `f32_programs_on_the_gpu`.
     #[test]
     fn f64_programs_on_the_gpu() {
@@ -820,7 +862,8 @@ mod tests {
             let mut cs = compute_cs();
             cs.threads = [threads, 1, 1];
             for (lines, expected) in wave_branch_cases(true) {
-                let dxil = super::compute_split(&decode(&lines), &cs)
+                let insts = decode(&lines);
+                let dxil = super::compute_split(&insts, &cs)
                     .unwrap_or_else(|e| panic!("split threads={threads}, {lines:?}: {e}"));
                 if crate::gpu::dxil::validate::validator_supported() {
                     crate::gpu::dxil::validate::validate(&dxil)
@@ -830,18 +873,6 @@ mod tests {
                     let out = runner::dispatch(&dxil, [1, 1, 1], &[], &vec![0; threads as usize]).unwrap();
                     // Wave 0 (lanes 0..63) has lane 63 matching `SRC0 = 63`.
                     assert_eq!(&out[..64], &[expected; 64], "split threads={threads} wave0, {lines:?}");
-                    if threads == 128 {
-                        // Wave 1 (lanes 64..127) has no lane with v0 == 63, so compare against
-                        // the regular direct split-wave64 translator across all 128 threads.
-                        let bytes: Vec<u8> = lines
-                            .iter()
-                            .flat_map(|(n, e, f)| crate::gpu::rdna2::encode(n, e, f, None).unwrap())
-                            .collect();
-                        let o = super::KernelOptions { wave64: true, split: true, mem_windows: 1, sampler_base: 0 };
-                        let ref_dxil = crate::gpu::dxil::kernel::translate_compute(&bytes, o, &cs).unwrap().dxil;
-                        let ref_out = runner::dispatch(&ref_dxil, [1, 1, 1], &[], &vec![0; 128]).unwrap();
-                        assert_eq!(&out[..128], &ref_out[..128], "split threads=128 parity, {lines:?}");
-                    }
                 }
             }
         }
@@ -1107,6 +1138,60 @@ mod tests {
                 for r in 1..=8 {
                     assert_eq!(direct.vgpr[l][r], hlsl.vgpr[l][r], "wave{lanes}: lane {l} v{r}: {:#x} vs {:#x}", direct.vgpr[l][r], hlsl.vgpr[l][r]);
                 }
+            }
+        }
+    }
+
+    /// A float compare bridged to #1426's lowering in a block only the lower half of a split
+    /// wave64 group reaches (Pipodi's point 5 on #1745): a nested `if` whose condition goes to
+    /// `s_and_saveexec`. #1426 would ballot the compare's mask through an exchange, a group
+    /// barrier the upper half never reaches. The bridge reads back only each lane's bit, so this
+    /// half's ballot is enough, and the only barrier left is the one at the start.
+    #[test]
+    fn a_bridged_mask_write_where_one_half_is_elsewhere_meets_no_barrier() {
+        let lines: &[I] = &[
+            ("V_CVT_F32_U32", "ENC_VOP1", &[("VDST", 1), ("SRC0", V)]),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 7), ("SRC0", 128)]),
+            // lanes 0–31: the lower hardware half
+            ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 160), ("VSRC1", 0)]),
+            ("S_AND_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 8), ("SSRC0", 106)]),
+            ("S_CBRANCH_EXECZ", "ENC_SOPP", &[("SIMM16", 4)]),
+            // 0 < f32(lane): every lane in EXEC but lane 0
+            ("V_CMP_LT_F32", "ENC_VOPC", &[("SRC0", 128), ("VSRC1", 1)]),
+            ("S_AND_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 10), ("SSRC0", 106)]),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 7), ("SRC0", 133)]),
+            ("S_OR_B64", "ENC_SOP2", &[("SDST", 126), ("SSRC0", 126), ("SSRC1", 10)]),
+            ("S_OR_B64", "ENC_SOP2", &[("SDST", 126), ("SSRC0", 126), ("SSRC1", 8)]),
+            ("S_LSHL_B32", "ENC_SOP2", &[("SDST", 3), ("SSRC0", 2), ("SSRC1", 135)]),
+            ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 4), ("SRC0", 3), ("VSRC1", 0)]),
+            ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 8), ("SRC0", 130), ("VSRC1", 4)]),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 9), ("SRC0", 128)]),
+            ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 8), ("DATA", 7), ("SADDR", 125), ("OFFSET", 0)]),
+            ENDPGM,
+        ];
+        // one console wave per group: the halves meet at a group barrier (`Partner::Present`)
+        let cs = compute_cs();
+        let dxil = super::compute_split(&decode(lines), &cs).unwrap_or_else(|e| panic!("{e}"));
+        if dxc::location().is_err() {
+            return runner::skip_test("no DXC");
+        }
+        let text = crate::gpu::dxil::validate::disassemble(&dxil).unwrap();
+        // (the first branch is the group's own: a folded dispatch's groups past the console's
+        // count leave there, `IO_GROUP_LIMIT`; the entry whole-wave branch comes after it)
+        let (_, after_gate) = text.split_once("\n  br ").unwrap_or_else(|| panic!("expected the group gate in program:\n{text}"));
+        let (_, after_entry) = after_gate.split_once("\n  br ").unwrap_or_else(|| panic!("expected branch in program:\n{text}"));
+        let divergent_barriers = after_entry.lines().filter(|l| l.contains("call void @dx.op.barrier")).count();
+        // after the entry whole-wave branch, only one half reaches the body so no group barrier may appear there
+        assert_eq!(divergent_barriers, 0, "group barriers after entry branch:\n{text}");
+        if !gpu() {
+            return;
+        }
+        let mem = vec![0u32; 256];
+        let gpu = runner::dispatch(&dxil, [2, 1, 1], &[100, 0], &mem).unwrap();
+        // the console's v7 (the CPU `Interp` has no #1426 bridge): 5 in lanes 1–31, else 0
+        for g in 0..2 {
+            for l in 0..64 {
+                assert_eq!(gpu[g * 128 + l], if (1..32).contains(&l) { 5 } else { 0 }, "group {g}, lane {l}");
             }
         }
     }

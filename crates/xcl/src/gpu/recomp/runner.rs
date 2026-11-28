@@ -1540,7 +1540,7 @@ fn run_in_region(dxil: &[u8], state: &KernelState, arena: &Arena) -> Result<Kern
         let dh: ID3D12DescriptorHeap = dev
             .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                 Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                NumDescriptors: super::MEM_HEAP_BASE + win_count as u32,
+                NumDescriptors: (super::MEM_HEAP_BASE + win_count as u32).max(super::MEM_NULL_STORE + 1),
                 Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
                 NodeMask: 0,
             })
@@ -1551,6 +1551,11 @@ fn run_in_region(dxil: &[u8], state: &KernelState, arena: &Arena) -> Result<Kern
             let mut h = dh.GetCPUDescriptorHandleForHeapStart();
             h.ptr += (super::MEM_HEAP_BASE as usize + k) * inc;
             dev.CreateUnorderedAccessView(b, None::<&ID3D12Resource>, Some(&raw_window_uav(size as u64)), h);
+        }
+        for idx in [super::MEM_NULL_LOAD, super::MEM_NULL_STORE] {
+            let mut h = dh.GetCPUDescriptorHandleForHeapStart();
+            h.ptr += idx as usize * inc;
+            dev.CreateUnorderedAccessView(None::<&ID3D12Resource>, None::<&ID3D12Resource>, Some(&raw_window_uav(4)), h);
         }
         list.SetDescriptorHeaps(&[Some(dh.clone())]);
         list.SetComputeRootSignature(&gpu.rs);
@@ -1615,6 +1620,14 @@ pub fn try_create_texture(desc: &D3D12_RESOURCE_DESC) -> Result<(), String> {
 /// A compute shader with the console dispatch ABI (`Mode::Compute`): `groups` thread groups,
 /// u0 = user SGPRs, u2 = flat memory. Returns the memory afterwards.
 pub fn dispatch(dxil: &[u8], groups: [u32; 3], sgprs: &[u32], mem: &[u32]) -> Result<Vec<u32>, String> {
+    dispatch_remapped(dxil, groups, None, sgprs, mem)
+}
+
+pub fn dispatch_remapped(dxil: &[u8], mut groups: [u32; 3], remap: Option<(u32, u32)>, sgprs: &[u32], mem: &[u32]) -> Result<Vec<u32>, String> {
+    if let Some((ratio, dim)) = remap {
+        let count = groups.get_mut(dim as usize).ok_or("invalid remap dimension")?;
+        *count = count.checked_mul(ratio).ok_or("remapped dispatch overflows")?;
+    }
     let mut g = GPU.lock().unwrap();
     let gpu = g.get_or_insert_with(init).as_mut().map_err(|x| x.clone())?;
     let pso: ID3D12PipelineState = unsafe {
@@ -1625,7 +1638,41 @@ pub fn dispatch(dxil: &[u8], groups: [u32; 3], sgprs: &[u32], mem: &[u32]) -> Re
         })
     }
     .map_err(|x| format!("CreateComputePipelineState: {x}"))?;
-    dispatch_with(&gpu.dev, &gpu.queue, &gpu.fence, &mut gpu.value, &pso, &gpu.rs, groups, sgprs, mem, 1, false).map(|(m, _)| m)
+    dispatch_with(&gpu.dev, &gpu.queue, &gpu.fence, &mut gpu.value, &pso, &gpu.rs, groups, sgprs, mem, 1, false, None).map(|(m, _)| m)
+}
+
+#[cfg(test)]
+pub(crate) fn dispatch_split(
+    chain: &crate::gpu::dxil::kernel::DispatchChain, groups: [u32; 3], mem: &[u32],
+) -> Result<Vec<u32>, String> {
+    dispatch_split_by(chain, groups, mem, u64::MAX)
+}
+
+/// `dispatch_split`, at most `most` groups at once (`pso::dispatch_slabs`).
+#[cfg(test)]
+pub(crate) fn dispatch_split_by(
+    chain: &crate::gpu::dxil::kernel::DispatchChain, groups: [u32; 3], mem: &[u32], most: u64,
+) -> Result<Vec<u32>, String> {
+    dispatch_split_samples(chain, groups, &[], mem, most, 1, false).map(|(m, _)| m)
+}
+
+#[cfg(test)]
+pub(crate) fn dispatch_split_samples(
+    chain: &crate::gpu::dxil::kernel::DispatchChain, groups: [u32; 3], sgprs: &[u32], mem: &[u32],
+    most: u64, reps: usize, timed: bool,
+) -> Result<(Vec<u32>, Vec<f64>), String> {
+    let mut g = GPU.lock().unwrap();
+    let gpu = g.get_or_insert_with(init).as_mut().map_err(|e| e.clone())?;
+    let rs = super::pso::dispatch_chain_root_signature(&gpu.dev, &[])?;
+    let pieces: Vec<ID3D12PipelineState> = chain.pieces.iter().map(|dxil| unsafe {
+        gpu.dev.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            pRootSignature: transmute_copy(&rs),
+            CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr().cast(), BytecodeLength: dxil.len() },
+            ..Default::default()
+        }).map_err(e)
+    }).collect::<Result<_,_>>()?;
+    dispatch_with(&gpu.dev, &gpu.queue, &gpu.fence, &mut gpu.value, &pieces[0], &rs, groups, sgprs, mem, reps, timed,
+                  Some((&pieces, chain.dwords_per_group, most)))
 }
 
 /// `dispatch` run `reps` times in one command list (a UAV barrier between them, memory not
@@ -1642,7 +1689,59 @@ pub fn dispatch_timed(dxil: &[u8], groups: [u32; 3], sgprs: &[u32], mem: &[u32],
         })
     }
     .map_err(|x| format!("CreateComputePipelineState: {x}"))?;
-    dispatch_with(&gpu.dev, &gpu.queue, &gpu.fence, &mut gpu.value, &pso, &gpu.rs, groups, sgprs, mem, reps.max(1), true).map(|(_, t)| t)
+    dispatch_with(&gpu.dev, &gpu.queue, &gpu.fence, &mut gpu.value, &pso, &gpu.rs, groups, sgprs, mem, reps.max(1), true, None).map(|(_, t)| t)
+}
+
+#[cfg(test)]
+pub(crate) fn profile_buffer_forms(
+    whole: &[u8], chains: [&crate::gpu::dxil::kernel::DispatchChain; 2], groups: [u32; 3],
+    sgprs: &[u32], mem: &[u32], expected: &[u32], budget: u64,
+) -> Result<(), String> {
+    let mut g = GPU.lock().unwrap();
+    let gpu = g.get_or_insert_with(init).as_mut().map_err(|e| e.clone())?;
+    let rs = super::pso::dispatch_chain_root_signature(&gpu.dev, &[])?;
+    let blob = std::env::var_os("XCL_SAMPLE_REPLAY_WHOLE_PSO").map(std::fs::read).transpose().map_err(|err| err.to_string())?;
+    let build = |code: &[u8], signature: &ID3D12RootSignature, cache: Option<&[u8]>| unsafe {
+        gpu.dev.CreateComputePipelineState::<ID3D12PipelineState>(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            pRootSignature: transmute_copy(signature),
+            CS: D3D12_SHADER_BYTECODE { pShaderBytecode: code.as_ptr().cast(), BytecodeLength: code.len() },
+            CachedPSO: cache.map(|bytes| D3D12_CACHED_PIPELINE_STATE {
+                pCachedBlob: bytes.as_ptr().cast(), CachedBlobSizeInBytes: bytes.len(),
+            }).unwrap_or_default(),
+            ..Default::default()
+        }).map_err(e)
+    };
+    let base = build(whole, &gpu.rs, blob.as_deref())?;
+    let alternative = std::env::var_os("XCL_SAMPLE_ALTERNATE_WHOLE").map(|path| {
+        let dxil = std::fs::read(path).map_err(|err| err.to_string())?;
+        build(&dxil, &gpu.rs, None)
+    }).transpose()?;
+    let count = if alternative.is_some() { 1 } else { 2 };
+    let pieces: Vec<Vec<_>> = chains[..count].iter().map(|c| c.pieces.iter().map(|p| build(p, &rs, None)).collect::<Result<_,_>>()).collect::<Result<_,_>>()?;
+    let mut samples = [Vec::new(), Vec::new(), Vec::new()];
+    for round in 0..12 {
+        for pass in 0..3 {
+            let variant = (round / 2 + if round % 2 == 0 { pass } else { 2 - pass }) % 3;
+            let whole = match variant { 0 => Some(&base), 2 => alternative.as_ref(), _ => None };
+            let (pso, signature, chain) = if let Some(pso) = whole { (pso, &gpu.rs, None) } else {
+                let i = variant - 1;
+                let words = chains[i].dwords_per_group;
+                let most = (budget / (u64::from(words) * 4)).max(1);
+                (&pieces[i][0], &rs, Some((pieces[i].as_slice(), words, most)))
+            };
+            let (out, times) = dispatch_with(&gpu.dev, &gpu.queue, &gpu.fence, &mut gpu.value, pso, signature,
+                groups, sgprs, mem, 12, true, chain)?;
+            if out != expected { return Err(format!("replay readback differs for form {variant}")); }
+            if round >= 3 { samples[variant].extend_from_slice(&times[2..]); }
+        }
+    }
+    for (i, row) in samples.iter_mut().enumerate() {
+        row.sort_by(f64::total_cmp);
+        let mid = row.len() / 2;
+        println!("FORM_TIME form={i} groups={groups:?} budget={budget} n={} median_us={:.3} p90_us={:.3}",
+            row.len(), 500.0 * (row[mid-1]+row[mid]), row[row.len()*9/10]*1000.0);
+    }
+    Ok(())
 }
 
 /// Dispatch with an existing compute pipeline on `dev` (its own queue), e.g. one the D3D12.X
@@ -1652,7 +1751,7 @@ pub fn dispatch_on(dev: &ID3D12Device, pso: &ID3D12PipelineState, rs: &ID3D12Roo
     unsafe {
         let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).map_err(e)?;
         let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(e)?;
-        dispatch_with(dev, &queue, &fence, &mut 0, pso, rs, groups, sgprs, mem, 1, false).map(|(m, _)| m)
+        dispatch_with(dev, &queue, &fence, &mut 0, pso, rs, groups, sgprs, mem, 1, false, None).map(|(m, _)| m)
     }
 }
 
@@ -1669,6 +1768,7 @@ fn dispatch_with(
     mem: &[u32],
     reps: usize,
     timed: bool,
+    chain: Option<(&[ID3D12PipelineState], u32, u64)>,
 ) -> Result<(Vec<u32>, Vec<f64>), String> {
     let mut io = sgprs.to_vec();
     io.resize(KERNEL_SGPRS, 0);
@@ -1704,7 +1804,7 @@ fn dispatch_with(
         let dh: ID3D12DescriptorHeap = dev
             .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                 Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                NumDescriptors: super::MEM_HEAP_BASE + win_count as u32,
+                NumDescriptors: (super::MEM_HEAP_BASE + win_count as u32).max(super::MEM_NULL_STORE + 1),
                 Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
                 NodeMask: 0,
             })
@@ -1715,11 +1815,23 @@ fn dispatch_with(
             h.ptr += (super::MEM_HEAP_BASE as usize + k) * inc;
             dev.CreateUnorderedAccessView(&mem_buf, None::<&ID3D12Resource>, Some(&raw_window_uav(mem_bytes)), h);
         }
+        for idx in [super::MEM_NULL_LOAD, super::MEM_NULL_STORE] {
+            let mut h = dh.GetCPUDescriptorHandleForHeapStart();
+            h.ptr += idx as usize * inc;
+            dev.CreateUnorderedAccessView(None::<&ID3D12Resource>, None::<&ID3D12Resource>, Some(&raw_window_uav(4)), h);
+        }
         list.SetDescriptorHeaps(&[Some(dh.clone()), Some(bound._heaps[1].clone())]);
         list.SetComputeRootSignature(rs);
         list.SetComputeRootUnorderedAccessView(0, io_buf.GetGPUVirtualAddress());
         list.SetComputeRootUnorderedAccessView(1, res_buf.GetGPUVirtualAddress());
-        list.SetComputeRootUnorderedAccessView(2, mem_buf.GetGPUVirtualAddress());
+        for k in 0..4 {
+            list.SetComputeRootUnorderedAccessView(2 + k as u32, mem_buf.GetGPUVirtualAddress());
+        }
+        let scratch = chain.map(|(_, words, most)| {
+            let first = super::pso::dispatch_slabs(groups, most)[0].1;
+            let bytes = first.iter().fold(4 * u64::from(words), |n, &g| n * u64::from(g));
+            buffer(dev, bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true)
+        }).transpose()?;
         // `reps` dispatches, each between two timestamps when `timed`
         let stamps = 2 * reps as u32;
         let queries = if timed {
@@ -1738,7 +1850,14 @@ fn dispatch_with(
             if let Some((heap, _)) = &queries {
                 list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, 2 * k);
             }
-            list.Dispatch(groups[0], groups[1], groups[2]);
+            if let (Some((pieces, _, most)), Some(scratch)) = (chain, &scratch) {
+                super::pso::record_dispatch_chain(
+                    &list, groups, most, scratch, k > 0, pieces,
+                    |piece| list.SetPipelineState(piece),
+                );
+            } else {
+                list.Dispatch(groups[0], groups[1], groups[2]);
+            }
             if let Some((heap, _)) = &queries {
                 list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, 2 * k + 1);
             }

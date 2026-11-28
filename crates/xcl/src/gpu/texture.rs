@@ -195,7 +195,8 @@ pub unsafe fn upload(dev: &ID3D12Device, queue: &ID3D12CommandQueue, res: &ID3D1
     let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).map_err(err)?;
     let staging = record_upload(dev, &list, res, subs, before, after)?;
     list.Close().map_err(err)?;
-    queue.ExecuteCommandLists(&[Some(windows::core::Interface::cast(&list).map_err(err)?)]);
+    let list = windows::core::Interface::cast(&list).map_err(err)?;
+    crate::hle::d3d12x::real::native_queue_execute(queue, &list);
     let r = wait(dev, queue);
     drop(staging);
     r
@@ -263,11 +264,24 @@ impl Uploader {
     }
 }
 
+pub(crate) type UploadBatchItem = (ID3D12Resource, Vec<Subresource>, Vec<D3D12_RESOURCE_STATES>);
+
 /// Several uploads on one list, one wait: (resource, subresources, states) each – the states
 /// the texture is in and is left in: one for every subresource, or one per subresource (D3D12
 /// order). A failure of one is returned with its index; the others still run. The texels go
 /// through the queue's kept upload buffer (`Uploader`).
 pub unsafe fn upload_batch(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items: &[(ID3D12Resource, Vec<Subresource>, Vec<D3D12_RESOURCE_STATES>)]) -> Result<Vec<(usize, String)>, String> {
+    upload_batch_with_zero_mips(dev, queue, items, &[])
+}
+
+/// As `upload_batch`, with an optional mask per item for subresources already verified to be all
+/// zero. The copies still run, but these subresources all source the same zeroed staging span.
+pub(crate) unsafe fn upload_batch_with_zero_mips(
+    dev: &ID3D12Device,
+    queue: &ID3D12CommandQueue,
+    items: &[UploadBatchItem],
+    zero_mips: &[Vec<bool>],
+) -> Result<Vec<(usize, String)>, String> {
     if items.is_empty() {
         return Ok(Vec::new());
     }
@@ -278,35 +292,29 @@ pub unsafe fn upload_batch(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items
         None => Uploader::new(dev)?,
     };
     // where each texture's texels go in the upload buffer
-    let mut failed = Vec::new();
-    let mut planned = Vec::with_capacity(items.len());
-    let mut total = 0u64;
-    for (k, (res, subs, states)) in items.iter().enumerate() {
-        match layout(dev, res, subs, states, states) {
-            Ok(l) => {
-                let base = total.div_ceil(PLACEMENT) * PLACEMENT;
-                total = base + l.total;
-                planned.push((k, l, base));
-            }
-            Err(e) => failed.push((k, e)),
-        }
-    }
+    let (failed, planned, zero) = plan_batch(dev, items, zero_mips)?;
     if planned.is_empty() {
         put_back(key, up);
         return Ok(failed);
     }
-    let (staging, mapped) = up.staging(dev, total)?;
+    let (staging, mapped) = up.staging(dev, zero.end)?;
+    clear_staging_span(mapped, &zero);
     up.alloc.Reset().map_err(err)?;
     up.list.Reset(&up.alloc, None).map_err(err)?;
-    for (k, l, base) in &planned {
-        let (res, subs, states) = &items[*k];
-        record_into(&up.list, res, subs, l, states, states, &staging, mapped, *base);
+    for (k, l, offsets) in planned {
+        let (res, subs, states) = &items[k];
+        record_into(&up.list, res, subs, &l, states, states, &staging, mapped, offsets);
     }
     up.list.Close().map_err(err)?;
-    queue.ExecuteCommandLists(&[Some(windows::core::Interface::cast(&up.list).map_err(err)?)]);
+    let list = windows::core::Interface::cast(&up.list).map_err(err)?;
+    crate::hle::d3d12x::real::native_queue_execute(queue, &list);
     up.value += 1;
     let copy_error = |e| format!("texture copy: {e}");
-    queue.Signal(&up.fence, up.value).map_err(|e| copy_error(fence::api_error(dev, "Signal", e)))?;
+    if let Err(e) = crate::hle::d3d12x::real::native_queue_signal(queue, &up.fence, up.value) {
+        let signal = copy_error(fence::api_error(dev, "Signal", e));
+        drop_after_wait(up, wait(dev, queue))?;
+        return Err(signal);
+    }
     if let Err(e) = fence::wait(&up.fence, up.value, dev, None, 10_000) {
         // the GPU may still read the upload buffer and run the list: they stay alive (a fresh
         // uploader next time) – freeing them under the GPU removed the device
@@ -315,6 +323,78 @@ pub unsafe fn upload_batch(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items
     }
     put_back(key, up);
     Ok(failed)
+}
+
+unsafe fn plan_batch<'a>(
+    dev: &ID3D12Device,
+    items: &[UploadBatchItem],
+    zero_mips: &'a [Vec<bool>],
+) -> Result<(Vec<(usize, String)>, Vec<(usize, Layout, StagingOffsets<'a>)>, std::ops::Range<u64>), String> {
+    let mut failed = Vec::new();
+    let mut laid_out = Vec::with_capacity(items.len());
+    for (k, (res, subs, states)) in items.iter().enumerate() {
+        let zeros = zero_mips.get(k).map(Vec::as_slice).unwrap_or_default();
+        match layout(dev, res, subs, states, states) {
+            Ok(l) if zeros.is_empty() || zeros.len() == l.fps.len() => laid_out.push((k, l, zeros)),
+            Ok(_) => failed.push((k, "texture upload zero mask does not match its subresources".into())),
+            Err(e) => failed.push((k, e)),
+        }
+    }
+    // A lone valid zero source cannot share and reserving its last row's padding could grow
+    // staging. Count after validation so a failed item cannot enable that padded path.
+    let share_zeros = laid_out.iter().flat_map(|(_, _, zeros)| *zeros).filter(|&&zero| zero).nth(1).is_some();
+    let mut planned = Vec::with_capacity(laid_out.len());
+    let mut storage = BatchStaging::default();
+    for (k, mut l, zeros) in laid_out {
+        let zeros = if share_zeros { zeros } else { &[] };
+        match storage.add(&mut l, zeros) {
+            Ok(base) => planned.push((k, l, StagingOffsets { base, zero: 0, zero_mips: zeros })),
+            Err(e) => failed.push((k, e)),
+        }
+    }
+    let zero = storage.zero_span()?;
+    for (_, _, offsets) in &mut planned {
+        offsets.zero = zero.start;
+    }
+    Ok((failed, planned, zero))
+}
+
+pub struct InFlight {
+    _alloc: ID3D12CommandAllocator,
+    _list: ID3D12GraphicsCommandList,
+    _staging: ID3D12Resource,
+    pub bytes: u64,
+}
+
+pub unsafe fn submit_batch(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items: &[(ID3D12Resource, Vec<Subresource>, Vec<D3D12_RESOURCE_STATES>)]) -> Result<(Vec<(usize, String)>, Option<InFlight>), String> {
+    submit_batch_with_zero_mips(dev, queue, items, &[])
+}
+
+pub(crate) unsafe fn submit_batch_with_zero_mips(
+    dev: &ID3D12Device,
+    queue: &ID3D12CommandQueue,
+    items: &[UploadBatchItem],
+    zero_mips: &[Vec<bool>],
+) -> Result<(Vec<(usize, String)>, Option<InFlight>), String> {
+    let (failed, planned, zero) = plan_batch(dev, items, zero_mips)?;
+    if planned.is_empty() {
+        return Ok((failed, None));
+    }
+    let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(err)?;
+    let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).map_err(err)?;
+    let staging = buffer(dev, zero.end)?;
+    let mut mapped = std::ptr::null_mut();
+    staging.Map(0, None, Some(&mut mapped)).map_err(err)?;
+    clear_staging_span(mapped as *mut u8, &zero);
+    for (k, layout, offsets) in planned {
+        let (res, subs, states) = &items[k];
+        record_into(&list, res, subs, &layout, states, states, &staging, mapped as *mut u8, offsets);
+    }
+    staging.Unmap(0, None);
+    list.Close().map_err(err)?;
+    let cmd = windows::core::Interface::cast(&list).map_err(err)?;
+    crate::hle::d3d12x::real::native_queue_execute(queue, &cmd);
+    Ok((failed, Some(InFlight { _alloc: alloc, _list: list, _staging: staging, bytes: zero.end })))
 }
 
 fn put_back(key: usize, up: Uploader) {
@@ -342,7 +422,7 @@ pub unsafe fn record_upload_states(
     let up = buffer(dev, l.total)?;
     let mut p = std::ptr::null_mut();
     up.Map(0, None, Some(&mut p)).map_err(err)?;
-    record_into(list, res, subs, &l, before, after, &up, p as *mut u8, 0);
+    record_into(list, res, subs, &l, before, after, &up, p as *mut u8, StagingOffsets::default());
     up.Unmap(0, None);
     Ok(up)
 }
@@ -353,6 +433,83 @@ struct Layout {
     fps: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
     rows: Vec<u32>,
     total: u64,
+}
+
+#[derive(Default)]
+struct BatchStaging {
+    data_bytes: u64,
+    zero_bytes: u64,
+}
+
+impl BatchStaging {
+    /// Keep the driver's dimensions and pitches. Only repack offsets when an item can share the
+    /// zero span. Each ordinary footprint keeps at least the byte range supplied by the driver.
+    fn add(&mut self, l: &mut Layout, zeros: &[bool]) -> Result<u64, String> {
+        let overflow = || "texture upload staging size overflow".to_string();
+        if !zeros.is_empty() && zeros.len() != l.fps.len() {
+            return Err("texture upload zero mask does not match its subresources".into());
+        }
+        let base = self.data_bytes.checked_next_multiple_of(PLACEMENT).ok_or_else(overflow)?;
+        let mut next = l.total;
+        let mut zero_bytes = self.zero_bytes;
+        if zeros.contains(&true) {
+            next = 0;
+            for (k, &zero) in zeros.iter().enumerate() {
+                let fp = l.fps[k];
+                let end = l.fps.get(k + 1).map_or(l.total, |next| next.Offset);
+                let bytes = end.checked_sub(fp.Offset).ok_or_else(overflow)?;
+                if zero {
+                    // Zero full pitched rows, including padding on the last row of each slice.
+                    let pitched_bytes = u64::from(fp.Footprint.RowPitch)
+                        .checked_mul(u64::from(l.rows[k]))
+                        .and_then(|bytes| bytes.checked_mul(u64::from(fp.Footprint.Depth)))
+                        .ok_or_else(overflow)?;
+                    zero_bytes = zero_bytes.max(pitched_bytes.max(bytes));
+                } else {
+                    let at = next.checked_next_multiple_of(PLACEMENT).ok_or_else(overflow)?;
+                    next = at.checked_add(bytes).ok_or_else(overflow)?;
+                    l.fps[k].Offset = at;
+                }
+            }
+        }
+        self.data_bytes = base.checked_add(next).ok_or_else(overflow)?;
+        self.zero_bytes = zero_bytes;
+        Ok(base)
+    }
+
+    fn zero_span(&self) -> Result<std::ops::Range<u64>, String> {
+        if self.zero_bytes == 0 {
+            return Ok(self.data_bytes..self.data_bytes);
+        }
+        let overflow = || "texture upload staging size overflow".to_string();
+        let start = self.data_bytes.checked_next_multiple_of(PLACEMENT).ok_or_else(overflow)?;
+        let end = start.checked_add(self.zero_bytes).ok_or_else(overflow)?;
+        Ok(start..end)
+    }
+}
+
+/// The mapped staging buffer covers `span`, which can contain data from an earlier batch.
+unsafe fn clear_staging_span(mapped: *mut u8, span: &std::ops::Range<u64>) {
+    if !span.is_empty() {
+        mapped.add(span.start as usize).write_bytes(0, (span.end - span.start) as usize);
+    }
+}
+
+#[derive(Default)]
+struct StagingOffsets<'a> {
+    base: u64,
+    zero: u64,
+    zero_mips: &'a [bool],
+}
+
+impl StagingOffsets<'_> {
+    fn is_zero(&self, sub: usize) -> bool {
+        self.zero_mips.get(sub) == Some(&true)
+    }
+
+    fn at(&self, sub: usize, offset: u64) -> u64 {
+        if self.is_zero(sub) { self.zero } else { self.base + offset }
+    }
 }
 
 /// The `Layout` of uploading `subs` into `res`, checked against the resource.
@@ -371,6 +528,9 @@ unsafe fn layout(dev: &ID3D12Device, res: &ID3D12Resource, subs: &[Subresource],
     let mut row_bytes = vec![0u64; n];
     let mut total = 0u64;
     dev.GetCopyableFootprints(&rd, 0, n as u32, 0, Some(fps.as_mut_ptr()), Some(rows.as_mut_ptr()), Some(row_bytes.as_mut_ptr()), Some(&mut total));
+    if total == u64::MAX {
+        return Err("invalid texture copy footprints".into());
+    }
     for (i, ((s, fp), (&nrows, &nbytes))) in subs.iter().zip(&fps).zip(rows.iter().zip(&row_bytes)).enumerate() {
         if s.rows != nrows as usize || s.depth != fp.Footprint.Depth as usize || s.row_bytes != nbytes as usize {
             return Err(format!(
@@ -382,20 +542,23 @@ unsafe fn layout(dev: &ID3D12Device, res: &ID3D12Resource, subs: &[Subresource],
     Ok(Layout { fps, rows, total })
 }
 
-/// Write `subs` into the mapped upload buffer `up` (`mapped`) from `base` (a multiple of
-/// D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT) as `l` places them, and record their copies into
-/// `res` on `list` (barriers from `before` and back to `after`).
+/// Write `subs` into the mapped upload buffer `up` (`mapped`) where `l` and `offsets` place them,
+/// and record every copy into `res` on `list` (barriers from `before` and back to `after`).
 #[allow(clippy::too_many_arguments)]
-unsafe fn record_into(list: &ID3D12GraphicsCommandList, res: &ID3D12Resource, subs: &[Subresource], l: &Layout, before: &[D3D12_RESOURCE_STATES], after: &[D3D12_RESOURCE_STATES], up: &ID3D12Resource, mapped: *mut u8, base: u64) {
+unsafe fn record_into(list: &ID3D12GraphicsCommandList, res: &ID3D12Resource, subs: &[Subresource], l: &Layout, before: &[D3D12_RESOURCE_STATES], after: &[D3D12_RESOURCE_STATES], up: &ID3D12Resource, mapped: *mut u8, offsets: StagingOffsets<'_>) {
     let n = subs.len();
-    for ((s, fp), &nrows) in subs.iter().zip(&l.fps).zip(&l.rows) {
+    for (k, ((s, fp), &nrows)) in subs.iter().zip(&l.fps).zip(&l.rows).enumerate() {
+        if offsets.is_zero(k) {
+            continue;
+        }
+        let start = offsets.at(k, fp.Offset) as usize;
         let pitch = fp.Footprint.RowPitch as usize;
         let row = s.row_bytes.min(pitch);
         // depth slices are NumRows rows apart (rows of 4×4 blocks for BCn)
         let slice_pitch = pitch * nrows as usize;
         for z in 0..(fp.Footprint.Depth as usize).min(s.depth) {
             for y in 0..(nrows as usize).min(s.rows) {
-                let at = base as usize + fp.Offset as usize + z * slice_pitch + y * pitch;
+                let at = start + z * slice_pitch + y * pitch;
                 std::ptr::copy_nonoverlapping(s.data[(z * s.rows + y) * s.row_bytes..].as_ptr(), mapped.add(at), row);
             }
         }
@@ -410,7 +573,7 @@ unsafe fn record_into(list: &ID3D12GraphicsCommandList, res: &ID3D12Resource, su
             Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
             Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: k as u32 },
         };
-        let placed = D3D12_PLACED_SUBRESOURCE_FOOTPRINT { Offset: base + fp.Offset, Footprint: fp.Footprint };
+        let placed = D3D12_PLACED_SUBRESOURCE_FOOTPRINT { Offset: offsets.at(k, fp.Offset), Footprint: fp.Footprint };
         let src = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(up), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: placed } };
         list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
     }
@@ -436,8 +599,17 @@ pub unsafe fn wait(dev: &ID3D12Device, queue: &ID3D12CommandQueue) -> Result<(),
     let copy_error = |e| format!("texture copy: {e}");
     let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)
         .map_err(|e| copy_error(fence::api_error(dev, "CreateFence", e)))?;
-    queue.Signal(&fence, 1).map_err(|e| copy_error(fence::api_error(dev, "Signal", e)))?;
+    crate::hle::d3d12x::real::native_queue_signal(queue, &fence, 1).map_err(|e| copy_error(fence::api_error(dev, "Signal", e)))?;
     fence::wait(&fence, 1, dev, None, 10_000).map_err(copy_error)
+}
+
+/// Release GPU submission objects only once a fallback queue wait made that safe. If the wait
+/// itself fails, deliberately retain them: submitted work may still reference their resources.
+pub(crate) fn drop_after_wait<T>(objects: T, waited: Result<(), String>) -> Result<(), String> {
+    if waited.is_err() {
+        std::mem::forget(objects);
+    }
+    waited
 }
 
 unsafe fn buffer(dev: &ID3D12Device, size: u64) -> Result<ID3D12Resource, String> {
@@ -479,8 +651,93 @@ fn transition_sub(r: &ID3D12Resource, sub: u32, before: D3D12_RESOURCE_STATES, a
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
     use windows::Win32::Graphics::Dxgi::Common::*;
+
+    #[test]
+    fn submitted_objects_are_retained_when_the_fallback_wait_fails() {
+        struct CountDrop<'a>(&'a std::sync::atomic::AtomicUsize);
+        impl Drop for CountDrop<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+
+        let drops = std::sync::atomic::AtomicUsize::new(0);
+        assert!(drop_after_wait(CountDrop(&drops), Ok(())).is_ok());
+        assert_eq!(drops.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(drop_after_wait(CountDrop(&drops), Err("wait failed".into())).unwrap_err(), "wait failed");
+        assert_eq!(drops.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn shared_zero_mip_staging_compacts_and_clears_the_full_span() {
+        // A 1024² R8 texture with five mips, including the driver's row and placement alignment.
+        let layout = || Layout {
+            fps: [0, 1_048_576, 1_310_720, 1_376_256, 1_409_024].into_iter()
+                .zip([1024, 512, 256, 128, 64])
+                .map(|(offset, width)| D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                    Offset: offset,
+                    Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                        Format: DXGI_FORMAT_R8_UNORM,
+                        Width: width,
+                        Height: width,
+                        Depth: 1,
+                        RowPitch: width.max(256),
+                    },
+                }).collect(),
+            rows: vec![1024, 512, 256, 128, 64],
+            total: 1_425_216,
+        };
+        let zeros = [true, false, false, false, false];
+        let mut original = BatchStaging::default();
+        let mut shared = BatchStaging::default();
+        let mut items = Vec::new();
+        for _ in 0..8 {
+            original.add(&mut layout(), &[]).unwrap();
+            let mut l = layout();
+            let base = shared.add(&mut l, &zeros).unwrap();
+            items.push((l, base));
+        }
+        let old = original.zero_span().unwrap();
+        let zero = shared.zero_span().unwrap();
+        assert!(old.is_empty());
+        assert_eq!(old.end, 11_403_072);
+        assert_eq!(zero.end, 4_063_232);
+        assert_eq!(staging_capacity(old.end), Some(16 << 20));
+        assert_eq!(staging_capacity(zero.end), Some(4 << 20));
+        for (l, base) in items {
+            let offsets = StagingOffsets { base, zero: zero.start, zero_mips: &zeros };
+            assert_eq!(offsets.at(0, l.fps[0].Offset), zero.start);
+            for (k, fp) in l.fps.iter().enumerate().skip(1) {
+                let at = offsets.at(k, fp.Offset);
+                assert_eq!(at % PLACEMENT, 0);
+                assert!(at + u64::from(fp.Footprint.RowPitch * l.rows[k]) <= zero.start);
+                assert_eq!(fp.Footprint, layout().fps[k].Footprint);
+            }
+        }
+
+        // A fully zero footprint uses whole pitched rows, including the last row of the
+        // last slice, even when GetCopyableFootprints reports a shorter last row.
+        let mut volume = Layout {
+            fps: vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                Offset: 0,
+                Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                    Format: DXGI_FORMAT_R8_UNORM, Width: 13, Height: 2, Depth: 3, RowPitch: 256,
+                },
+            }],
+            rows: vec![2],
+            total: 5 * 256 + 13,
+        };
+        let mut volume_batch = BatchStaging { data_bytes: 268, zero_bytes: 0 };
+        volume_batch.add(&mut volume, &[true]).unwrap();
+        let zero = volume_batch.zero_span().unwrap();
+        assert_eq!(zero, 512..2048);
+        let mut bytes = vec![0x72; 2049];
+        unsafe { clear_staging_span(bytes.as_mut_ptr(), &zero); }
+        assert!(bytes[..512].iter().all(|&b| b == 0x72));
+        assert!(bytes[512..2048].iter().all(|&b| b == 0));
+        assert_eq!(bytes[2048], 0x72);
+    }
 
     fn image(format: u32, ty: ImageType, w: u32, h: u32, slices: u32, mips: u32, mode: u32, address: u64) -> Image {
         Image {
@@ -821,11 +1078,72 @@ mod tests {
         assert_eq!(staging_capacity(u64::MAX), None);
     }
 
+    fn select_large_upload_device_with<F, D>(
+        selector: &crate::gpu::adapter::Selector,
+        make_factory: impl FnOnce() -> Result<F, String>,
+        warp_device: impl FnOnce(&F) -> Result<D, String>,
+        hardware_device: impl FnOnce(&F, &crate::gpu::adapter::Selector) -> Option<(D, String)>,
+        default_device: impl FnOnce() -> Result<D, String>,
+    ) -> Result<(D, String), String> {
+        match make_factory() {
+            Ok(factory) if *selector == crate::gpu::adapter::Selector::Warp => {
+                warp_device(&factory).map(|dev| (dev, "WARP (software renderer)".to_string()))
+            }
+            Ok(factory) => hardware_device(&factory, selector).ok_or_else(|| "no GPU".to_string()),
+            Err(err) if *selector == crate::gpu::adapter::Selector::Auto => default_device()
+                .map(|dev| (dev, "default D3D12 adapter".to_string()))
+                .map_err(|dev_err| format!("DXGI factory unavailable ({err}); default D3D12 device unavailable ({dev_err})")),
+            Err(err) => Err(format!("DXGI factory unavailable for {selector}: {err}")),
+        }
+    }
+
+    unsafe fn large_upload_device(selector: &crate::gpu::adapter::Selector) -> Result<(ID3D12Device, String), String> {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter1, IDXGIFactory6};
+        select_large_upload_device_with(
+            selector,
+            || CreateDXGIFactory2::<IDXGIFactory6>(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(|e| e.to_string()),
+            |factory| {
+                let warp: IDXGIAdapter1 = factory.EnumWarpAdapter().map_err(|e| format!("WARP adapter unavailable: {e}"))?;
+                crate::gpu::agility::create_device(&warp, D3D_FEATURE_LEVEL_11_0).map_err(|e| format!("WARP device unavailable: {e}"))
+            },
+            |factory, sel| {
+                crate::gpu::adapter::candidates(factory, sel).into_iter().find_map(|(a, desc)| {
+                    crate::gpu::agility::create_device(&a, D3D_FEATURE_LEVEL_11_0).ok().map(|dev| (dev, crate::gpu::adapter::name(&desc)))
+                })
+            },
+            || crate::gpu::agility::create_device(None, D3D_FEATURE_LEVEL_11_0).map_err(|e| e.to_string()),
+        )
+    }
+
+    #[test]
+    fn large_upload_device_selection_handles_factory_fallback_and_selectors() {
+        use crate::gpu::adapter::Selector;
+        // 1. Auto + DXGI_ERROR_UNSUPPORTED falls back to default device.
+        let mut used_default = false;
+        let ok = select_large_upload_device_with(&Selector::Auto, || Err::<(), _>("DXGI_ERROR_UNSUPPORTED (0x887A0004)".into()), |_| unreachable!(), |_, _| unreachable!(), || { used_default = true; Ok(42u32) });
+        assert!(used_default && ok == Ok((42, "default D3D12 adapter".to_string())));
+        // 2. Auto + double failure returns Err without panicking.
+        let err = select_large_upload_device_with(&Selector::Auto, || Err::<(), _>("E_FAIL".into()), |_| unreachable!(), |_, _| unreachable!(), || Err::<u32, _>("no D3D12 device".into()));
+        assert!(err.as_ref().is_err_and(|e| e.contains("E_FAIL") && e.contains("no D3D12 device")));
+        // 3. Explicit XCL_ADAPTER filter + factory error must not ignore filter via default fallback.
+        for sel in [Selector::Name("rtx".into()), Selector::Index(1), Selector::Warp] {
+            let mut fallback = false;
+            let res = select_large_upload_device_with(&sel, || Err::<(), _>("DXGI_ERROR_UNSUPPORTED".into()), |_| unreachable!(), |_, _| unreachable!(), || { fallback = true; Ok(99u32) });
+            assert!(!fallback && res.is_err());
+        }
+        // 4. Headless CI: Auto + factory ok with 0 hardware adapters skips cleanly without fallback.
+        let mut fallback = false;
+        let none = select_large_upload_device_with(&Selector::Auto, || Ok(()), |_| unreachable!(), |_, _| None::<(u32, String)>, || { fallback = true; Ok(7u32) });
+        assert!(!fallback && none == Err("no GPU".to_string()));
+        // 5. Selector::Warp + factory ok uses EnumWarpAdapter path.
+        let warp = select_large_upload_device_with(&Selector::Warp, || Ok(()), |_| Ok(11u32), |_, _| unreachable!(), || unreachable!());
+        assert_eq!(warp, Ok((11, "WARP (software renderer)".to_string())));
+    }
+
     #[test]
     fn gpu_large_mixed_upload_keeps_tight_staging_and_exact_pixels() {
         use windows::core::Interface;
-        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
-        use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory6};
 
         unsafe {
             if std::env::var_os("XCL_D3D12_DEBUG").is_some() {
@@ -834,16 +1152,15 @@ mod tests {
                     Err(error) => println!("D3D12 debug layer unavailable: {error}"),
                 }
             }
-            let factory: IDXGIFactory6 = CreateDXGIFactory1().expect("DXGI factory");
             let selector = crate::gpu::adapter::Selector::from_env_or("auto");
-            let selected = crate::gpu::adapter::candidates(&factory, &selector).into_iter().find_map(|(a, desc)| {
-                crate::gpu::agility::create_device(&a, D3D_FEATURE_LEVEL_11_0).ok().map(|dev| (dev, desc))
-            });
-            let Some((dev, desc)) = selected else {
-                crate::gpu::recomp::runner::skip_test("no GPU");
-                return;
+            let (dev, adapter_name) = match large_upload_device(&selector) {
+                Ok(selected) => selected,
+                Err(reason) => {
+                    crate::gpu::recomp::runner::skip_test(&reason);
+                    return;
+                }
             };
-            println!("large upload adapter: {}", String::from_utf16_lossy(&desc.Description).trim_end_matches('\0'));
+            println!("large upload adapter: {adapter_name}");
             let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
             let make = |width, height, format| {
                 let desc = D3D12_RESOURCE_DESC {
@@ -939,24 +1256,30 @@ mod tests {
         Some(sum as f64 / (sw * sh * ch) as f64)
     }
 
-    /// The retail TTPF archive (`XCL_SAMPLE_TTPF`): (1) the mip chain model gives the space
-    /// every texture takes; (2) on its uncompressed unorm textures each detiled mip level is
-    /// close to the level above it scaled down 2× (mip tail levels included), while the same
-    /// tail levels read from a wrong place in the tail block (origin 0, 0) are not.
+    /// Read and detile every entry in the archive. For applicable textures, also check mip
+    /// continuity, mip tail origins and volume layout against the texture content.
     #[test]
     fn retail_ttpf_textures_detile_with_their_mip_chains() {
         let Ok(path) = std::env::var("XCL_SAMPLE_TTPF") else {
             println!("XCL_SAMPLE_TTPF not set – skipping");
             return;
         };
-        let a = Ttpf::open(&path);
-        let (mut fit, mut sized, mut unreadable) = (0, 0, 0);
+        check_ttpf_textures(&Ttpf::open(&path));
+    }
+
+    fn check_ttpf_textures(a: &Ttpf) {
+        assert!(!a.textures.is_empty(), "empty TTPF texture table");
         let rgba8 = desc::gfx10_format(DXGI_FORMAT_R8G8B8A8_UNORM).unwrap();
-        let (mut checked, mut close, mut worst) = (0, 0, Vec::new());
-        let (mut tail_levels, mut tail_err, mut wrong_err) = (0, 0.0f64, 0.0f64);
+        let (mut color_checked, mut color_close) = (0, 0);
+        let (mut alpha_checked, mut alpha_close) = (0, 0);
+        let mut worst = Vec::new();
+        let (mut tail_levels, mut tail_controls, mut tail_err, mut wrong_err) = (0, 0, 0.0f64, 0.0f64);
         let mut volumes = Vec::new();
+        let mut detiled = 0;
+        let mut subresource_count = 0;
         for t in &a.textures {
-            let Some((e, side, _)) = ttpf_element(t.dxgi) else { continue };
+            let (e, side, _) = ttpf_element(t.dxgi)
+                .unwrap_or_else(|| panic!("TTPF texture {}: unsupported DXGI format {}", t.index, t.dxgi));
             let gfx10 = match (e, side) {
                 (0, 1) => 1,
                 (1, 1) => 7,
@@ -972,20 +1295,55 @@ mod tests {
                 _ => ImageType::D2,
             };
             let img = image(gfx10, ty, t.w, t.h, t.slices, t.mips, t.mode, 0);
-            let p = placement(&img, CONSOLE_PIPES).unwrap();
-            sized += 1;
-            if p.bytes == t.end - t.start || p.bytes.div_ceil(4096) * 4096 == t.end - t.start {
-                fit += 1;
+            let p = placement(&img, CONSOLE_PIPES)
+                .unwrap_or_else(|e| panic!("TTPF texture {}: {e}", t.index));
+            let start = a.payload_start(t, p.bytes);
+            let slot = t.end.checked_sub(start).expect("TTPF entry ends before its payload");
+            assert!(
+                p.bytes == slot || p.bytes.next_multiple_of(t.payload_alignment()) == slot,
+                "TTPF texture {}: layout needs {:#x} bytes, archive slot has {slot:#x}",
+                t.index, p.bytes
+            );
+            let mem = a.read(start, start + p.bytes)
+                .unwrap_or_else(|| panic!("TTPF texture {}: unreadable payload at {start:#x}", t.index));
+            let subs = subresources(&img, &mem, CONSOLE_PIPES)
+                .unwrap_or_else(|e| panic!("TTPF texture {}: {e}", t.index));
+            let layers = if t.dim == 3 { 1 } else { t.slices as usize };
+            assert_eq!(subs.len(), layers * t.mips as usize, "TTPF texture {}", t.index);
+            detiled += 1;
+            subresource_count += subs.len();
+            if t.has_cube_tiers() {
+                let first = a.blocks.binary_search_by_key(&t.start, |b| b.start)
+                    .expect("TTPF cube must start at a block boundary");
+                let full = a.blocks.binary_search_by_key(&start, |b| b.start).unwrap();
+                for tier in first..full {
+                    let shift = full - tier;
+                    assert!(shift < t.mips as usize, "TTPF cube {}: too many lower-resolution tiers", t.index);
+                    let lower = image(gfx10, ty, (t.w >> shift).max(1), (t.h >> shift).max(1),
+                        t.slices, t.mips - shift as u32, t.mode, 0);
+                    let prefix = a.read(a.blocks[tier].start, a.blocks[tier + 1].start)
+                        .unwrap_or_else(|| panic!("TTPF cube {}: unreadable lower-resolution tier", t.index));
+                    let lower = subresources(&lower, &prefix, CONSOLE_PIPES).unwrap();
+                    let full_mips = subs.chunks_exact(t.mips as usize).flat_map(|face| &face[shift..]);
+                    assert!(full_mips.eq(&lower), "TTPF cube {}: duplicated mips differ at tier {shift}", t.index);
+                }
             }
             // volumes of 16-bit float texels (colour-grading LUTs): neighbours along x and z
             // differ little read as thick blocks, a lot read as 2D slices
-            if t.dim == 3 && matches!(t.dxgi, 10 | 54) {
-                if let Some(mem) = a.read(t.start, t.end) {
-                    let thick = subresources(&img, &mem, CONSOLE_PIPES).unwrap().remove(0);
-                    let flat = image(gfx10, ImageType::D2Array, t.w, t.h, t.slices, t.mips, t.mode, 0);
-                    let as_2d: Vec<u8> = subresources(&flat, &mem, CONSOLE_PIPES).unwrap().into_iter().flat_map(|s| s.data).collect();
-                    let (w, h, d, e) = (t.w as usize, t.h as usize, t.slices as usize, 1usize << e);
-                    volumes.push((t.index, roughness(&thick.data, w, h, d, e), roughness(&as_2d, w, h, d, e)));
+            if t.dim == 3 && matches!(t.dxgi, 10 | 54) && t.w > 1 && t.slices > 1 {
+                let flat = image(gfx10, ImageType::D2Array, t.w, t.h, t.slices, t.mips, t.mode, 0);
+                if let Ok(flat_subs) = subresources(&flat, &mem, CONSOLE_PIPES) {
+                    // A D2 array stores all mips of one slice before the next slice.
+                    let as_2d: Vec<u8> = flat_subs.chunks_exact(t.mips as usize)
+                        .flat_map(|slice| slice[0].data.iter().copied()).collect();
+                    let thick = &subs[0].data;
+                    if as_2d.len() == thick.len() {
+                        let (w, h, d, e) = (t.w as usize, t.h as usize, t.slices as usize, 1usize << e);
+                        // `roughness` reads only the first half-float of each texel.
+                        let distinct = as_2d.chunks_exact(e).zip(thick.chunks_exact(e))
+                            .any(|(a, b)| a[..2] != b[..2]);
+                        volumes.push((t.index, roughness(thick, w, h, d, e), roughness(&as_2d, w, h, d, e), distinct));
+                    }
                 }
             }
             // unorm channels: R8 / A8, RGBA8 / BGRA8, RGBA16
@@ -998,11 +1356,6 @@ mod tests {
             if t.mips < 2 || t.slices != 1 {
                 continue;
             }
-            let Some(mem) = a.read(t.start, t.start + p.bytes) else {
-                unreadable += 1;
-                continue;
-            };
-            let subs = subresources(&img, &mem, CONSOLE_PIPES).unwrap();
             let mut bad = 0.0f64;
             for k in 1..subs.len() {
                 let Some(err) = mip_error(&subs[k - 1], &subs[k], ch, cb) else { continue };
@@ -1015,26 +1368,106 @@ mod tests {
                     wrong.levels[k].origin = (0, 0);
                     let ws = Subresource { depth: 1, rows: l.height, row_bytes: subs[k].row_bytes, data: wrong.detile_level(&mem, k, 0) };
                     tail_levels += 1;
-                    tail_err += err;
-                    wrong_err += mip_error(&subs[k - 1], &ws, ch, cb).unwrap();
+                    // `mip_error` uses only the high byte of each 16-bit channel.
+                    let distinct = if cb == 1 { ws.data != subs[k].data } else {
+                        ws.data.chunks_exact(2).zip(subs[k].data.chunks_exact(2))
+                            .any(|(a, b)| a[1] != b[1])
+                    };
+                    if distinct {
+                        tail_controls += 1;
+                        tail_err += err;
+                        wrong_err += mip_error(&subs[k - 1], &ws, ch, cb).unwrap();
+                    }
                 }
             }
-            checked += 1;
+            // Alpha masks can change coverage between mips. Keep their box-filter error as
+            // a diagnostic; they still go through the same layout, decode and tail checks.
+            let (checked, close) = if t.dxgi == 65 {
+                (&mut alpha_checked, &mut alpha_close)
+            } else {
+                (&mut color_checked, &mut color_close)
+            };
+            *checked += 1;
             if bad < 8.0 {
-                close += 1;
+                *close += 1;
             } else if worst.len() < 8 {
                 worst.push((t.index, t.w, t.h, t.mips, t.mode, bad));
             }
         }
-        let n = tail_levels.max(1) as f64;
-        println!("TTPF: the mip chain model size matches for {fit} of {sized} textures");
-        println!("TTPF: textures with mips (R8/RGBA8/RGBA16): {close} of {checked} – every mip close to the previous one downscaled (< 8/255), {unreadable} in unreadable blocks; outliers: {worst:?}");
-        println!("TTPF: {tail_levels} levels in the mip tail – error {:.2}/255, at the wrong place in the block {:.2}/255", tail_err / n, wrong_err / n);
-        println!("TTPF: volumes (index, neighbour difference as thick blocks, as 2D slices): {volumes:?}");
-        assert!(fit * 100 >= sized * 99, "mip chain model: {fit} / {sized}");
-        assert!(checked >= 5 && close * 100 >= checked * 90, "mips: {close} / {checked}");
-        assert!(tail_levels >= 5 && wrong_err > 3.0 * tail_err, "mip tail: {tail_err} vs {wrong_err}");
-        assert!(!volumes.is_empty() && volumes.iter().all(|v| v.2 > 3.0 * v.1), "volumes: {volumes:?}");
+        let n = tail_controls.max(1) as f64;
+        println!("TTPF: read and detiled {detiled} of {} textures ({subresource_count} subresources)", a.textures.len());
+        println!("TTPF: mips close to the previous level downscaled (< 8/255): color {color_close}/{color_checked}, alpha {alpha_close}/{alpha_checked}; outliers: {worst:?}");
+        println!("TTPF: {tail_levels} levels in the mip tail, {tail_controls} distinguishable controls – error {:.2}/255, at the wrong place in the block {:.2}/255", tail_err / n, wrong_err / n);
+        println!("TTPF: volumes (index, neighbour difference as thick blocks, as 2D slices, distinguishable): {volumes:?}");
+        assert!(color_close * 100 >= color_checked * 90, "color mips: {color_close} / {color_checked}");
+        assert!(tail_controls == 0 || wrong_err > 3.0 * tail_err, "mip tail: {tail_err} vs {wrong_err}");
+        assert!(volumes.iter().all(|v| !v.3 || v.2 > 3.0 * v.1), "volumes: {volumes:?}");
+    }
+
+    fn ttpf_with_cleared_smallest_mip(dxgi: u32) -> Ttpf {
+        let img = image(1, ImageType::D2, 2, 2, 1, 2, 5, 0);
+        let p = placement(&img, CONSOLE_PIPES).unwrap();
+        let mut data = vec![0; p.bytes];
+        p.chain.tile_level(&mut data, 0, 0, &[64; 4]);
+        p.chain.tile_level(&mut data, 1, 0, &[0]);
+        let start = 0x800;
+        let end = start + data.len();
+        Ttpf {
+            blocks: vec![
+                TtpfBlock { file: 0, start, codec: 0, padding: 0 },
+                TtpfBlock { file: data.len(), start: end, codec: 0, padding: 0 },
+            ],
+            textures: vec![TtpfTexture {
+                index: 0, w: 2, h: 2, dxgi, mode: 5, mips: 2, slices: 1, dim: 1,
+                tile_mode: 1, start, end,
+            }],
+            d: data,
+            cache: Default::default(),
+        }
+    }
+
+    #[test]
+    fn ttpf_accepts_a_cleared_alpha_mip() {
+        check_ttpf_textures(&ttpf_with_cleared_smallest_mip(DXGI_FORMAT_A8_UNORM.0 as u32));
+    }
+
+    #[test]
+    #[should_panic(expected = "color mips: 0 / 1")]
+    fn ttpf_still_rejects_an_inconsistent_color_mip() {
+        check_ttpf_textures(&ttpf_with_cleared_smallest_mip(DXGI_FORMAT_R8_UNORM.0 as u32));
+    }
+
+    #[test]
+    fn ttpf_uniform_tail_needs_no_distinguishing_control() {
+        let img = image(1, ImageType::D2, 4, 4, 1, 2, 5, 0);
+        let p = placement(&img, CONSOLE_PIPES).unwrap();
+        assert_ne!(p.chain.levels[1].origin, (0, 0));
+        let start = 0x800;
+        let end = start + p.bytes;
+        let a = Ttpf {
+            blocks: vec![TtpfBlock { file: 0, start, codec: 0, padding: 0 }, TtpfBlock { file: p.bytes, start: end, codec: 0, padding: 0 }],
+            textures: vec![TtpfTexture { index: 0, w: 4, h: 4, dxgi: 61, mode: 5, mips: 2, slices: 1, dim: 1, tile_mode: 1, start, end }],
+            d: vec![0; p.bytes],
+            cache: Default::default(),
+        };
+        check_ttpf_textures(&a);
+    }
+
+    #[test]
+    fn ttpf_small_mipped_volume_does_not_require_a_flat_array_control() {
+        for mips in [1, 2] {
+            let img = image(7, ImageType::D3, 2, 2, 2, mips, 5, 0);
+            let p = placement(&img, CONSOLE_PIPES).unwrap();
+            let start = 0x800;
+            let end = start + p.bytes;
+            let a = Ttpf {
+                blocks: vec![TtpfBlock { file: 0, start, codec: 0, padding: 0 }, TtpfBlock { file: p.bytes, start: end, codec: 0, padding: 0 }],
+                textures: vec![TtpfTexture { index: 0, w: 2, h: 2, dxgi: 54, mode: 5, mips, slices: 2, dim: 3, tile_mode: 1, start, end }],
+                d: vec![0; p.bytes],
+                cache: Default::default(),
+            };
+            check_ttpf_textures(&a);
+        }
     }
 
     /// Mean |difference| between x and z neighbours of the first channel (half floats, `e`-byte
@@ -1072,6 +1505,46 @@ mod tests {
         })
     }
 
+    #[test]
+    fn ttpf_reads_tagged_blocks_and_the_last_texture() {
+        let mut file = vec![0; 0x1700];
+        file[..4].copy_from_slice(b"RDS5");
+        file[4..8].copy_from_slice(&4u32.to_le_bytes());
+        file[8..12].copy_from_slice(&0x12000u32.to_le_bytes());
+        file[16..20].copy_from_slice(&1u32.to_le_bytes());
+        file[0x100..0x104].copy_from_slice(b"ETPF");
+        file[0x108..0x10c].copy_from_slice(&2u32.to_le_bytes());
+        let cube = (2u32 << 24) | (2 << 21) | (5 << 10) | (98 << 3) | 2;
+        file[0x114..0x118].copy_from_slice(&cube.to_le_bytes());
+        file[0x120..0x124].copy_from_slice(&(2u32 << 28).to_le_bytes());
+        file[0x124..0x128].copy_from_slice(&((1u32 << 21) | (71 << 3) | 1).to_le_bytes());
+        file[0x128..0x12c].copy_from_slice(&2u32.to_le_bytes());
+
+        let raw = vec![0x78; 0x1000];
+        let zlib = miniz_oxide::deflate::compress_to_vec_zlib(&[0x35; 0x1000], 6);
+        let bc1 = include_bytes!("../../../../tests/data/bcpack/bc1-8192-3.bin");
+        for (i, (start, next, tagged, payload)) in [
+            (0x200, 0x1300, 0x0000, raw.as_slice()),
+            (0x1300, 0x1400, 0x1800, zlib.as_slice()),
+            (0x1400, 0x1700, 0x2100, bc1.as_slice()),
+            (0x1700, 0x1700, 0x12100, &[]),
+        ].into_iter().enumerate() {
+            let padding = next - start - payload.len();
+            let record = (start as u64 >> 8) | ((tagged as u64 >> 6) << 24) | (padding as u64) << 52;
+            file[0x18 + 8 * i..0x20 + 8 * i].copy_from_slice(&record.to_le_bytes());
+            file[start..start + payload.len()].copy_from_slice(payload);
+        }
+
+        let archive = Ttpf::parse(file);
+        assert_eq!(archive.payload_start(&archive.textures[0], 0x1000), 0x1800);
+        assert_eq!(archive.read(0x17fe, 0x1802).unwrap(), [0x78, 0x78, 0x35, 0x35]);
+        let last = &archive.textures[1];
+        assert_eq!((last.start, last.end, last.mips), (0x2800, 0x12800, 3));
+        assert_eq!(archive.read(last.start, last.end).unwrap(), crate::hle::bcpack::decode(1, bc1, 0x10000).unwrap());
+        assert!(archive.read(last.end, last.end + 1).is_none());
+        assert!(archive.read(last.end + 1, last.end).is_none(), "reversed range");
+    }
+
     struct TtpfTexture {
         index: usize,
         w: u32,
@@ -1082,73 +1555,131 @@ mod tests {
         slices: u32,
         /// dword 1 bits 21-23: 1 2D, 2 cube, 3 volume (slices = depth), 5 2D array
         dim: u32,
+        tile_mode: u32,
         start: usize,
         end: usize,
     }
 
-    /// Just enough of a .ttpf archive: its zlib blocks of one unpacked stream and the texture
-    /// table.
+    impl TtpfTexture {
+        fn has_cube_tiers(&self) -> bool {
+            self.dim == 2 && self.mips > 1 && self.tile_mode != 1
+        }
+
+        fn payload_alignment(&self) -> usize {
+            if self.has_cube_tiers() && self.tile_mode != 2 { 0x10000 } else { 0x1000 }
+        }
+    }
+
+    struct TtpfBlock {
+        file: usize,
+        start: usize,
+        codec: u8,
+        padding: usize,
+    }
+
+    /// The archive's texture table and the blocks of its unpacked stream, in stream order.
     struct Ttpf {
         d: Vec<u8>,
-        /// (file offset, position in the stream), by position
-        blocks: Vec<(usize, usize)>,
+        blocks: Vec<TtpfBlock>,
         textures: Vec<TtpfTexture>,
-        cache: std::cell::RefCell<HashMap<usize, Option<std::rc::Rc<Vec<u8>>>>>,
+        cache: std::cell::RefCell<Option<(usize, Vec<u8>)>>,
     }
 
     impl Ttpf {
         fn open(path: &str) -> Ttpf {
-            let d = std::fs::read(path).unwrap();
+            Self::parse(std::fs::read(path).unwrap())
+        }
+
+        fn parse(d: Vec<u8>) -> Ttpf {
             let u32_at = |o: usize| u32::from_le_bytes(d[o..o + 4].try_into().unwrap());
             assert_eq!(&d[..4], b"RDS5");
-            let total = u32_at(8) as usize | (u32_at(0xc) as usize & 0xff) << 32;
+            // The header excludes the 0x800-byte lead-in used by stream offsets.
+            let total = (u32_at(8) as usize | (u32_at(0xc) as usize & 0xff) << 32) + 0x800;
             let at = (u32_at(0x10) as usize) << 8;
+            assert_eq!(&d[at..at + 4], b"ETPF");
             let n = (u32_at(4) as usize).min((at - 0x18) / 8);
-            let mut blocks: Vec<(usize, usize)> = (0..n)
+            let mut blocks: Vec<_> = (0..n)
                 .filter_map(|i| {
                     let v = u64::from_le_bytes(d[0x18 + 8 * i..0x20 + 8 * i].try_into().unwrap());
-                    let pos = ((v >> 24) & 0xff_ffff) | ((v >> 48) & 0xf) << 24;
-                    (v != 0).then_some((((v & 0xff_ffff) << 8) as usize, (pos << 6) as usize))
+                    // The low bits of the unpacked position carry the codec. The packed
+                    // payload stops before the padding recorded in the high bits.
+                    let tagged = (((v >> 24) & 0xfff_ffff) << 6) as usize;
+                    (v != 0).then_some(TtpfBlock {
+                        file: ((v & 0xff_ffff) << 8) as usize,
+                        start: (tagged & !0xfff) + 0x800,
+                        codec: ((tagged >> 8) & 0xf) as u8,
+                        padding: (v >> 52) as usize,
+                    })
                 })
                 .collect();
-            blocks.sort_by_key(|b| b.1);
+            blocks.sort_by_key(|b| b.start);
+            let sentinel = blocks.last().expect("empty TTPF block table");
+            assert_eq!((sentinel.file, sentinel.start), (d.len(), total), "TTPF end of stream");
+            assert!(blocks.windows(2).all(|w| w[0].file < w[1].file && w[0].start < w[1].start), "TTPF block order");
             let count = u32_at(at + 8) as usize;
             let mut textures: Vec<TtpfTexture> = (0..count)
                 .map(|i| {
                     let o = at + 16 + 16 * i;
                     let (a, b, c) = (u32_at(o), u32_at(o + 4), u32_at(o + 8));
+                    let tile_mode = (b >> 24) & 3;
+                    // dword 0 bits 28-31 plus dword 1 bits 0-2 (#1245).
+                    let mips = ((a >> 28) + (b & 7)).max(1);
+                    let dim = (b >> 21) & 7;
                     TtpfTexture {
                         index: i,
                         w: (a & 0x3fff) + 1,
                         h: ((a >> 14) & 0x3fff) + 1,
                         dxgi: (b & 0x3ff) >> 3,
-                        // tile mode bits: 0 = 64 KB tiles (SW_64KB_D), else 4 KB (SW_4KB_S)
-                        mode: if (b >> 24) & 3 == 0 { 10 } else { 5 },
-                        mips: (a >> 28).max(1),
+                        // Mode 0 uses SW_64KB_D except for cubes with separate mip tiers.
+                        mode: if tile_mode == 0 && !(dim == 2 && mips > 1) { 10 } else { 5 },
+                        mips,
                         slices: ((b >> 10) & 0x7ff) + 1,
-                        dim: (b >> 21) & 7,
+                        dim,
+                        tile_mode,
                         start: (c & 0x1f_ffff) as usize * 4096 + 0x800,
                         end: total,
                     }
                 })
                 .collect();
-            let mut by_start: Vec<usize> = (0..count).collect();
-            by_start.sort_by_key(|&i| textures[i].start);
+            textures.sort_by_key(|t| t.start);
             for k in 0..count.saturating_sub(1) {
-                textures[by_start[k]].end = textures[by_start[k + 1]].start;
+                textures[k].end = textures[k + 1].start;
             }
             Ttpf { d, blocks, textures, cache: Default::default() }
         }
 
-        /// bytes [a, b) of the unpacked stream (None: in a block that is not zlib)
+        fn payload_start(&self, texture: &TtpfTexture, bytes: usize) -> usize {
+            if !texture.has_cube_tiers() {
+                return texture.start;
+            }
+            // Lower-resolution cubes come first. The full six-face chain starts in its
+            // own block and, for modes 0 and 3, is padded out to a 64 KiB multiple.
+            let start = texture.end.checked_sub(bytes.next_multiple_of(texture.payload_alignment()))
+                .filter(|&start| start > texture.start)
+                .unwrap_or_else(|| panic!("TTPF cube {}: no room for its full mip chain", texture.index));
+            assert!(self.blocks.binary_search_by_key(&start, |b| b.start).is_ok(),
+                "TTPF cube {}: full mip chain must start at a block boundary", texture.index);
+            start
+        }
+
+        /// Bytes [a, b) of the unpacked stream. The cache retains the last block for the next
+        /// texture if they share a block.
         fn read(&self, a: usize, b: usize) -> Option<Vec<u8>> {
-            let mut out = Vec::with_capacity(b - a);
+            let len = b.checked_sub(a)?;
+            if b > self.blocks.last()?.start {
+                return None;
+            }
+            let mut out = Vec::with_capacity(len);
             let mut pos = a;
             while pos < b {
-                let i = self.blocks.partition_point(|bl| bl.1 <= pos).checked_sub(1)?;
-                let data = self.block(i)?;
-                let from = pos - self.blocks[i].1;
-                let to = (b - self.blocks[i].1).min(data.len());
+                let i = self.blocks.partition_point(|bl| bl.start <= pos).checked_sub(1)?;
+                let mut cache = self.cache.borrow_mut();
+                if cache.as_ref().is_none_or(|(index, _)| *index != i) {
+                    *cache = Some((i, self.block(i)?));
+                }
+                let data = &cache.as_ref()?.1;
+                let from = pos.checked_sub(self.blocks[i].start)?;
+                let to = b.checked_sub(self.blocks[i].start)?.min(data.len());
                 if to <= from {
                     return None;
                 }
@@ -1158,17 +1689,17 @@ mod tests {
             Some(out)
         }
 
-        fn block(&self, i: usize) -> Option<std::rc::Rc<Vec<u8>>> {
-            self.cache
-                .borrow_mut()
-                .entry(i)
-                .or_insert_with(|| {
-                    let off = self.blocks[i].0;
-                    let next = self.blocks.iter().map(|b| b.0).filter(|&o| o > off).min().unwrap_or(self.d.len());
-                    let src = self.d.get(off..next)?;
-                    (src.first() == Some(&0x78)).then(|| miniz_oxide::inflate::decompress_to_vec_zlib(src).ok().map(std::rc::Rc::new)).flatten()
-                })
-                .clone()
+        fn block(&self, i: usize) -> Option<Vec<u8>> {
+            let block = &self.blocks[i];
+            let next = self.blocks.get(i + 1)?;
+            let len = next.start.checked_sub(block.start)?;
+            let src = self.d.get(block.file..next.file.checked_sub(block.padding)?)?;
+            let data = match block.codec {
+                0 => src.to_vec(),
+                8 => miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(src, len).ok()?,
+                mode => crate::hle::bcpack::decode(mode, src, len).ok()?,
+            };
+            (data.len() == len).then_some(data)
         }
     }
 }

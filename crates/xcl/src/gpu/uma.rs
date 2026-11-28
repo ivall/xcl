@@ -116,6 +116,8 @@ pub struct Uma {
     /// cannot take it – a title that commits all of unified memory at start (Unicorn
     /// Overlord: 2046 of 2048 MB) left no room for draw arguments, and draws were skipped.
     pool: Mutex<(usize, usize, Vec<usize>)>,
+    /// windows remade as driver heaps (`hle::d3d12x::uma_driver`), one bit each
+    driver: std::sync::atomic::AtomicU32,
 }
 
 /// bytes of XCL's arena pool (`Uma::new`)
@@ -301,6 +303,7 @@ impl Uma {
                 inner: Mutex::new(inner),
                 sparse_free: Mutex::new(sparse_free),
                 pool: Mutex::new((0, 0, Vec::new())),
+                driver: Default::default(),
             };
             u.reserve_pool(POOL);
             return Some(u);
@@ -375,6 +378,16 @@ impl Uma {
     /// Whether `p` is in a committed window.
     pub fn is_committed(&self, p: usize) -> bool {
         self.window_of(p).is_some_and(|k| self.is_committed_window(k))
+    }
+
+    /// Window `k` is a driver heap now (`hle::d3d12x::uma_driver`).
+    pub fn set_driver_window(&self, k: usize) {
+        self.driver.fetch_or(1 << k, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether window `k` is a driver heap (`set_driver_window`).
+    pub fn is_driver_window(&self, k: usize) -> bool {
+        k < 32 && self.driver.load(std::sync::atomic::Ordering::Relaxed) & (1 << k) != 0
     }
 
     /// Whether `[p, p + len)` lies in a committed coherent window – memory that is committed and
@@ -512,6 +525,7 @@ impl Uma {
                     inner: Mutex::new(inner),
                     sparse_free: Mutex::new(Default::default()),
                     pool: Mutex::new((0, 0, Vec::new())),
+                    driver: Default::default(),
                 });
             }
             for p in got {
@@ -774,6 +788,13 @@ impl Arena {
 
 static GLOBAL: OnceLock<Option<Uma>> = OnceLock::new();
 
+/// A process that holds no title memory (a shader preparation worker): `get` is None from here
+/// on, and nothing is reserved or committed for it (a run's region commits its coherent window).
+/// Before any `get`.
+pub fn leave_out() {
+    let _ = GLOBAL.set(None);
+}
+
 /// The title's graphics memory XCL places in the coherent window (`note_coherent_need`) is
 /// known only once it asks for it, and the window is committed when it is made: its size is
 /// what the title asked for in its last run (`<data>/cache/uma_coherent.txt`) and XCL's own
@@ -782,12 +803,38 @@ fn coherent_file() -> std::path::PathBuf {
     crate::state::data_dir().join("cache").join("uma_coherent.txt")
 }
 
+/// Machines with less RAM than this get an automatic coherent-window cap.
+const AUTO_CAP_BELOW_RAM: u64 = 24 << 30;
+
+/// The coherent window is GPU-visible system memory: Windows keeps all of it resident as
+/// non-local video memory, outside the paging file. On a 16 GB machine running a retail title,
+/// the 4 GB window was most of the 4.8-5.3 GB of shared GPU memory, and available RAM fell to
+/// 0.02-0.16 GB. With the window at 2 GB, shared memory averaged 2.5-3.2 GB and average
+/// available RAM went from ~1.6 to 2.6-3.2 GB, with the runs no shorter. Below
+/// `AUTO_CAP_BELOW_RAM`, the window is at most an eighth of the RAM, at least 1 GiB.
+/// `XCL_COHERENT_MB` still sets the size; `XCL_COHERENT_AUTO_CAP=0` turns the cap off.
+fn auto_coherent_cap(total_ram: Option<u64>) -> Option<usize> {
+    if std::env::var("XCL_COHERENT_AUTO_CAP").is_ok_and(|v| v.trim() == "0") {
+        return None;
+    }
+    let ram = total_ram?;
+    (ram < AUTO_CAP_BELOW_RAM).then(|| ((ram / 8).max(1 << 30)) as usize)
+}
+
+fn total_physical() -> Option<u64> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    (unsafe { GlobalMemoryStatusEx(&mut m) } != 0).then_some(m.ullTotalPhys)
+}
+
 /// Bytes the coherent window(s) are made with for a runtime layout of `windows` windows.
 pub fn coherent_hint_for(windows: usize) -> usize {
     let cap = max_coherent_bytes(windows);
     if let Some(mb) = std::env::var("XCL_COHERENT_MB").ok().and_then(|v| v.parse::<usize>().ok()) {
         return (mb << 20).clamp(GRAIN, cap);
     }
+    let cap = auto_coherent_cap(total_physical()).map_or(cap, |c| c.clamp(GRAIN, cap));
     let title = std::fs::read_to_string(coherent_file()).ok().and_then(|s| s.trim().parse::<usize>().ok()).unwrap_or(0);
     // only with the commit for all of it: the title's ~13 GB, video memory for its render targets
     // and textures (WDDM charges commit for each video-memory allocation too) and the window
@@ -799,7 +846,7 @@ pub fn coherent_hint_for(windows: usize) -> usize {
             free_commit() >> 20,
             NEEDS_FOR_COHERENT_HEAPS >> 20
         );
-        return RUNTIME_COMMITTED_CAP;
+        return RUNTIME_COMMITTED_CAP.min(cap);
     }
     (title + RUNTIME_COMMITTED_CAP).min(cap)
 }
@@ -1187,5 +1234,18 @@ mod tests {
         assert_eq!(u.window_of(a), Some(0));
         assert_eq!(u.window_of(b), Some(1));
         assert!(u.free(a) && u.free(b));
+    }
+}
+
+#[cfg(test)]
+mod auto_cap_tests {
+    use super::*;
+
+    #[test]
+    fn low_ram_machines_get_an_eighth_of_their_ram() {
+        assert_eq!(auto_coherent_cap(Some(16 << 30)), Some(2 << 30));
+        assert_eq!(auto_coherent_cap(Some(6 << 30)), Some(1 << 30));
+        assert_eq!(auto_coherent_cap(Some(32 << 30)), None);
+        assert_eq!(auto_coherent_cap(None), None);
     }
 }

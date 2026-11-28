@@ -78,6 +78,7 @@ pub(super) unsafe extern "system" fn create_command_queue_x(this: *mut c_void, d
     let d = if desc.is_null() { [0; 4] } else { pc_queue_desc(desc.read_unaligned()) };
     let hr = real::dev_create_command_queue(this, d.as_ptr() as usize, riid, ppv);
     if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
+        super::present::track_queue(*ppv as usize);
         super::list_x::on_queue_create(*ppv as usize, this as usize, D3D12_COMMAND_LIST_TYPE(d[0] as i32));
     }
     hr
@@ -88,6 +89,14 @@ pub(super) unsafe extern "system" fn create_command_allocator_x(this: *mut c_voi
     real::dev_create_command_allocator(this, pc_list_type(ty) as usize, riid, ppv)
 }
 
+fn active_list_allocator(alloc: usize) -> usize {
+    active_list_allocator_with(alloc, super::alloc_pool::current)
+}
+
+fn active_list_allocator_with(alloc: usize, current: impl FnOnce(usize) -> usize) -> usize {
+    current(alloc)
+}
+
 unsafe fn create_list(this: *mut c_void, node: u32, ty: u32, alloc: usize, pso: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     let dma = !riid.is_null() && guid_bytes(&*riid) == guid_bytes(&IID_XBOX_DMA_COMMAND_LIST);
     let riid = if dma { &IID_GRAPHICS_COMMAND_LIST as *const GUID } else { riid };
@@ -95,10 +104,17 @@ unsafe fn create_list(this: *mut c_void, node: u32, ty: u32, alloc: usize, pso: 
     let hr = if super::console_list::enabled() {
         real::dev_create_command_list_x(this, node, ty, alloc, pso, riid, ppv)
     } else {
-        let resolved_pso = super::pso_async::resolve_for_bind(pso);
-        let hr = real::dev_create_command_list(this, node, ty, alloc, resolved_pso, riid, ppv);
+        let prepared = super::bind::PreparedNativePipeline::new(pso);
+        let resolved_pso = prepared.raw();
+        let pc_alloc = active_list_allocator(alloc);
+        let hr = real::dev_create_command_list(this, node, ty, pc_alloc, resolved_pso, riid, ppv);
         if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
-            super::list_x::on_create(*ppv, alloc, pso, D3D12_COMMAND_LIST_TYPE(ty as i32));
+            super::list_x::on_create_with_backing(*ppv, alloc, pc_alloc, pso, D3D12_COMMAND_LIST_TYPE(ty as i32));
+            prepared.commit(*ppv, alloc);
+            super::dred::reset(*ppv);
+            if pso != 0 && resolved_pso != 0 {
+                super::dred::mark_pipeline(*ppv, pso, resolved_pso);
+            }
         }
         hr
     };
@@ -111,7 +127,6 @@ unsafe fn create_list(this: *mut c_void, node: u32, ty: u32, alloc: usize, pso: 
     // the title's inline D3D12.X code writes into the list object: it gets one of the
     // console's shape (`title_list`)
     if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() && !super::console_list::enabled() {
-        super::bind::reset(*ppv, alloc, pso);
         *ppv = super::title_list::wrap(*ppv);
     }
     hr
@@ -689,9 +704,9 @@ fn uav_format_supported_by_caps(format: u32, support1: u32, support2: u32) -> bo
     (support2 & typed_rw) != 0
 }
 
-static UAV_FORMAT_SUPPORT: Mutex<Option<HashMap<(usize, u32), bool>>> = Mutex::new(None);
+static UAV_FORMAT_SUPPORT: Mutex<Option<HashMap<((u32, i32), u32), bool>>> = Mutex::new(None);
 
-/// Query (and cache per device + format) whether the PC device supports `ALLOW_UNORDERED_ACCESS`
+/// Query (and cache per adapter LUID + format) whether the PC device supports `ALLOW_UNORDERED_ACCESS`
 /// on `format`. Falls back to `texture_format_allows_uav` if the device cannot be queried.
 unsafe fn device_format_supports_uav(device: *mut c_void, format: u32) -> bool {
     if !texture_format_allows_uav(format) {
@@ -700,28 +715,30 @@ unsafe fn device_format_supports_uav(device: *mut c_void, format: u32) -> bool {
     if is_typeless_uav_format(format) || device.is_null() {
         return true;
     }
-    let key = (device as usize, format);
+    let Some(dev) = ID3D12Device::from_raw_borrowed(&device) else {
+        return true;
+    };
+    let luid = dev.GetAdapterLuid();
+    let key = ((luid.LowPart, luid.HighPart), format);
     if let Some(&cached) = UAV_FORMAT_SUPPORT.lock().unwrap().as_ref().and_then(|m| m.get(&key)) {
         return cached;
     }
-    let supported = ID3D12Device::from_raw_borrowed(&device).map_or(true, |dev| {
-        let mut fs = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
-            Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(format as i32),
-            ..Default::default()
-        };
-        if dev
-            .CheckFeatureSupport(
-                D3D12_FEATURE_FORMAT_SUPPORT,
-                &mut fs as *mut _ as *mut c_void,
-                std::mem::size_of_val(&fs) as u32,
-            )
-            .is_ok()
-        {
-            uav_format_supported_by_caps(format, fs.Support1.0 as u32, fs.Support2.0 as u32)
-        } else {
-            true
-        }
-    });
+    let mut fs = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+        Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(format as i32),
+        ..Default::default()
+    };
+    let supported = if dev
+        .CheckFeatureSupport(
+            D3D12_FEATURE_FORMAT_SUPPORT,
+            &mut fs as *mut _ as *mut c_void,
+            std::mem::size_of_val(&fs) as u32,
+        )
+        .is_ok()
+    {
+        uav_format_supported_by_caps(format, fs.Support1.0 as u32, fs.Support2.0 as u32)
+    } else {
+        true
+    };
     UAV_FORMAT_SUPPORT.lock().unwrap().get_or_insert_with(HashMap::new).insert(key, supported);
     supported
 }
@@ -945,6 +962,29 @@ pub(super) unsafe fn pc_clear(clear: *const c_void, buf: &mut [u8; 24]) -> *cons
     buf.as_ptr() as *const c_void
 }
 
+/// The PC format of an optimized clear value (`clear_format`) for a resource whose PC format is
+/// `pc_format`: aligns promoted `B5G6R5` (`85 -> 28`) and `B8G8R8X8` (`88 -> 87`) UAV targets
+/// while preserving native `85`/`88` on render-target-only resources without UAV.
+pub(super) fn pc_clear_format(pc_format: u32, clear_format: u32) -> u32 {
+    match (pc_format, pc_target_format(clear_format)) {
+        (28, 85) => 28,
+        (87, 88) => 87,
+        (_, f) => f,
+    }
+}
+
+/// Like `pc_clear`, also aligning `clear.Format` with `pc_format` when `pc_resource_desc` promoted
+/// a UAV-capable `B5G6R5` (`85 -> 28`) or `B8G8R8X8` (`88 -> 87`) resource.
+pub(super) unsafe fn pc_clear_for_desc(clear: *const c_void, pc_format: u32, buf: &mut [u8; 24]) -> *const c_void {
+    if clear.is_null() || !crate::gpu::shader::readable(clear as usize, 24) {
+        return clear;
+    }
+    std::ptr::copy_nonoverlapping(clear as *const u8, buf.as_mut_ptr(), 24);
+    let f = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+    buf[0..4].copy_from_slice(&pc_clear_format(pc_format, f).to_le_bytes());
+    buf.as_ptr() as *const c_void
+}
+
 /// device #25 GetResourceAllocationInfo(visible mask, count, descs) → {size, alignment},
 /// returned through a hidden pointer. Called the C way – (return buffer, device, …), XDefiant –
 /// or the C++ way – (device, return buffer, …): whichever argument is the device is `this`.
@@ -1036,19 +1076,78 @@ pub(super) unsafe extern "system" fn get_custom_heap_properties_x(a: *mut c_void
     ret
 }
 
+const MAX_ALIAS_LOGS: u64 = 16;
+const MAX_ALIAS_TRACKED: usize = 16_384;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PlacedDescSummary {
+    dim: u32,
+    width: u64,
+    height: u32,
+    format: u32,
+    flags: u32,
+}
+
+impl PlacedDescSummary {
+    fn from_desc(x: &[u8; 0x38]) -> Self {
+        let u = |o: usize| u32::from_le_bytes(x[o..o + 4].try_into().unwrap());
+        Self {
+            dim: u(0),
+            width: u64::from_le_bytes(x[0x10..0x18].try_into().unwrap()),
+            height: u(0x18),
+            format: u(0x20),
+            flags: u(0x30),
+        }
+    }
+}
+
+impl std::fmt::Display for PlacedDescSummary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "dimension {} {}x{} format {} flags {:#x}", self.dim, self.width, self.height, self.format, self.flags)
+    }
+}
+
+fn record_alias_in(
+    seen: &mut Option<std::collections::HashMap<usize, PlacedDescSummary>>,
+    logged: &AtomicU64,
+    va: usize,
+    cur: PlacedDescSummary,
+    max_tracked: usize,
+) -> Option<PlacedDescSummary> {
+    if logged.load(Ordering::Relaxed) >= MAX_ALIAS_LOGS {
+        *seen = None;
+        return None;
+    }
+    let m = seen.get_or_insert_with(std::collections::HashMap::new);
+    if let Some(slot) = m.get_mut(&va) {
+        let prev = std::mem::replace(slot, cur);
+        let prev_count = logged.fetch_add(1, Ordering::Relaxed);
+        if prev_count + 1 >= MAX_ALIAS_LOGS {
+            *seen = None;
+        }
+        return (prev_count < MAX_ALIAS_LOGS).then_some(prev);
+    }
+    if m.len() < max_tracked {
+        m.insert(va, cur);
+    }
+    None
+}
+
 /// Resources the title placed at an address an earlier one was placed at: on the console they
 /// share that memory (aliasing – transient render targets reuse it). Logged (first 16).
 fn note_alias(va: usize, x: &[u8; 0x38]) {
-    static SEEN: std::sync::Mutex<Option<std::collections::HashMap<usize, String>>> = std::sync::Mutex::new(None);
+    static SEEN: std::sync::Mutex<Option<std::collections::HashMap<usize, PlacedDescSummary>>> = std::sync::Mutex::new(None);
     static N: AtomicU64 = AtomicU64::new(0);
-    let u = |o: usize| u32::from_le_bytes(x[o..o + 4].try_into().unwrap());
-    let what = format!("dimension {} {}x{} format {} flags {:#x}", u(0), u64::from_le_bytes(x[0x10..0x18].try_into().unwrap()), u(0x18), u(0x20), u(0x30));
-    let mut g = SEEN.lock().unwrap();
-    let m = g.get_or_insert_with(std::collections::HashMap::new);
-    if let Some(prev) = m.insert(va, what.clone()) {
-        if N.fetch_add(1, Ordering::Relaxed) < 16 {
-            crate::xlog_info!("D3D12.X: CreatePlacedResourceX at {va:#x} ({what}) – aliases an earlier resource there ({prev})");
-        }
+    if N.load(Ordering::Relaxed) >= MAX_ALIAS_LOGS {
+        return;
+    }
+    let cur = PlacedDescSummary::from_desc(x);
+    let prev = {
+        let mut g = SEEN.lock().unwrap();
+        record_alias_in(&mut g, &N, va, cur, MAX_ALIAS_TRACKED)
+    };
+    if let Some(prev) = prev {
+        crate::xlog_info!("D3D12.X: CreatePlacedResourceX at {va:#x} ({cur}) – aliases an earlier resource there ({prev})");
     }
 }
 
@@ -1072,7 +1171,8 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
     // PC's: the PC refused the resource (E_INVALIDARG) and the title threw
     let state = pc_initial_state(u32::from_le_bytes(x[0x30..0x34].try_into().unwrap()), state);
     let mut clear_buf = [0u8; 24];
-    let clear = pc_clear(clear, &mut clear_buf);
+    let pc_format = u32::from_le_bytes(d[0x20..0x24].try_into().unwrap());
+    let clear = pc_clear_for_desc(clear, pc_format, &mut clear_buf);
     if buffer {
         if let Some(hr) = real::place_at_title_address(this, va as usize, &d, state, clear, riid, ppv) {
             return hr;
@@ -1097,8 +1197,10 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
         if super::vram::gpu_owned(flags) {
             if let Some(hr) = super::vram::place(this, va as usize, &pc, state, clear, console_bytes, riid, ppv) {
                 if hr >= 0 && !(*ppv).is_null() {
-                    if let Some(bytes) = console_bytes {
-                        super::title_textures::retire_overlapping(va as usize, bytes as usize);
+                    if super::title_textures::register_gpu_owned(this, *ppv, va as usize, &x, D3D12_RESOURCE_STATES(state as i32)).is_err() {
+                        if let Some(bytes) = console_bytes {
+                            super::title_textures::retire_overlapping(va as usize, bytes as usize);
+                        }
                     }
                     real::note_title_address(*ppv as usize, va as usize);
                 }
@@ -1199,7 +1301,7 @@ pub(super) unsafe extern "system" fn get_copyable_footprints_x(
     *t = u64::MAX;
     f(this, x.as_ptr(), first, num, base, layouts, rows, row_sizes, t);
     if *t == u64::MAX {
-        let d = pc_resource_desc(&x);
+        let d = pc_resource_desc_for_device(this, &x);
         f(this, d.as_ptr(), first, num, base, layouts, rows, row_sizes, total);
     }
 }
@@ -1224,11 +1326,14 @@ pub(super) unsafe extern "system" fn create_command_signature_x(this: *mut c_voi
     let needs_root = list.iter().any(|a| (5..=8).contains(&a[0]));
     pc[8..16].copy_from_slice(&(if list.is_empty() { 0 } else { list.as_ptr() as u64 }).to_le_bytes());
     let hr = real::dev_create_command_signature(this, pc.as_ptr() as usize, if needs_root { root } else { 0 }, riid, ppv);
-    if hr >= 0 && !ppv.is_null() && needs_root {
-        super::bind::note_root_changing_signature(*ppv as usize);
-    }
     if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
-        super::bind::note_signature_dispatches(*ppv as usize, list.iter().any(|a| a[0] == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH.0 as u32));
+        let dispatches = list.iter().any(|a| a[0] == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH.0 as u32);
+        let stride = u32::from_le_bytes(pc[..4].try_into().unwrap());
+        let dispatch_only = list.len() == 1 && dispatches
+            && stride >= 12 && stride % 4 == 0;
+        super::bind::note_indirect_signature(*ppv as usize, super::bind::IndirectSignatureInfo::new(
+            dispatches, needs_root, dispatch_only.then_some(stride),
+        ));
     }
     hr
 }
@@ -1236,6 +1341,14 @@ pub(super) unsafe extern "system" fn create_command_signature_x(this: *mut c_voi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn new_command_lists_use_the_allocator_pools_active_backing() {
+        assert_eq!(active_list_allocator_with(0x1000, |alloc| {
+            assert_eq!(alloc, 0x1000);
+            0x2000
+        }), 0x2000);
+    }
 
     #[test]
     fn console_types_and_descs_become_pc_ones() {
@@ -1301,7 +1414,12 @@ mod tests {
                 let mut r: Option<ID3D12Resource> = None;
                 dev.CreatePlacedResource(&heap, 0, &d, D3D12_RESOURCE_STATES(state as i32), None, &mut r).map(|_| r)
             };
-            assert!(place(0x8 & real::PC_RESOURCE_STATES).is_err(), "UNORDERED_ACCESS without the UAV flag");
+            // Microsoft's runtime refuses this state for a resource without the UAV flag. vkd3d-proton
+            // (under Wine) does not check it and creates the resource, so the refusal is asserted on
+            // Windows only; the state XCL asks for is checked on both below.
+            if !crate::util::under_wine() {
+                assert!(place(0x8 & real::PC_RESOURCE_STATES).is_err(), "UNORDERED_ACCESS without the UAV flag");
+            }
             let state = pc_initial_state(6, 0x8);
             assert_eq!(state, D3D12_RESOURCE_STATE_DEPTH_WRITE.0 as u32);
             let r = place(state).unwrap_or_else(|e| panic!("placed in {state:#x}: {e}"));
@@ -1543,5 +1661,208 @@ mod tests {
         assert_eq!(pc_uav_linear_format(91), 87);
         assert_eq!(pc_uav_linear_format(93), 87);
         assert_eq!(pc_uav_linear_format(28), 28);
+    }
+
+    #[test]
+    fn pc_clear_for_desc_aligns_promoted_uav_targets_only() {
+        let desc_fmt = |fmt: u32, flags: u32| {
+            let mut x = [0u8; 0x38];
+            x[0] = 3;
+            x[0x20..0x24].copy_from_slice(&fmt.to_le_bytes());
+            x[0x24] = 1;
+            x[0x30..0x34].copy_from_slice(&flags.to_le_bytes());
+            u32::from_le_bytes(pc_resource_desc(&x)[0x20..0x24].try_into().unwrap())
+        };
+        // Promoted RT+UAV resources align clear.Format; RT-only preserves native 85/88.
+        assert_eq!((pc_clear_format(desc_fmt(85, 5), 85), pc_clear_format(desc_fmt(88, 5), 88)), (28, 87));
+        assert_eq!((pc_clear_format(desc_fmt(85, 1), 85), pc_clear_format(desc_fmt(88, 1), 88)), (85, 88));
+        assert_eq!((pc_clear_format(28, 86), pc_clear_format(28, 115), pc_clear_format(26, 67), pc_clear_format(44, 118)), (28, 28, 26, 45));
+        let (mut raw, mut buf) = ([0u8; 24], [0u8; 24]);
+        raw[0..4].copy_from_slice(&85u32.to_le_bytes());
+        raw[4..8].copy_from_slice(&0.5f32.to_le_bytes());
+        unsafe {
+            assert_eq!(pc_clear_for_desc(raw.as_ptr() as *const c_void, 28, &mut buf), buf.as_ptr() as *const c_void);
+            assert_eq!((u32::from_le_bytes(buf[0..4].try_into().unwrap()), &buf[4..24]), (28, &raw[4..24]));
+            assert!(pc_clear_for_desc(std::ptr::null(), 28, &mut buf).is_null());
+        }
+    }
+
+    #[test]
+    fn gpu_promoted_uav_clear_values_pass_create_committed_resource() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::*;
+        let dev = unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                let Ok(f) = CreateDXGIFactory1::<IDXGIFactory4>() else { return crate::gpu::recomp::runner::skip_test("no GPU or WARP"); };
+                let Ok(w) = f.EnumWarpAdapter::<IDXGIAdapter>() else { return crate::gpu::recomp::runner::skip_test("no GPU or WARP"); };
+                if D3D12CreateDevice(&w, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() { return crate::gpu::recomp::runner::skip_test("no GPU or WARP"); }
+            }
+            dev.unwrap()
+        };
+        let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+        for (orig_fmt, promoted_fmt) in [(85u32, 28u32), (88u32, 87u32)] {
+            let mut x = [0u8; 0x38];
+            x[0] = 3;
+            x[0x10..0x18].copy_from_slice(&64u64.to_le_bytes());
+            x[0x18..0x1C].copy_from_slice(&64u32.to_le_bytes());
+            x[0x1C] = 1;
+            x[0x1E] = 1;
+            x[0x20..0x24].copy_from_slice(&orig_fmt.to_le_bytes());
+            x[0x24] = 1;
+            x[0x30] = 5; // RT | UAV
+            unsafe {
+                let d_bytes = pc_resource_desc_for_device(dev.as_raw(), &x);
+                let pc_fmt = u32::from_le_bytes(d_bytes[0x20..0x24].try_into().unwrap());
+                assert_eq!(pc_fmt, promoted_fmt);
+                let d: D3D12_RESOURCE_DESC = std::ptr::read_unaligned(d_bytes.as_ptr() as *const _);
+                let clear = D3D12_CLEAR_VALUE {
+                    Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(orig_fmt as i32),
+                    Anonymous: D3D12_CLEAR_VALUE_0 { Color: [0.0, 0.0, 0.0, 1.0] },
+                };
+                let (mut old_buf, mut new_buf) = ([0u8; 24], [0u8; 24]);
+                let old_cv: D3D12_CLEAR_VALUE = std::ptr::read_unaligned(pc_clear(&clear as *const _ as *const c_void, &mut old_buf) as *const _);
+                let new_cv: D3D12_CLEAR_VALUE = std::ptr::read_unaligned(pc_clear_for_desc(&clear as *const _ as *const c_void, pc_fmt, &mut new_buf) as *const _);
+                let mut r: Option<ID3D12Resource> = None;
+                assert!(dev.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_COMMON, Some(&old_cv), &mut r).is_err());
+                assert_eq!(new_cv.Format.0 as u32, promoted_fmt);
+                dev.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_COMMON, Some(&new_cv), &mut r)
+                    .unwrap_or_else(|e| panic!("promoted {orig_fmt}->{promoted_fmt} CreateCommittedResource failed: {e}"));
+                assert!(r.is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn device_format_supports_uav_keys_cache_by_adapter_luid() {
+        use windows::Win32::Foundation::LUID;
+        #[repr(C)]
+        struct FakeDev { vt: *const usize, luid: LUID, support_uav: bool, checks: u32 }
+        unsafe extern "system" fn check_feature(this: *mut c_void, feature: D3D12_FEATURE, data: *mut c_void, size: u32) -> HRESULT {
+            let d = &mut *(this as *mut FakeDev);
+            d.checks += 1;
+            if feature == D3D12_FEATURE_FORMAT_SUPPORT && size as usize >= std::mem::size_of::<D3D12_FEATURE_DATA_FORMAT_SUPPORT>() {
+                let fs = &mut *(data as *mut D3D12_FEATURE_DATA_FORMAT_SUPPORT);
+                fs.Support1 = if d.support_uav { D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW } else { D3D12_FORMAT_SUPPORT1(0) };
+                fs.Support2 = if d.support_uav { D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD | D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE } else { D3D12_FORMAT_SUPPORT2(0) };
+            }
+            S_OK
+        }
+        unsafe extern "system" fn adapter_luid(this: *mut c_void, out: *mut LUID) { *out = (*(this as *const FakeDev)).luid; }
+        let mut vt = [0usize; 44];
+        (vt[13], vt[43]) = (check_feature as usize, adapter_luid as usize);
+        let luid_a = LUID { LowPart: 0xD120_0001, HighPart: 0x5A17_0001 };
+        let luid_b = LUID { LowPart: 0xD120_0002, HighPart: 0x5A17_0001 };
+        let mut dev = FakeDev { vt: vt.as_ptr(), luid: luid_a, support_uav: false, checks: 0 };
+        let ptr = &mut dev as *mut FakeDev as *mut c_void;
+        unsafe {
+            assert!(!device_format_supports_uav(ptr, 24) && dev.checks == 1);
+            // Reuse exact same pointer for a different adapter LUID (pointer ABA).
+            (dev.luid, dev.support_uav) = (luid_b, true);
+            assert!(device_format_supports_uav(ptr, 24) && dev.checks == 2);
+            assert!(device_format_supports_uav(ptr, 24) && dev.checks == 2);
+        }
+        if let Some(m) = UAV_FORMAT_SUPPORT.lock().unwrap().as_mut() {
+            m.remove(&((luid_a.LowPart, luid_a.HighPart), 24));
+            m.remove(&((luid_b.LowPart, luid_b.HighPart), 24));
+        }
+    }
+
+    #[test]
+    fn get_copyable_footprints_x_strips_device_unsupported_uav_on_retry() {
+        use windows::Win32::Foundation::LUID;
+        #[repr(C)]
+        struct FakeAdoptedDev { vt: *const usize, luid: LUID, calls: u32, last_flags: u32 }
+        unsafe extern "system" fn check_feature(_this: *mut c_void, feature: D3D12_FEATURE, data: *mut c_void, size: u32) -> HRESULT {
+            if feature == D3D12_FEATURE_FORMAT_SUPPORT && size as usize >= std::mem::size_of::<D3D12_FEATURE_DATA_FORMAT_SUPPORT>() {
+                let fs = &mut *(data as *mut D3D12_FEATURE_DATA_FORMAT_SUPPORT);
+                (fs.Support1, fs.Support2) = (D3D12_FORMAT_SUPPORT1(0), D3D12_FORMAT_SUPPORT2(0));
+            }
+            S_OK
+        }
+        unsafe extern "system" fn adapter_luid(this: *mut c_void, out: *mut LUID) { *out = (*(this as *const FakeAdoptedDev)).luid; }
+        unsafe extern "system" fn footprints(this: *mut c_void, desc: *const u8, _: u32, _: u32, _: u64, _: *mut c_void, _: *mut u32, _: *mut u64, total: *mut u64) {
+            let d = &mut *(this as *mut FakeAdoptedDev);
+            d.calls += 1;
+            d.last_flags = u32::from_le_bytes(*(desc.add(0x30) as *const [u8; 4]));
+            if !total.is_null() { *total = if d.last_flags & 4 != 0 { u64::MAX } else { 65536 }; }
+        }
+        let mut orig_vt = [0usize; 44];
+        (orig_vt[13], orig_vt[38], orig_vt[43]) = (check_feature as usize, footprints as usize, adapter_luid as usize);
+        let mut ext_buf = [0usize; 45];
+        ext_buf[0] = orig_vt.as_ptr() as usize;
+        ext_buf[1..].copy_from_slice(&orig_vt);
+        let luid = LUID { LowPart: 0xD120_0003, HighPart: 0x5A17_0001 };
+        let mut dev = FakeAdoptedDev { vt: unsafe { ext_buf.as_ptr().add(1) }, luid, calls: 0, last_flags: u32::MAX };
+        let mut x = [0u8; 0x38];
+        (x[0], x[0x10], x[0x18], x[0x1C], x[0x1E], x[0x20], x[0x24], x[0x30]) = (3, 64, 64, 1, 1, 24, 1, 4);
+        let mut total = 0u64;
+        unsafe {
+            get_copyable_footprints_x(&mut dev as *mut FakeAdoptedDev as *mut c_void, x.as_ptr(), 0, 1, 0, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), &mut total);
+        }
+        assert_eq!((dev.calls, dev.last_flags & 4, total), (2, 0, 65536));
+        if let Some(m) = UAV_FORMAT_SUPPORT.lock().unwrap().as_mut() {
+            m.remove(&((luid.LowPart, luid.HighPart), 24));
+        }
+    }
+
+    fn placed_desc(dim: u32, width: u64, height: u32, format: u32, flags: u32) -> [u8; 0x38] {
+        let mut x = [0u8; 0x38];
+        x[0..4].copy_from_slice(&dim.to_le_bytes());
+        x[0x10..0x18].copy_from_slice(&width.to_le_bytes());
+        x[0x18..0x1C].copy_from_slice(&height.to_le_bytes());
+        x[0x20..0x24].copy_from_slice(&format.to_le_bytes());
+        x[0x30..0x34].copy_from_slice(&flags.to_le_bytes());
+        x
+    }
+
+    #[test]
+    fn note_alias_logs_first_16_and_drops_table_after_cap() {
+        let first = PlacedDescSummary::from_desc(&placed_desc(3, 1920, 1080, 28, 0x5));
+        assert_eq!(first.to_string(), "dimension 3 1920x1080 format 28 flags 0x5");
+
+        let mut seen = None;
+        let logged = AtomicU64::new(0);
+        assert_eq!(record_alias_in(&mut seen, &logged, 0x1000, first, MAX_ALIAS_TRACKED), None);
+        let mut expected_prev = first;
+        for i in 1..=MAX_ALIAS_LOGS {
+            let next = PlacedDescSummary::from_desc(&placed_desc(3, 1920 + i, 1080, 28, i as u32));
+            assert_eq!(record_alias_in(&mut seen, &logged, 0x1000, next, MAX_ALIAS_TRACKED), Some(expected_prev), "alias #{i}");
+            expected_prev = next;
+            if i < MAX_ALIAS_LOGS {
+                assert!(seen.is_some(), "table stays active before cap (alias #{i})");
+            }
+        }
+        assert!(seen.is_none(), "16th alias must drop the tracking table");
+        let after = PlacedDescSummary::from_desc(&placed_desc(1, 4096, 1, 0, 0));
+        assert_eq!(record_alias_in(&mut seen, &logged, 0x1000, after, MAX_ALIAS_TRACKED), None);
+        assert_eq!(record_alias_in(&mut seen, &logged, 0x2000, after, MAX_ALIAS_TRACKED), None);
+        assert!(seen.is_none(), "calls after cap must not reallocate the tracking table");
+    }
+
+    #[test]
+    fn note_alias_bounds_tracked_entries_without_aliases() {
+        let mut seen = None;
+        let logged = AtomicU64::new(0);
+        let max_tracked = 8;
+        let d0 = PlacedDescSummary::from_desc(&placed_desc(3, 64, 64, 28, 1));
+        for i in 0..(max_tracked + 5) {
+            assert_eq!(record_alias_in(&mut seen, &logged, 0x10000 + i * 0x1000, d0, max_tracked), None);
+        }
+        assert_eq!(seen.as_ref().unwrap().len(), max_tracked, "tracked VA count must stay bounded");
+        let d1 = PlacedDescSummary::from_desc(&placed_desc(3, 128, 128, 28, 2));
+        assert_eq!(record_alias_in(&mut seen, &logged, 0x10000, d1, max_tracked), Some(d0), "aliasing a tracked entry still fires");
+        assert_eq!(logged.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn note_alias_short_circuits_when_cap_already_reached() {
+        let d0 = PlacedDescSummary::from_desc(&placed_desc(3, 32, 32, 28, 0));
+        let mut seen = Some(std::collections::HashMap::from([(0x5000usize, d0)]));
+        let logged = AtomicU64::new(MAX_ALIAS_LOGS);
+        let d1 = PlacedDescSummary::from_desc(&placed_desc(3, 64, 64, 28, 4));
+        assert_eq!(record_alias_in(&mut seen, &logged, 0x5000, d1, MAX_ALIAS_TRACKED), None);
+        assert!(seen.is_none(), "residual map must be freed once cap is reached");
+        assert_eq!(logged.load(Ordering::Relaxed), MAX_ALIAS_LOGS);
     }
 }

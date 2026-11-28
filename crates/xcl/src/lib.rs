@@ -8,6 +8,7 @@
 #[macro_use]
 pub mod log;
 pub mod manifest;
+pub(crate) mod cli;
 pub mod config;
 pub mod disasm;
 pub mod eh;
@@ -29,6 +30,7 @@ mod rpf_probe;
 pub mod shaders;
 #[cfg(test)]
 mod source_hash;
+pub mod stall;
 pub mod state;
 pub mod stubs;
 pub mod tls;
