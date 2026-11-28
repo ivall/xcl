@@ -14,3 +14,5 @@ Specific to Claude Code:
 - Fill in the **AI use** section of the PR description with Claude Code and your exact model name.
 - For a runtime change, run `scripts/smoke.ps1` on main and on the PR's head commit and paste both
   `xcl-smoke` blocks; do not write or edit them by hand.
+- Skills for this repo are only in `.agents/skills/`. Claude Code does not load that directory
+  itself. Read the skill that matches the subsystem before editing it. The index is `xcl`.

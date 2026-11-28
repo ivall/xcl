@@ -14,6 +14,7 @@ the `xcl` CLI), `tests/testtitle` + `tests/testgamedll` (our own console title f
 - What works and how to use it: `README.md`
 - Design: `docs/specs/2026-11-20-xcl-design.md`
 - Status, measurements and findings: `HANDOFF.md` (long; search it rather than reading it all)
+- Subsystem skills live only in `.agents/skills/<name>/SKILL.md`. Read the skill that matches the area before editing it. The index is `xcl`. Do not copy the skills into another directory.
 
 ## Build and test
 
