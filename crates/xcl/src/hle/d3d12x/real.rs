@@ -8434,10 +8434,18 @@ unsafe fn translated_mesh_stream_once(this: *mut c_void, desc: *const c_void, ri
         }
         rt_count = u32::from_le_bytes(p[32..36].try_into().unwrap());
     }
+    let dsv = stream_dsv_format(&subs);
     for (ty, payload) in &subs {
         let skip = [0, 2, 14, 19, 24, 25].contains(ty); // RS, PS, topology, cached PSO, AS, MS
         if !skip {
             let (_, palign) = super::null::subobject_payload(*ty).unwrap_or((0, 4));
+            // RASTERIZER*: the depth bias in the PC depth format's units
+            if matches!(*ty, 10 | 27 | 28) {
+                let mut p = payload.to_vec();
+                pc_stream_depth_bias(*ty, &mut p, dsv);
+                out.raw(*ty, &p, palign == 8);
+                continue;
+            }
             // BLEND: clear BlendEnable / LogicOpEnable on integer render targets (PC D3D12 rejects them)
             if *ty == 8 && payload.len() >= std::mem::size_of::<D3D12_BLEND_DESC>() {
                 let mut blend: D3D12_BLEND_DESC = std::ptr::read_unaligned(payload.as_ptr() as *const D3D12_BLEND_DESC);
@@ -8529,7 +8537,9 @@ unsafe fn translated_gs_pso(this: *mut c_void, d: &D3D12_GRAPHICS_PIPELINE_STATE
     sanitize_integer_rt_blend(&mut blend, rt.NumRenderTargets, &rt.RTFormats);
     out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, &blend);
     out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, &d.SampleMask);
-    out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, &d.RasterizerState);
+    let mut rast = d.RasterizerState;
+    rast.DepthBias = super::device_x::pc_depth_bias(d.DSVFormat.0 as u32, rast.DepthBias);
+    out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, &rast);
     out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, &d.DepthStencilState);
     out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, &rt);
     out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, &dsv);
@@ -8554,12 +8564,14 @@ unsafe fn fallback_stream(desc: *const u8) -> Option<(Vec<u8>, [usize; 2])> {
     }
     let mut buf = std::slice::from_raw_parts(base as *const u8, size).to_vec();
     let d = dummy();
-    let (mesh, rt_count, rt_formats) = {
+    let (mesh, rt_count, rt_formats, dsv) = {
         let mut mesh = false;
+        let mut dsv = 0u32;
         let mut rt_count = 0u32;
         let mut rt_formats = [windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(0); 8];
         if let Some(subs) = stream_subobjects(&buf) {
             mesh = subs.iter().any(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0 as u32);
+            dsv = stream_dsv_format(&subs);
             if let Some((_, p)) = subs.iter().find(|(ty, p)| *ty == 15 && p.len() >= 36) {
                 for k in 0..8 {
                     let f = super::device_x::pc_target_format(u32::from_le_bytes(p[4 * k..4 * k + 4].try_into().unwrap()));
@@ -8568,7 +8580,7 @@ unsafe fn fallback_stream(desc: *const u8) -> Option<(Vec<u8>, [usize; 2])> {
                 rt_count = u32::from_le_bytes(p[32..36].try_into().unwrap());
             }
         }
-        (mesh, rt_count, rt_formats)
+        (mesh, rt_count, rt_formats, dsv)
     };
     let dm = if mesh { Some(dummy_mesh()?) } else { None };
     let mut off = 0usize;
@@ -8609,6 +8621,7 @@ unsafe fn fallback_stream(desc: *const u8) -> Option<(Vec<u8>, [usize; 2])> {
                 let f = super::device_x::pc_view_format(u32::from_le_bytes(buf[at..at + 4].try_into().unwrap()));
                 buf[at..at + 4].copy_from_slice(&f.to_le_bytes());
             }
+            10 | 27 | 28 => pc_stream_depth_bias(ty, &mut buf[at..at + psize], dsv),
             12 | 19 => buf[at..at + 16].fill(0), // input layout, cached PSO
             7 => buf[at..at + 32].fill(0),        // stream output
             _ => {}
@@ -8746,12 +8759,41 @@ fn sanitize_integer_rt_blend(
     }
 }
 
+/// The console DSVFormat a pipeline stream declares (DEPTH_STENCIL_FORMAT, 16), wherever it
+/// sits in the stream; 0 without one.
+fn stream_dsv_format(subs: &[(u32, &[u8])]) -> u32 {
+    subs.iter().find(|(ty, p)| *ty == 16 && p.len() >= 4).map_or(0, |(_, p)| u32::from_le_bytes(p[0..4].try_into().unwrap()))
+}
+
+/// A pipeline stream's RASTERIZER (10: i32 DepthBias) or RASTERIZER1 / 2 (27 / 28: f32) payload
+/// with its DepthBias (at +12 in all three) in the units of the stream's depth format on the PC
+/// (`device_x::pc_depth_bias`); other subobjects and other formats are left as they are.
+fn pc_stream_depth_bias(ty: u32, p: &mut [u8], console_dsv: u32) {
+    if p.len() < 16 {
+        return;
+    }
+    let at = &mut p[12..16];
+    match ty {
+        10 => {
+            let b = super::device_x::pc_depth_bias(console_dsv, i32::from_le_bytes((&*at).try_into().unwrap()));
+            at.copy_from_slice(&b.to_le_bytes());
+        }
+        27 | 28 => {
+            let b = super::device_x::DepthBias::new(f32::from_le_bytes((&*at).try_into().unwrap()), 0.0, 0.0).for_dsv(console_dsv);
+            at.copy_from_slice(&b.depth_bias().to_le_bytes());
+        }
+        _ => {}
+    }
+}
+
 /// A topology type the PC has: the console's for rect lists (19, with draws of topology 17 –
 /// `list_x::RECT_LIST`) is TRIANGLE, as those draws become triangle lists (the rects' fourth
 /// corners come from `pso::rect_list_gs`, added by `translated_graphics_pso`); UNDEFINED (a stream
 /// without one) is TRIANGLE, or PATCH with a hull shader – the PC refuses both with a VS.
 fn pc_topology_type(g: &mut D3D12_GRAPHICS_PIPELINE_STATE_DESC) {
-    // (and the console's D16S8 depth format the PC's: `device_x::pc_view_format`)
+    // (and the console's D16S8 depth format the PC's: `device_x::pc_view_format`, its depth
+    // bias in the PC format's units: `device_x::pc_depth_bias`)
+    g.RasterizerState.DepthBias = super::device_x::pc_depth_bias(g.DSVFormat.0 as u32, g.RasterizerState.DepthBias);
     g.DSVFormat = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(super::device_x::pc_view_format(g.DSVFormat.0 as u32) as i32);
     for f in g.RTVFormats.iter_mut() {
         *f = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(super::device_x::pc_target_format(f.0 as u32) as i32);
@@ -8766,6 +8808,57 @@ fn pc_topology_type(g: &mut D3D12_GRAPHICS_PIPELINE_STATE_DESC) {
 mod pso_blend_and_tsharp_tests {
     use super::*;
     use windows::Win32::Graphics::Dxgi::Common::*;
+
+    #[test]
+    fn a_d16s8_stream_gets_its_depth_bias_in_d24_units_in_either_order() {
+        let mut r = [0u8; 44]; // RASTERIZER: DepthBias i32 at +12, clamp +16, slope +20
+        r[12..16].copy_from_slice(&(-8i32).to_le_bytes());
+        r[16..20].copy_from_slice(&0.01f32.to_le_bytes());
+        let mut r1 = r;
+        r1[12..16].copy_from_slice(&(-0.5f32).to_le_bytes());
+        let fmt = 118u32.to_le_bytes();
+        // the format after the rasterizer and before it
+        for subs in [vec![(10u32, &r[..]), (16, &fmt[..])], vec![(16, &fmt[..]), (10, &r[..])]] {
+            assert_eq!(stream_dsv_format(&subs), 118);
+        }
+        let mut p = r;
+        pc_stream_depth_bias(10, &mut p, 118);
+        assert_eq!(i32::from_le_bytes(p[12..16].try_into().unwrap()), -2048);
+        assert_eq!(&p[16..], &r[16..]);
+        let mut p = r1;
+        pc_stream_depth_bias(27, &mut p, 118);
+        assert_eq!(f32::from_le_bytes(p[12..16].try_into().unwrap()), -128.0);
+        let mut p = r1;
+        pc_stream_depth_bias(28, &mut p, 118);
+        assert_eq!(f32::from_le_bytes(p[12..16].try_into().unwrap()), -128.0);
+        // no depth-stencil format: untouched; other subobjects: untouched
+        assert_eq!(stream_dsv_format(&[(10, &r[..])]), 0);
+        for (ty, fmt) in [(10, 0), (27, 0), (10, 45), (8, 118)] {
+            let mut p = if ty == 27 { r1 } else { r };
+            pc_stream_depth_bias(ty, &mut p, fmt);
+            assert_eq!(p, if ty == 27 { r1 } else { r });
+        }
+    }
+
+    #[test]
+    fn a_d16s8_pipeline_gets_its_depth_bias_in_d24_units() {
+        let mut g: D3D12_GRAPHICS_PIPELINE_STATE_DESC = unsafe { std::mem::zeroed() };
+        g.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        g.DSVFormat = DXGI_FORMAT(118);
+        g.RasterizerState.DepthBias = -8;
+        g.RasterizerState.DepthBiasClamp = 0.01;
+        g.RasterizerState.SlopeScaledDepthBias = 2.0;
+        pc_topology_type(&mut g);
+        assert_eq!((g.DSVFormat, g.RasterizerState.DepthBias), (DXGI_FORMAT_D24_UNORM_S8_UINT, -2048));
+        assert_eq!((g.RasterizerState.DepthBiasClamp, g.RasterizerState.SlopeScaledDepthBias), (0.01, 2.0));
+        // translated twice (already the PC's format): no second scale
+        pc_topology_type(&mut g);
+        assert_eq!(g.RasterizerState.DepthBias, -2048);
+        g.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+        g.RasterizerState.DepthBias = -8;
+        pc_topology_type(&mut g);
+        assert_eq!(g.RasterizerState.DepthBias, -8);
+    }
 
     #[test]
     fn integer_rtv_blend_sanitization_clears_uint_sint_and_preserves_float() {
@@ -9029,6 +9122,7 @@ unsafe fn stream_pipeline(desc: *const c_void) -> StreamPipeline {
         BackFace: keep,
     };
     let mut has_depth_stencil = false;
+    let mut float_bias: Option<f32> = None;
     for (ty, p) in &subs {
         match ty {
             0 => put(&mut g.pRootSignature, p),
@@ -9040,7 +9134,10 @@ unsafe fn stream_pipeline(desc: *const c_void) -> StreamPipeline {
             7 => put(&mut g.StreamOutput, p),
             8 => put(&mut g.BlendState, p),
             9 => put(&mut g.SampleMask, p),
-            10 => put(&mut g.RasterizerState, p),
+            10 => {
+                put(&mut g.RasterizerState, p);
+                float_bias = None;
+            }
             // DEPTH_STENCIL; DEPTH_STENCIL1 is that and the depth bounds test
             11 | 21 => {
                 has_depth_stencil = true;
@@ -9078,6 +9175,7 @@ unsafe fn stream_pipeline(desc: *const c_void) -> StreamPipeline {
             27 => {
                 let mut d: D3D12_RASTERIZER_DESC1 = std::mem::zeroed();
                 put(&mut d, p);
+                float_bias = Some(d.DepthBias);
                 g.RasterizerState = D3D12_RASTERIZER_DESC {
                     FillMode: d.FillMode,
                     CullMode: d.CullMode,
@@ -9095,6 +9193,7 @@ unsafe fn stream_pipeline(desc: *const c_void) -> StreamPipeline {
             28 => {
                 let mut d: D3D12_RASTERIZER_DESC2 = std::mem::zeroed();
                 put(&mut d, p);
+                float_bias = Some(d.DepthBias);
                 g.RasterizerState = D3D12_RASTERIZER_DESC {
                     FillMode: d.FillMode,
                     CullMode: d.CullMode,
@@ -9119,7 +9218,13 @@ unsafe fn stream_pipeline(desc: *const c_void) -> StreamPipeline {
     // a rect list stays one for translated_graphics_pso, which gives it its GS (untranslated, it
     // becomes the PC's in graphics_pso)
     if g.PrimitiveTopologyType.0 != RECT_LIST_TYPE {
+        let console_dsv = g.DSVFormat.0 as u32;
         pc_topology_type(&mut g);
+        // a float bias is scaled before it becomes an integer, as in `pc_stream_depth_bias` and
+        // `DepthBias::for_dsv` (formats that keep their units keep the truncation)
+        if let Some(f) = float_bias.filter(|_| super::device_x::pc_depth_bias(console_dsv, 1) != 1) {
+            g.RasterizerState.DepthBias = super::device_x::DepthBias::new(f, 0.0, 0.0).for_dsv(console_dsv).depth_bias().round() as i32;
+        }
     }
     StreamPipeline::Graphics(Box::new(g), cacheable)
 }
@@ -9148,9 +9253,20 @@ unsafe fn rewrite_graphics_stream(
     }
     let default_topo = if subs.iter().any(|(ty, p)| *ty == 4 && payload_shader(p).is_some()) { D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH } else { D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE };
     let (mut saw_topology, mut saw_rasterizer) = (false, false);
+    let dsv = stream_dsv_format(subs);
     for &(ty, payload) in subs {
         if matches!(ty, 0 | 1 | 2 | 19) || (ty == 5 && rect_gs.is_some()) { continue; }
-        if matches!(ty, 10 | 27 | 28) { saw_rasterizer = true; }
+        // RASTERIZER*: the depth bias in the PC depth format's units
+        let scaled;
+        let payload = if matches!(ty, 10 | 27 | 28) {
+            saw_rasterizer = true;
+            let mut p = payload.to_vec();
+            pc_stream_depth_bias(ty, &mut p, dsv);
+            scaled = p;
+            &scaled[..]
+        } else {
+            payload
+        };
         let (_, palign) = super::null::subobject_payload(ty).unwrap_or((0, 4));
         match ty {
             8 if payload.len() >= std::mem::size_of::<D3D12_BLEND_DESC>() => patch_sub::<D3D12_BLEND_DESC>(&mut out, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, payload, |b| sanitize_integer_rt_blend(b, rt_count, &rt_formats)),
@@ -11297,6 +11413,22 @@ mod map_tests {
     }
 
     #[test]
+    fn a_rewritten_d16s8_stream_gets_its_depth_bias_in_d24_units() {
+        let bytes = |p: *const u8, n| unsafe { std::slice::from_raw_parts(p, n) };
+        let r1 = D3D12_RASTERIZER_DESC1 { DepthBias: -0.5, SlopeScaledDepthBias: 2.0, ..Default::default() };
+        let r1 = bytes(&r1 as *const _ as *const u8, std::mem::size_of_val(&r1)).to_vec();
+        for (dsv, want) in [(118u32, -128.0f32), (45, -0.5)] {
+            let dsv_bytes = dsv.to_le_bytes();
+            let subs: Vec<(u32, &[u8])> = vec![(16, &dsv_bytes), (27, &r1)];
+            let out = unsafe { rewrite_graphics_stream(&subs, 0x1234usize as *mut c_void, b"PC VS", None, None, false, false) };
+            let (parsed, _) = known_subobjects_checked(&out.0);
+            let r: D3D12_RASTERIZER_DESC1 = unsafe { read_sub(parsed.iter().find(|s| s.0 == 27).unwrap().1) };
+            assert_eq!(r.DepthBias, want, "DSV {dsv}");
+            assert_eq!(r.SlopeScaledDepthBias, 2.0);
+        }
+    }
+
+    #[test]
     fn extended_rasterizer_state_stays_in_native_stream() {
         let vs = crate::gpu::xbox::tests::sample(
             1,
@@ -11426,6 +11558,40 @@ mod map_tests {
                 _ => panic!("expected graphics stream pipeline"),
             }
         };
+
+        // RASTERIZER1 / RASTERIZER2: a fractional bias on a D16S8 buffer is scaled before it is an integer
+        let parse_bias = |ty: u32, dsv: u32, bias: f32| -> i32 {
+            let mut stream = Vec::new();
+            let mut vs_bc = [0u8; 16];
+            vs_bc[0..8].copy_from_slice(&(console_vs.as_ptr() as usize).to_le_bytes());
+            vs_bc[8..16].copy_from_slice(&console_vs.len().to_le_bytes());
+            push_sub(&mut stream, 1, &vs_bc, 8);
+            push_sub(&mut stream, 16, &dsv.to_le_bytes(), 4);
+            let r = D3D12_RASTERIZER_DESC1 { DepthBias: bias, SlopeScaledDepthBias: 2.0, ..Default::default() };
+            let bytes = unsafe { std::slice::from_raw_parts(&r as *const _ as *const u8, std::mem::size_of::<D3D12_RASTERIZER_DESC1>()) };
+            push_sub(&mut stream, ty, bytes, 4);
+            // an unknown suffix keeps the stream off the native path (`StreamPipeline::GraphicsStream`)
+            push_sub(&mut stream, 0xFFFF, &[0u8; 4], 4);
+            #[repr(C)]
+            struct StreamDesc {
+                size: usize,
+                ptr: usize,
+            }
+            let desc = StreamDesc { size: stream.len(), ptr: stream.as_ptr() as usize };
+            match unsafe { stream_pipeline(&desc as *const _ as *const c_void) } {
+                StreamPipeline::Graphics(g, _) => {
+                    assert_eq!(g.RasterizerState.SlopeScaledDepthBias, 2.0);
+                    g.RasterizerState.DepthBias
+                }
+                _ => panic!("expected graphics stream pipeline"),
+            }
+        };
+        for ty in [27u32, 28] {
+            for (bias, d16s8, d24s8) in [(-0.5f32, -128, 0), (0.4, 102, 0), (1.5, 384, 1)] {
+                assert_eq!(parse_bias(ty, 118, bias), d16s8, "type {ty}, bias {bias}, D16S8");
+                assert_eq!(parse_bias(ty, 45, bias), d24s8, "type {ty}, bias {bias}, D24S8");
+            }
+        }
 
         // Omitted DEPTH_STENCIL + omitted/UNKNOWN DSVFormat -> DepthEnable defaults to false.
         assert!(!parse(None, None).DepthStencilState.DepthEnable.as_bool());

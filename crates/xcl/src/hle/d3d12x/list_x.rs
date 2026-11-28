@@ -1636,18 +1636,30 @@ unsafe fn try_native_depth_bias(list: *mut c_void, bias: DepthBias) -> bool {
     if list.is_null() {
         return false;
     }
-    #[cfg(test)]
-    if let Some(res) = TEST_NATIVE_BIAS.with(|h| h.borrow_mut().as_mut().map(|f| f(list as usize, bias))) {
-        return res;
+    // in the units of the bound pipeline's depth buffer on the PC (`device_x::pc_depth_bias`)
+    let pso = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(list as usize))).map_or(0, |s| s.bound_pso);
+    let bias = bias.for_dsv(device_x::base_dsv_format(pso));
+    let sent = 'send: {
+        #[cfg(test)]
+        if let Some(res) = TEST_NATIVE_BIAS.with(|h| h.borrow_mut().as_mut().map(|f| f(list as usize, bias))) {
+            break 'send res;
+        }
+        let Some(cl) = ID3D12GraphicsCommandList::from_raw_borrowed(&list) else {
+            break 'send false;
+        };
+        let Ok(cl9) = cl.cast::<ID3D12GraphicsCommandList9>() else {
+            break 'send false;
+        };
+        cl9.RSSetDepthBias(bias.depth_bias(), bias.depth_bias_clamp(), bias.slope_scaled_depth_bias());
+        true
+    };
+    // the list's state is the bias it now has on the PC (scaled), which the next sync compares
+    if sent {
+        if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(list as usize))) {
+            s.native_bias = bias;
+        }
     }
-    let Some(cl) = ID3D12GraphicsCommandList::from_raw_borrowed(&list) else {
-        return false;
-    };
-    let Ok(cl9) = cl.cast::<ID3D12GraphicsCommandList9>() else {
-        return false;
-    };
-    cl9.RSSetDepthBias(bias.depth_bias(), bias.depth_bias_clamp(), bias.slope_scaled_depth_bias());
-    true
+    sent
 }
 
 /// Record a newly created command list's allocator, initial pipeline, and type.
@@ -1698,9 +1710,6 @@ pub(super) unsafe fn on_create_with_backing(list: *mut c_void, alloc: usize, bac
     if ty != D3D12_COMMAND_LIST_TYPE_BUNDLE && pso != 0 {
         if let Some((true, static_bias)) = device_x::base_depth_bias_info(pso) {
             if !static_bias.is_zero() && try_native_depth_bias(list, static_bias) {
-                if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&key)) {
-                    s.native_bias = static_bias;
-                }
             }
         }
     }
@@ -1788,7 +1797,7 @@ pub(super) unsafe fn on_set_pipeline_state(list: *mut c_void, pso: usize) {
             if let Some((true, static_bias)) = info {
                 let target = s.depth_bias.unwrap_or(static_bias);
                 s.pso_dirty = false;
-                if target != s.native_bias {
+                if target.for_dsv(device_x::base_dsv_format(effective)) != s.native_bias {
                     Some((target, s.depth_bias.is_some()))
                 } else {
                     None
@@ -1810,9 +1819,6 @@ pub(super) unsafe fn on_set_pipeline_state(list: *mut c_void, pso: usize) {
     };
     if let Some((target, has_override)) = sync_target {
         if try_native_depth_bias(list, target) {
-            if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&key)) {
-                s.native_bias = target;
-            }
         } else if has_override {
             if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&key)) {
                 s.pso_dirty = true;
@@ -1845,9 +1851,6 @@ pub(super) unsafe fn on_clear_state(list: *mut c_void, pso: usize) {
     if !is_bundle && pso != 0 {
         if let Some((true, static_bias)) = device_x::base_depth_bias_info(pso) {
             if !static_bias.is_zero() && try_native_depth_bias(list, static_bias) {
-                if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&key)) {
-                    s.native_bias = static_bias;
-                }
             }
         }
     }
@@ -4111,17 +4114,11 @@ pub(super) unsafe fn split_recording(list: *mut c_void, reason: SegmentReason) -
             if target.is_zero() {
                 applied_native = true;
             } else if try_native_depth_bias(next_pc, target) {
-                if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(next_pc as usize))) {
-                    s.native_bias = target;
-                }
                 applied_native = true;
             }
         } else if bound_pso == 0 {
             if let Some(b) = depth_bias {
                 if device_x::dynamic_depth_bias_supported(dev_raw as *mut c_void) && try_native_depth_bias(next_pc, b) {
-                    if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(next_pc as usize))) {
-                        s.native_bias = b;
-                    }
                     applied_native = true;
                 }
             }
@@ -4827,17 +4824,11 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
             if target_bias.is_zero() {
                 applied_native = true;
             } else if try_native_depth_bias(target, target_bias) {
-                if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(target as usize))) {
-                    s.native_bias = target_bias;
-                }
                 applied_native = true;
             }
         } else if bound_pso == 0 {
             if let Some(b) = depth_bias {
                 if device_x::dynamic_depth_bias_supported(dev_raw as *mut c_void) && try_native_depth_bias(target, b) {
-                    if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(target as usize))) {
-                        s.native_bias = b;
-                    }
                     applied_native = true;
                 }
             }
@@ -4907,7 +4898,7 @@ pub(super) unsafe extern "system" fn set_depth_bias_x(this: *mut c_void, depth_b
             s.pso_dirty = false;
             let restore = s.using_fallback_pso && s.bound_pso != 0;
             s.using_fallback_pso = false;
-            (if restore { Some(s.bound_pso) } else { None }, target != s.native_bias)
+            (if restore { Some(s.bound_pso) } else { None }, target.for_dsv(device_x::base_dsv_format(s.bound_pso)) != s.native_bias)
         };
         if let Some(base) = need_restore_base {
             let resolved = resolve_and_record_pipeline(this as usize, base);
@@ -4917,9 +4908,6 @@ pub(super) unsafe extern "system" fn set_depth_bias_x(this: *mut c_void, depth_b
             return;
         }
         if try_native_depth_bias(this, target) {
-            if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&key)) {
-                s.native_bias = target;
-            }
             return;
         }
         // ID3D12GraphicsCommandList9 unavailable: fall through to patched-PSO fallback.
@@ -5553,9 +5541,6 @@ pub(super) unsafe fn reset_pc(this: *mut c_void, alloc: usize, pso: usize) -> i3
     if !is_bundle && pso != 0 {
         if let Some((true, static_bias)) = device_x::base_depth_bias_info(pso) {
             if !static_bias.is_zero() && try_native_depth_bias(this, static_bias) {
-                if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(this as usize))) {
-                    s.native_bias = static_bias;
-                }
             }
         }
     }
@@ -7867,6 +7852,88 @@ mod tests {
         device_x::forget_base(pso_dyn_zero);
         device_x::forget_base(pso_dyn_static);
         device_x::forget_base(pso_static_only);
+    }
+
+    #[test]
+    fn native_depth_bias_follows_the_bound_pipelines_depth_format() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let calls: Rc<RefCell<Vec<f32>>> = Rc::new(RefCell::new(Vec::new()));
+        let calls_cb = calls.clone();
+        TEST_NATIVE_BIAS.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move |_, bias| {
+                calls_cb.borrow_mut().push(bias.depth_bias());
+                true
+            }));
+        });
+        let l = 0x9300_0001usize as *mut c_void;
+        let (d16s8, d24s8) = (0x9300_0010usize, 0x9300_0011usize);
+        device_x::register_test_base_dsv(d16s8, true, DepthBias::new(-3.0, 0.0, 1.0), 118);
+        device_x::register_test_base_dsv(d24s8, true, DepthBias::ZERO, 45);
+        unsafe {
+            // static bias of a D16S8 pipeline: in D24 units
+            on_create(l, 0x100, d16s8, D3D12_COMMAND_LIST_TYPE_DIRECT);
+            assert_eq!(calls.borrow().last(), Some(&-768.0));
+            // a fractional override: scaled exactly
+            set_depth_bias_x(l, -0.5, 0.0, 0.0);
+            assert_eq!(calls.borrow().last(), Some(&-128.0));
+            // the same override with a D24S8 pipeline bound: resent from the unscaled value
+            on_set_pipeline_state(l, d24s8);
+            assert_eq!(calls.borrow().last(), Some(&-0.5));
+            on_set_pipeline_state(l, d16s8);
+            assert_eq!(calls.borrow().last(), Some(&-128.0));
+            assert_eq!(calls.borrow().len(), 4);
+        }
+        TEST_NATIVE_BIAS.with(|h| *h.borrow_mut() = None);
+        on_release(l as usize);
+        device_x::forget_base(d16s8);
+        device_x::forget_base(d24s8);
+    }
+
+    #[test]
+    fn native_depth_bias_resends_after_a_pipeline_that_does_not_sync() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let calls: Rc<RefCell<Vec<f32>>> = Rc::new(RefCell::new(Vec::new()));
+        let calls_cb = calls.clone();
+        TEST_NATIVE_BIAS.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move |_, bias| {
+                calls_cb.borrow_mut().push(bias.depth_bias());
+                true
+            }));
+        });
+        let (d16, d24) = (0x9310_0010usize, 0x9310_0011usize);
+        let (fixed_d16, fixed_d24, compute) = (0x9310_0020usize, 0x9310_0021usize, 0x9310_0030usize);
+        device_x::register_test_base_dsv(d16, true, DepthBias::ZERO, 118);
+        device_x::register_test_base_dsv(d24, true, DepthBias::ZERO, 45);
+        device_x::register_test_base_dsv(fixed_d16, false, DepthBias::ZERO, 118);
+        device_x::register_test_base_dsv(fixed_d24, false, DepthBias::ZERO, 45);
+        // (from, between, to, the bias the `to` pipeline must draw with): a non-dynamic or a
+        // compute (untracked) pipeline in between changes the bound pipeline without a resend
+        let cases = [
+            (d16, fixed_d24, d24, -1.0f32),
+            (d16, compute, d24, -1.0),
+            (d24, fixed_d16, d16, -256.0),
+            (d24, compute, d16, -256.0),
+        ];
+        for (i, &(from, between, to, want)) in cases.iter().enumerate() {
+            let l = (0x9310_1000usize + i) as *mut c_void;
+            calls.borrow_mut().clear();
+            unsafe {
+                on_create(l, 0x100, from, D3D12_COMMAND_LIST_TYPE_DIRECT);
+                set_depth_bias_x(l, -1.0, 0.0, 0.0);
+                on_set_pipeline_state(l, between);
+                on_set_pipeline_state(l, to);
+            }
+            assert_eq!(calls.borrow().last(), Some(&want), "case {i}: {:?}", calls.borrow());
+            on_release(l as usize);
+        }
+        TEST_NATIVE_BIAS.with(|h| *h.borrow_mut() = None);
+        for p in [d16, d24, fixed_d16, fixed_d24] {
+            device_x::forget_base(p);
+        }
     }
 
     #[test]
