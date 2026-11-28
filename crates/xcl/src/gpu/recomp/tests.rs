@@ -9416,6 +9416,41 @@ fn gpu_sdwa_f16_inline_constants() {
 }
 
 #[test]
+fn gpu_i64_literal_is_sign_extended() {
+    for wave64 in gpu_waves() {
+        let p = prog(&[
+            // v_cmp_eq_i64 v[0:1] (-17i64), literal(-17i32 = 0xFFFF_FFEF) -> all 1s
+            ("V_CMP_EQ_I64", "ENC_VOP3", &[("VDST", 0), ("SRC0", V + 0), ("SRC1", 255)], Some((-17i32) as u32)),
+            // v_ashrrev_i64 2, literal(-16i32 = 0xFFFF_FFF0) -> -4i64 (0xFFFF_FFFF_FFFF_FFFC)
+            ("V_ASHRREV_I64", "ENC_VOP3", &[("VDST", 4), ("SRC0", 130), ("SRC1", 255)], Some((-16i32) as u32)),
+            // s_ashr_i64 literal(-16i32), 2 -> -4i64
+            ("S_ASHR_I64", "ENC_SOP2", &[("SDST", 4), ("SSRC0", 255), ("SSRC1", 130)], Some((-16i32) as u32)),
+            // v_mad_i64_i32 v[6:7], s[6:7], 0, 0, literal(-100i32) -> -100i64
+            ("V_MAD_I64_I32", "VOP3_SDST_ENC", &[("VDST", 6), ("SDST", 6), ("SRC0", 128), ("SRC1", 128), ("SRC2", 255)], Some((-100i32) as u32)),
+            // control: v_cmp_eq_u64 v[2:3] (0x0000_0000_FFFF_FFEF), literal(0xFFFF_FFEF) -> all 1s (zero-extended)
+            ("V_CMP_EQ_U64", "ENC_VOP3", &[("VDST", 2), ("SRC0", V + 2), ("SRC1", 255)], Some(0xFFFF_FFEF)),
+        ]);
+        let mut st = KernelState::default();
+        let neg17 = (-17i64) as u64;
+        for r in st.vgpr.iter_mut() {
+            (r[0], r[1]) = (neg17 as u32, (neg17 >> 32) as u32);
+            (r[2], r[3]) = (0xFFFF_FFEF, 0);
+        }
+        let (r, lanes) = run_wave(&p, &st, wave64);
+        let all = (u32::MAX, if wave64 { u32::MAX } else { 0 });
+        assert_eq!((r.sgpr[0], r.sgpr[1]), all, "wave{lanes} v_cmp_eq_i64 literal sign-extended");
+        assert_eq!((r.sgpr[2], r.sgpr[3]), all, "wave{lanes} v_cmp_eq_u64 literal zero-extended");
+        let neg4 = (-4i64) as u64;
+        assert_eq!((r.sgpr[4], r.sgpr[5]), (neg4 as u32, (neg4 >> 32) as u32), "wave{lanes} s_ashr_i64 literal sign-extended");
+        let neg100 = (-100i64) as u64;
+        for (l, v) in r.vgpr.iter().take(lanes).enumerate() {
+            assert_eq!((v[4], v[5]), (neg4 as u32, (neg4 >> 32) as u32), "wave{lanes} lane {l} v_ashrrev_i64 literal");
+            assert_eq!((v[6], v[7]), (neg100 as u32, (neg100 >> 32) as u32), "wave{lanes} lane {l} v_mad_i64_i32 SRC2 literal");
+        }
+    }
+}
+
+#[test]
 fn fspx_compute_user_sgprs_from_rsrc2() {
     use crate::gpu::xbox::tests::container;
 

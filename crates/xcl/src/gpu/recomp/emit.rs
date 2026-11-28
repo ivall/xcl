@@ -473,6 +473,14 @@ pub fn buf_format_info(idx: usize) -> u32 {
 }
 
 /// A destination register (pair).
+/// How a 32-bit literal (`code == 255`) is widened to a 64-bit operand in RDNA2 ISA.
+#[derive(Clone, Copy)]
+enum Lit64 {
+    U64,
+    I64,
+    F64,
+}
+
 #[derive(Clone)]
 enum Dst {
     V(u64),
@@ -852,8 +860,9 @@ impl Em {
 
     /// 64-bit value (lo, hi) of a scalar source code.
     /// In RDNA2 ISA, a 32-bit literal (`code == 255`) goes in the high 32 bits for f64
-    /// operands (`{0, lit}`) and in the low 32 bits for integer/bitmask operands (`{lit, 0}`).
-    fn code64(&mut self, code: u64, lit: Option<u32>, f64: bool) -> Option<(String, String)> {
+    /// operands (`{0, lit}`), is sign-extended for i64 operands (`{lit, sign_ext}`), and is
+    /// zero-extended for u64 / bitmask operands (`{lit, 0}`).
+    fn code64(&mut self, code: u64, lit: Option<u32>, kind: Lit64) -> Option<(String, String)> {
         Some(match code {
             0..=123 | 126 => (self.sreg(code), self.sreg(code + 1)),
             125 => ("0u".into(), "0u".into()),
@@ -867,7 +876,14 @@ impl Em {
             251 => (format!("(uint)({})", self.mask_zero(106)), "0u".into()),
             252 => (format!("(uint)({})", self.mask_zero(126)), "0u".into()),
             253 => ("scc".into(), "0u".into()),
-            255 => if f64 { ("0u".into(), hex(lit?)) } else { (hex(lit?), "0u".into()) },
+            255 => {
+                let v = lit?;
+                match kind {
+                    Lit64::F64 => ("0u".into(), hex(v)),
+                    Lit64::I64 => (hex(v), hex(if (v as i32) < 0 { 0xFFFF_FFFF } else { 0 })),
+                    Lit64::U64 => (hex(v), "0u".into()),
+                }
+            }
             256..=510 => (self.vreg(code - 256), self.vreg(code - 255)),
             _ => return None,
         })
@@ -904,14 +920,14 @@ impl Em {
         }
     }
 
-    fn read64(&mut self, d: &Decoded, o: &Operand, f64: bool) -> Option<(String, String)> {
+    fn read64(&mut self, d: &Decoded, o: &Operand, kind: Lit64) -> Option<(String, String)> {
         match o.field {
             Some(f) => {
                 let v = Self::field(d, f);
                 if o.ty.starts_with("OPR_VGPR") && d.enc.field_width(f) <= 8 {
                     return Some((self.vreg(v), self.vreg(v + 1)));
                 }
-                self.code64(v, d.literal, f64)
+                self.code64(v, d.literal, kind)
             }
             None => match o.ty {
                 "OPR_VCC" => Some((self.sreg(106), self.sreg(107))),
@@ -1550,7 +1566,7 @@ impl Em {
         }
         if d.enc.name == "ENC_SOPC" {
             if matches!(name, "s_bitcmp0_b64" | "s_bitcmp1_b64") {
-                let (a0, a1) = self.read64(d, ins[0], false).ok_or("op")?;
+                let (a0, a1) = self.read64(d, ins[0], Lit64::U64).ok_or("op")?;
                 let b = self.read(d, ins[1], false).ok_or("op")?;
                 let bit = format!("((select(({b} & 32u) == 0u, {a0}, {a1}) >> ({b} & 31u)) & 1u)");
                 if name == "s_bitcmp0_b64" {
@@ -1562,7 +1578,7 @@ impl Em {
             }
             let a64 = name.ends_with("_u64");
             if a64 {
-                let (a, b) = (self.read64(d, ins[0], false).ok_or("op")?, self.read64(d, ins[1], false).ok_or("op")?);
+                let (a, b) = (self.read64(d, ins[0], Lit64::U64).ok_or("op")?, self.read64(d, ins[1], Lit64::U64).ok_or("op")?);
                 let op = match name {
                     "s_cmp_eq_u64" => "==",
                     "s_cmp_lg_u64" => "!=",
@@ -1616,7 +1632,7 @@ impl Em {
                 let v = if name.contains("wrexec") { t0 } else { o0 };
                 self.write32(&dst, &v);
             } else {
-                let s0 = self.read64(d, ins[0], false).ok_or("op")?;
+                let s0 = self.read64(d, ins[0], Lit64::U64).ok_or("op")?;
                 let (el, eh) = (self.sreg(126), self.sreg(127));
                 let (nl, nh) = (op(&s0.0, &el).ok_or("saveexec")?, op(&s0.1, &eh).ok_or("saveexec")?);
                 let (t0, t1, o0, o1) = (self.t(), self.t(), self.t(), self.t());
@@ -1812,8 +1828,9 @@ impl Em {
     }
 
     fn salu64(&mut self, d: &Decoded, name: &str, dst: &Dst, ins: &[&Operand]) -> Result<(), &'static str> {
+        let lit64 = if name.ends_with("_i64") { Lit64::I64 } else { Lit64::U64 };
         let a = match ins.first() {
-            Some(o) => Some(self.read64(d, o, false).ok_or("op")?),
+            Some(o) => Some(self.read64(d, o, lit64).ok_or("op")?),
             None => None,
         };
         let b = match ins.get(1) {
@@ -1823,7 +1840,7 @@ impl Em {
                     let v = self.read(d, o, false).ok_or("op")?;
                     Some((v, "0u".into()))
                 } else {
-                    Some(self.read64(d, o, false).ok_or("op")?)
+                    Some(self.read64(d, o, lit64).ok_or("op")?)
                 }
             }
             None => None,
@@ -3147,7 +3164,7 @@ impl Em {
             }
             match o.ty {
                 "OPR_SREG" | "OPR_VCC" if o.size == 64 => {
-                    let (l, h) = self.read64(d, o, false).ok_or("op")?;
+                    let (l, h) = self.read64(d, o, Lit64::U64).ok_or("op")?;
                     u.push(format!("{l}|{h}"));
                 }
                 _ if o.size == 64 => return Err("operand 64-bit"),
@@ -3677,11 +3694,17 @@ impl Em {
         if d.variant != Variant::Plain {
             return Err("64-bit SDWA/DPP");
         }
-        let src_f64 = name.ends_with("_f64");
+        let lit64 = if name.ends_with("_f64") {
+            Lit64::F64
+        } else if name.ends_with("_i64") || name == "v_mad_i64_i32" {
+            Lit64::I64
+        } else {
+            Lit64::U64
+        };
         let mut lo_hi: Vec<(String, String)> = Vec::new();
         for o in &ins {
             if o.size == 64 {
-                lo_hi.push(self.read64(d, o, src_f64).ok_or("op")?);
+                lo_hi.push(self.read64(d, o, lit64).ok_or("op")?);
             } else {
                 let v = self.read(d, o, false).ok_or("op")?;
                 lo_hi.push((v, "0u".into()));
