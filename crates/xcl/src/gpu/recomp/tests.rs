@@ -8343,6 +8343,104 @@ fn f64_math_random(wave64: bool) {
     assert!(bad.is_empty());
 }
 
+/// v_cubeid / v_cubesc / v_cubetc / v_cubema against the ISA's pseudocode on random directions,
+/// bit for bit: the major axis is z when |z| >= |x| and |z| >= |y|, else y when |y| >= |x|, else x,
+/// so ties go to z, then y. Half of the lanes tie two or three magnitudes, some components
+/// are ±0 or ±inf. Also VOP3 NEG / ABS on a source, applied before the axis is picked. No NaNs,
+/// and no denormals (the shader's f32 denormal mode is not what this checks). One wave per
+/// dispatch in 50 dispatches, or n dispatches with XCL_FUZZ_ITERS=n, as wave64 and as wave32.
+#[test]
+fn gpu_cube_face_ops_random() {
+    for wave64 in gpu_waves() {
+        cube_face_ops_random(wave64);
+    }
+}
+
+/// (face id, sc, tc, ma) of the direction (x, y, z) as the ISA defines them
+fn cube_ref(x: f32, y: f32, z: f32) -> [f32; 4] {
+    if z.abs() >= x.abs() && z.abs() >= y.abs() {
+        [if z < 0.0 { 5.0 } else { 4.0 }, if z < 0.0 { -x } else { x }, -y, 2.0 * z]
+    } else if y.abs() >= x.abs() {
+        [if y < 0.0 { 3.0 } else { 2.0 }, x, if y < 0.0 { -z } else { z }, 2.0 * y]
+    } else {
+        [if x < 0.0 { 1.0 } else { 0.0 }, if x < 0.0 { z } else { -z }, -y, 2.0 * x]
+    }
+}
+
+fn cube_face_ops_random(wave64: bool) {
+    let iters: usize = std::env::var("XCL_FUZZ_ITERS").ok().and_then(|s| s.parse().ok()).unwrap_or(50);
+    // v0, v1, v2 = x, y, z; NEG 1 negates SRC0 (x), ABS 4 takes |SRC2| (z)
+    let p = prog(&[
+        ("V_CUBEID_F32", "ENC_VOP3", &[("VDST", 10), ("SRC0", V), ("SRC1", V + 1), ("SRC2", V + 2)], None),
+        ("V_CUBESC_F32", "ENC_VOP3", &[("VDST", 11), ("SRC0", V), ("SRC1", V + 1), ("SRC2", V + 2)], None),
+        ("V_CUBETC_F32", "ENC_VOP3", &[("VDST", 12), ("SRC0", V), ("SRC1", V + 1), ("SRC2", V + 2)], None),
+        ("V_CUBEMA_F32", "ENC_VOP3", &[("VDST", 13), ("SRC0", V), ("SRC1", V + 1), ("SRC2", V + 2)], None),
+        ("V_CUBEID_F32", "ENC_VOP3", &[("VDST", 14), ("SRC0", V), ("SRC1", V + 1), ("SRC2", V + 2), ("NEG", 1)], None),
+        ("V_CUBESC_F32", "ENC_VOP3", &[("VDST", 15), ("SRC0", V), ("SRC1", V + 1), ("SRC2", V + 2), ("NEG", 1)], None),
+        ("V_CUBEID_F32", "ENC_VOP3", &[("VDST", 16), ("SRC0", V), ("SRC1", V + 1), ("SRC2", V + 2), ("ABS", 4)], None),
+        ("V_CUBETC_F32", "ENC_VOP3", &[("VDST", 17), ("SRC0", V), ("SRC1", V + 1), ("SRC2", V + 2), ("ABS", 4)], None),
+    ]);
+    let (dxil, mem) = kernel_wave(&p, wave64);
+    let lanes = if wave64 { 64 } else { 32 };
+    let mut rng = Rng(0xC0BE_FACE_0123_4567);
+    // a normal f32 of either sign, |v| in [2^-20, 2^20), or a small value on 1/8 steps, ±0 or ±inf
+    let comp = |r: &mut Rng| -> f32 {
+        let sign = if r.below(2) == 0 { 0 } else { 1u32 << 31 };
+        match r.below(8) {
+            0 => f32::from_bits(sign),
+            1 => f32::from_bits(sign | 0x7F80_0000),
+            2 | 3 => (r.below(65) as f32 - 32.0) / 8.0,
+            _ => f32::from_bits(sign | ((127 - 20 + r.below(40) as u32) << 23) | (r.next() as u32 & 0x007F_FFFF)),
+        }
+    };
+    let (mut checked, mut ties) = (0usize, 0usize);
+    let mut faces = [0usize; 6];
+    let mut bad: Vec<String> = Vec::new();
+    for _ in 0..iters {
+        let mut st = KernelState::default();
+        let mut dirs = Vec::new();
+        for r in st.vgpr.iter_mut() {
+            let (x, mut y, mut z) = (comp(&mut rng), comp(&mut rng), comp(&mut rng));
+            // ties: copy one magnitude onto another, with a random sign
+            let flip = |v: f32, r: &mut Rng| if r.below(2) == 0 { v } else { -v };
+            match rng.below(8) {
+                0 => z = flip(x, &mut rng),
+                1 => y = flip(x, &mut rng),
+                2 => (y, z) = (flip(x, &mut rng), flip(x, &mut rng)),
+                3 => z = flip(y, &mut rng),
+                _ => {}
+            }
+            (r[0], r[1], r[2]) = (x.to_bits(), y.to_bits(), z.to_bits());
+            dirs.push((x, y, z));
+        }
+        let r = runner::run(&dxil, &st, &mem).unwrap();
+        for (l, v) in r.vgpr.iter().take(lanes).enumerate() {
+            let (x, y, z) = dirs[l];
+            checked += 1;
+            ties += (x.abs() == y.abs() || y.abs() == z.abs() || x.abs() == z.abs()) as usize;
+            let want = cube_ref(x, y, z);
+            faces[want[0] as usize] += 1;
+            let (nx, az) = (cube_ref(-x, y, z), cube_ref(x, y, z.abs()));
+            let checks = [
+                ("cubeid", v[10], want[0]), ("cubesc", v[11], want[1]), ("cubetc", v[12], want[2]), ("cubema", v[13], want[3]),
+                ("cubeid(-x)", v[14], nx[0]), ("cubesc(-x)", v[15], nx[1]), ("cubeid(|z|)", v[16], az[0]), ("cubetc(|z|)", v[17], az[2]),
+            ];
+            for (name, g, w) in checks {
+                if g != w.to_bits() {
+                    bad.push(format!("{name}({x:e}, {y:e}, {z:e} / {:#010x} {:#010x} {:#010x}) = {:e} ({g:#010x}), want {w:e} ({:#010x})",
+                        x.to_bits(), y.to_bits(), z.to_bits(), f32::from_bits(g), w.to_bits()));
+                }
+            }
+        }
+    }
+    println!("wave{lanes}: lanes {checked}, with a tie {ties}, faces +x/-x/+y/-y/+z/-z {faces:?}");
+    bad.sort(); bad.dedup();
+    println!("{} distinct failures", bad.len());
+    for b in bad.iter().take(40) { println!("  {b}"); }
+    assert!(faces.iter().all(|&n| n > 0), "every face picked: {faces:?}");
+    assert!(bad.is_empty());
+}
+
 fn f16_to_f64(h: u16) -> f64 {
     let s = if h & 0x8000 != 0 { -1.0 } else { 1.0 };
     let e = (h >> 10) & 0x1F;
