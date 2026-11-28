@@ -1324,6 +1324,7 @@ fn console_extensions(kind: Kind) -> Option<usize> {
 /// * device #76: `CreateCommittedResource` (heap properties, flags, desc, state, clear value,
 ///   riid, ppv) as on PC #27 (PC #76 = CreateCommittedResource3); the console resource desc
 ///   carries more after the 52 PC bytes (amd_fidelityfx_upscaler_xbox.dll writes 3 at +52).
+/// * allocator #9: the title registers its command-memory callback (`alloc_memory_callback_x`).
 /// * descriptor heap #9 / #10: the heap start handles come back in rax on the console.
 /// * resource #11 GetGPUVirtualAddress: console buffers live in unified memory; their console
 ///   address (= CPU address, low 32 bits = offset in `mem`) is what console code gets.
@@ -1396,6 +1397,7 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
         Kind::DescriptorHeap => vec![(9, heap_cpu_start_x as usize), (10, heap_gpu_start_x as usize)],
         Kind::Resource => vec![(11, res_gpu_va_x as usize)],
         Kind::Fence => vec![(12, super::fence_x::completed_value_address as usize)],
+        Kind::CommandAllocator => vec![(9, alloc_memory_callback_x as usize)],
         // the title's calls from #14 on: Signal / Wait / … / SignalX / PresentX at the slots of
         // its runtime's layout (`queue_dispatch`)
         Kind::CommandQueue => QUEUE_SLOTS.iter().enumerate().map(|(k, &f)| (QUEUE_FIRST + k, f as usize)).collect(),
@@ -1476,6 +1478,19 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
         }
         _ => vec![],
     }
+}
+
+/// allocator #9 (callback, context): the title gives the allocator a function that hands it
+/// command memory. The retail title calls it each time it takes an allocator from its pool,
+/// and ignores the result; its callback takes a size and an alignment (4th and 5th arguments)
+/// and the context (7th) and returns a block of the title's memory. A PC allocator takes its
+/// memory from the driver, so the callback is kept nowhere and never called.
+pub(super) unsafe extern "system" fn alloc_memory_callback_x(_this: *mut c_void, callback: usize, context: usize) -> HRESULT {
+    static LOGGED: AtomicBool = AtomicBool::new(false);
+    if !LOGGED.swap(true, Ordering::Relaxed) {
+        crate::xlog_info!("D3D12.X: allocator #9 – the title registers a command-memory callback ({callback:#x}, context {context:#x}); PC allocators take their memory from the driver, so it is not called");
+    }
+    S_OK
 }
 
 /// descriptor heap #9 / #10 GetCPU / GetGPUDescriptorHandleForHeapStart: console code
@@ -10975,6 +10990,28 @@ mod srv_tests {
             assert_eq!(resource_dim_to_view(&desc), dim, "{samples} samples, {slices} slices");
             assert_eq!(v.ViewDimension.0, dim);
         }
+    }
+}
+
+#[cfg(test)]
+mod alloc_memory_callback_tests {
+    use super::*;
+
+    static CALLED: AtomicBool = AtomicBool::new(false);
+
+    unsafe extern "system" fn callback() -> usize {
+        CALLED.store(true, Ordering::Relaxed);
+        0
+    }
+
+    /// Allocator #9 takes the title's callback and context, answers S_OK and calls nothing.
+    #[test]
+    fn allocator_9_accepts_the_callback_without_calling_it() {
+        assert_eq!(console_slots(Kind::CommandAllocator), vec![(9, alloc_memory_callback_x as usize)]);
+        for _ in 0..2 {
+            assert_eq!(unsafe { alloc_memory_callback_x(std::ptr::null_mut(), callback as usize, 0x1234) }, S_OK);
+        }
+        assert!(!CALLED.load(Ordering::Relaxed));
     }
 }
 

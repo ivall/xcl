@@ -150,7 +150,10 @@ fn vtable(kind: Kind) -> *const usize {
             v[17] = Queue_GetClockCalibration as usize;
             v[18] = Hidden_ZeroDesc16 as usize; // GetDesc
         }
-        Kind::CommandAllocator => v[8] = Ret_S_OK as usize, // Reset
+        Kind::CommandAllocator => {
+            v[8] = Ret_S_OK as usize; // Reset
+            v[9] = super::real::alloc_memory_callback_x as usize;
+        }
         Kind::CommandList => {
             v[8] = Ret_Zero as usize; // GetType → DIRECT
             v[9] = Ret_S_OK as usize; // Close
@@ -845,6 +848,12 @@ mod tests {
             capture_stream_desc(desc.as_ptr() as *const u8);
             VirtualFree(page as *mut _, 0, MEM_RELEASE);
         }
+    }
+
+    /// The null device's allocators take the title's command-memory callback (#9) as the real ones do.
+    #[test]
+    fn allocator_9_is_the_memory_callback_slot() {
+        assert_eq!(unsafe { *vtable(Kind::CommandAllocator).add(9) }, super::super::real::alloc_memory_callback_x as usize);
     }
 
     #[test]
