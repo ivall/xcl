@@ -1979,6 +1979,9 @@ struct State {
     runs: Option<Vec<(usize, usize)>>,
     /// reusable buffer for dirty runs in `before_execute` (avoids per-submit heap alloc)
     scratch_runs: Vec<(usize, usize)>,
+    /// cached CPU copy of one dirty upload chunk: hashed here, never read back from the
+    /// write-combined staging buffer
+    upload_scratch: Vec<u8>,
     /// Dirty CPU pages whose write-watch bits were reset before an upload failed.
     retry_pages: Vec<usize>,
 }
@@ -2572,6 +2575,7 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
             waited: FxHashMap::default(),
             runs: None,
             scratch_runs: Vec::new(),
+            upload_scratch: Vec::new(),
             retry_pages: Vec::new(),
         })
     })();
@@ -3356,11 +3360,12 @@ impl State {
                         idx
                     }
                 };
-                std::ptr::copy_nonoverlapping(cur as *const u8, p.add(copy.staging_offset), copy.bytes);
-                batch.as_mut().unwrap().append_hashes(
-                    cur,
-                    std::slice::from_raw_parts(p.add(copy.staging_offset), copy.bytes),
-                );
+                // One read of title memory into cached scratch: the hashed bytes are exactly the
+                // staged bytes, and the write-combined staging buffer is never read back.
+                self.upload_scratch.clear();
+                self.upload_scratch.extend_from_slice(std::slice::from_raw_parts(cur as *const u8, copy.bytes));
+                std::ptr::copy_nonoverlapping(self.upload_scratch.as_ptr(), p.add(copy.staging_offset), copy.bytes);
+                batch.as_mut().unwrap().append_hashes(cur, &self.upload_scratch);
                 let staging_res = &self.staging.as_ref().unwrap().0;
                 self.slots[slot_idx].list.CopyBufferRegion(
                     &self.windows[wi].1,
@@ -5951,6 +5956,7 @@ mod tests {
                 waited: FxHashMap::default(),
                 runs: None,
                 scratch_runs: Vec::new(),
+                upload_scratch: Vec::new(),
                 retry_pages: Vec::new(),
             };
 
@@ -6341,6 +6347,7 @@ mod tests {
                 waited: FxHashMap::default(),
                 runs: None,
                 scratch_runs: Vec::new(),
+                upload_scratch: Vec::new(),
                 retry_pages: Vec::new(),
             };
 
@@ -6446,6 +6453,7 @@ mod tests {
                 waited: FxHashMap::default(),
                 runs: None,
                 scratch_runs: Vec::new(),
+                upload_scratch: Vec::new(),
                 retry_pages: Vec::new(),
             };
 
@@ -6587,6 +6595,7 @@ mod tests {
             waited: FxHashMap::default(),
             runs: None,
             scratch_runs: Vec::new(),
+            upload_scratch: Vec::new(),
             retry_pages: Vec::new(),
         };
         (base, s)
