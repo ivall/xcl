@@ -903,22 +903,40 @@ pub(crate) fn used_pipelines_name() -> String {
     used_file_name("used-pipelines", "txt", profile_is_series_s())
 }
 
-pub(crate) fn used_shaders_name() -> String {
-    used_file_name("used-shaders", "txt", profile_is_series_s())
+/// The active profile's manifest `stem` beside the DXIL cache (`used_file_name`), seeded from
+/// the shared one (`seeded_used_path`).
+pub(crate) fn used_path(stem: &str, ext: &str) -> std::path::PathBuf {
+    seeded_used_path(&crate::gpu::recomp::dxc::cache_dir(), stem, ext, profile_is_series_s())
+}
+
+/// `dir`'s manifest `stem` for the profile. Before the profiles had files of their own, both
+/// kept the shared `{stem}.{ext}`, so a Series S cache from then has no `-lockhart` file: its
+/// shader preparation went from the shaders earlier runs used to every record of the title
+/// (2 616 against 26 503 on a retail title, about 1.5 h). A missing or empty Series S file
+/// starts as a copy of a shared one that has entries; from then on each profile keeps its own.
+fn seeded_used_path(dir: &std::path::Path, stem: &str, ext: &str, series_s: bool) -> std::path::PathBuf {
+    let path = dir.join(used_file_name(stem, ext, series_s));
+    if series_s && std::fs::metadata(&path).map_or(true, |m| m.len() == 0) {
+        let shared = dir.join(used_file_name(stem, ext, false));
+        if std::fs::metadata(&shared).is_ok_and(|m| m.len() > 0) && std::fs::copy(&shared, &path).is_ok() {
+            crate::xlog_info!("D3D12.X: {} starts as a copy of {}, which both profiles shared before", path.display(), shared.display());
+        }
+    }
+    path
 }
 
 /// The shaders of the pipelines earlier runs used, each by its own key (`used-shaders.txt`
 /// or `used-shaders-lockhart.txt` beside the DXIL cache): what a title's shader preparation
 /// translates. Empty before a run with this list has used a pipeline.
 pub fn earlier_used_shaders() -> std::collections::HashSet<u64> {
-    used::parse(&std::fs::read_to_string(crate::gpu::recomp::dxc::cache_dir().join(used_shaders_name())).unwrap_or_default())
+    used::parse(&std::fs::read_to_string(used_path("used-shaders", "txt")).unwrap_or_default())
 }
 
 /// The keys of the pipelines earlier runs used (`used-pipelines.txt` or
 /// `used-pipelines-lockhart.txt` beside the DXIL cache): what
 /// `xcl shaders --precompile --used-only` builds.
 pub fn earlier_used_keys() -> std::collections::HashSet<u64> {
-    used::parse(&std::fs::read_to_string(crate::gpu::recomp::dxc::cache_dir().join(used_pipelines_name())).unwrap_or_default())
+    used::parse(&std::fs::read_to_string(used_path("used-pipelines", "txt")).unwrap_or_default())
 }
 
 /// The pipelines a title used, by a hash of their shaders, kept between runs
@@ -956,7 +974,7 @@ mod used {
             if cfg!(test) {
                 return Used { earlier: RwLock::new(HashSet::new()), now: Mutex::new((HashSet::new(), None)), parts: Default::default(), shaders: Mutex::new((HashSet::new(), None)) };
             }
-            let path = crate::gpu::recomp::dxc::cache_dir().join(super::used_pipelines_name());
+            let path = super::used_path("used-pipelines", "txt");
             let earlier = parse(&std::fs::read_to_string(&path).unwrap_or_default());
             if !earlier.is_empty() {
                 crate::xlog_info!("D3D12.X: the pipelines of {} shader sets an earlier run used are built ahead of their first use", earlier.len());
@@ -965,7 +983,7 @@ mod used {
                 let _ = std::fs::create_dir_all(dir);
             }
             let file = std::fs::OpenOptions::new().create(true).append(true).open(&path).ok();
-            let shaders_path = path.with_file_name(super::used_shaders_name());
+            let shaders_path = super::used_path("used-shaders", "txt");
             let shaders = parse(&std::fs::read_to_string(&shaders_path).unwrap_or_default());
             let shaders_file = std::fs::OpenOptions::new().create(true).append(true).open(&shaders_path).ok();
             Used { now: Mutex::new((earlier.clone(), file)), earlier: RwLock::new(earlier), parts: Default::default(), shaders: Mutex::new((shaders, shaders_file)) }
@@ -2443,6 +2461,38 @@ mod used_tests {
             assert!(!profile_is_series_s_from(None, Some(raw)), "{raw}");
         }
         assert!(!profile_is_series_s_from(None, None));
+    }
+
+    /// A Series S cache from before the profiles had files of their own: its `-lockhart` file
+    /// starts as a copy of the shared one when it is missing or empty, never when it has entries
+    /// of its own; Series X reads the shared file, and nothing is copied when that is empty.
+    #[test]
+    fn a_series_s_manifest_starts_from_the_shared_one() {
+        let dir = std::env::temp_dir().join(format!("xcl-used-seed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (shared, own) = (dir.join("used-shaders.txt"), dir.join("used-shaders-lockhart.txt"));
+        let read = |p: &std::path::Path| std::fs::read_to_string(p).unwrap_or_default();
+
+        assert_eq!(seeded_used_path(&dir, "used-shaders", "txt", true), own);
+        assert!(!own.exists(), "no shared file: nothing to copy");
+        std::fs::write(&shared, "").unwrap();
+        seeded_used_path(&dir, "used-shaders", "txt", true);
+        assert!(!own.exists(), "an empty shared file is not copied");
+
+        std::fs::write(&shared, "1a\n2b\n").unwrap();
+        assert_eq!(seeded_used_path(&dir, "used-shaders", "txt", false), shared);
+        assert!(!own.exists(), "Series X keeps the shared file");
+        assert_eq!(seeded_used_path(&dir, "used-shaders", "txt", true), own);
+        assert_eq!(read(&own), "1a\n2b\n", "a missing Series S file starts as a copy");
+
+        std::fs::write(&own, "3c\n").unwrap();
+        seeded_used_path(&dir, "used-shaders", "txt", true);
+        assert_eq!(read(&own), "3c\n", "a Series S file with entries is kept");
+        std::fs::write(&own, "").unwrap();
+        seeded_used_path(&dir, "used-shaders", "txt", true);
+        assert_eq!(read(&own), "1a\n2b\n", "an empty one (made by a run that used no pipeline) is seeded");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

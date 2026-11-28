@@ -248,7 +248,7 @@ Fill the reusable DXIL cache ahead of a run with the read-only package wrapper. 
   XCL prepares supported shader stages and compute pipelines, including
   split pieces and their whole fallback. Graphics pipelines are created during play the first
   time; the ones a run used are recorded with their state (`used-graphics-pipelines.bin` beside
-  the shader cache, or `-lockhart` variants under Series S `lockhart`, at most `XCL_GFX_RECORDS_MB`, default 64) and built before the title starts
+  the shader cache, or `-lockhart` variants under Series S `lockhart`, which start once as a copy of the shared files, at most `XCL_GFX_RECORDS_MB`, default 64) and built before the title starts
   on the next launch, with their driver blobs kept, so the title makes them from those in
   milliseconds. `XCL_PREPARE_GRAPHICS=0` leaves that pass out. Later launches reuse matching cache entries.
   Closing the window cancels the launch. A compiler or driver failure stops it and reports
