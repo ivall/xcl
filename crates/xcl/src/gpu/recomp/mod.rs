@@ -260,6 +260,8 @@ pub struct CsInterface {
     pub tg_size: bool,
     /// thread id VGPRs: 1 (v0), 2 (v0, v1) or 3 (v0..v2)
     pub tid_components: u32,
+    /// the group's LDS allocation in bytes (COMPUTE_PGM_RSRC2.LDS_SIZE); 0: not known
+    pub lds_bytes: u32,
 }
 
 impl CsInterface {
@@ -281,6 +283,8 @@ impl CsInterface {
             tgid: [(r >> 7) & 1 == 1, (r >> 8) & 1 == 1, (r >> 9) & 1 == 1],
             tg_size: (r >> 10) & 1 == 1,
             tid_components: ((r >> 11) & 3) + 1,
+            // LDS_SIZE, bits 15..23, in 128-dword (512-byte) units on RDNA
+            lds_bytes: ((r >> 15) & 0x1FF) * 512,
         }
     }
 }

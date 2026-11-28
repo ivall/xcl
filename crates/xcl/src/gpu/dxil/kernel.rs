@@ -590,6 +590,7 @@ impl Lw {
             xn: z,
             xslot: 1,
             lds: None,
+            lds_words: 8192,
             lds_top: 8191,
             dpp_enable: None,
             partner: Partner::Present,
@@ -650,7 +651,12 @@ impl Lw {
         if split && std::env::var_os("XCL_X64_ALL_MASKS").is_none() {
             lw.whole_live = crate::gpu::recomp::x64_masks::by_pc(insts, kernel);
         }
-        lw.setup_storage(uses_lds, if split { slot } else { 1 });
+        // a compute program's LDS allocation (COMPUTE_PGM_RSRC2.LDS_SIZE) sizes the block
+        let lds_bytes = match entry {
+            Entry::Compute(cs) => cs.lds_bytes,
+            _ => 0,
+        };
+        lw.setup_storage(uses_lds, if split { slot } else { 1 }, lds_bytes);
         if let (Some(t), true) = (group_threads, split) {
             lw.partner = match t {
                 0..=32 => Partner::Missing,

@@ -4670,11 +4670,11 @@ impl Em {
             let m0 = self.sreg(124);
             let at = format!("(({m0} & 0xFFFFu) + {off16}u + 4u * lane_id)");
             let slot = if self.x64() {
-                format!("xcl_lds[min((({at}) >> 2) & 8191u, XCL_X_LDS_TOP)]")
+                format!("xcl_lds[min((({at}) >> 2) & XCL_LDS_MASK, XCL_X_LDS_TOP)]")
             } else if self.safe_barrier {
-                format!("xcl_lds[min((({at}) >> 2) & 8191u, XCL_LDS_TOP)]")
+                format!("xcl_lds[min((({at}) >> 2) & XCL_LDS_MASK, XCL_LDS_TOP)]")
             } else {
-                format!("xcl_lds[(({at}) >> 2) & 8191u]")
+                format!("xcl_lds[(({at}) >> 2) & XCL_LDS_MASK]")
             };
             if name == "ds_write_addtid_b32" {
                 let src = self.vreg(f("DATA0"));
@@ -4698,11 +4698,11 @@ impl Em {
         let safe_bar = self.safe_barrier;
         let lds = |at: String| {
             if x64 {
-                format!("xcl_lds[min((({at}) >> 2) & 8191u, XCL_X_LDS_TOP)]")
+                format!("xcl_lds[min((({at}) >> 2) & XCL_LDS_MASK, XCL_X_LDS_TOP)]")
             } else if safe_bar {
-                format!("xcl_lds[min((({at}) >> 2) & 8191u, XCL_LDS_TOP)]")
+                format!("xcl_lds[min((({at}) >> 2) & XCL_LDS_MASK, XCL_LDS_TOP)]")
             } else {
-                format!("xcl_lds[(({at}) >> 2) & 8191u]")
+                format!("xcl_lds[(({at}) >> 2) & XCL_LDS_MASK]")
             }
         };
         let mut st = Vec::new();
@@ -4897,24 +4897,61 @@ impl Em {
         self.x64() && (self.uses_lds || matches!(self.opt.mode, Mode::Geometry(_)))
     }
 
+    /// Split wave64: the words of the exchange in the top of `xcl_lds` – slots (console wave,
+    /// half, parity), the arrival counters (console wave, half), the wave counter of
+    /// `xcl_x_thread`.
+    fn x64_slots_counters(&self) -> (usize, usize) {
+        let waves = self.x64_threads().div_ceil(64).max(1) as usize;
+        (waves * 4 * self.x64_words, waves * 2)
+    }
+
+    /// Dwords of `xcl_lds`. The console sets a compute program's LDS allocation in
+    /// COMPUTE_PGM_RSRC2 (`CsInterface::lds_bytes`); a block of the D3D12 limit (32 KB) for a
+    /// program that needs 512 bytes caps the groups an SM / WGP holds at once (3 per NVIDIA
+    /// Ampere SM: 6 warps of a 64-thread group, with nothing to hide the split-wave64 meets
+    /// behind). Known: the next power of two that holds it and the runtime words kept at the
+    /// top (the exchange, the safe barrier's two, `XCL_WT`), so `& XCL_LDS_MASK` wraps an
+    /// address as the 32 KB block did. Otherwise, and for the other stages: 32 KB.
+    fn lds_words(&self) -> u32 {
+        let Mode::Compute(cs) = &self.opt.mode else { return 8192 };
+        if cs.lds_bytes == 0 {
+            return 8192;
+        }
+        let top = if self.x64() {
+            let (slots, counters) = self.x64_slots_counters();
+            (slots + counters + 1) as u32 + 2
+        } else {
+            4
+        };
+        (cs.lds_bytes.div_ceil(4) + top).next_power_of_two().min(8192)
+    }
+
+    /// The `xcl_lds` declaration (`lds_words`) and the address mask of its accesses.
+    fn lds_decl(&self, h: &mut String, note: &str) {
+        let words = self.lds_words();
+        let size = match &self.opt.mode {
+            Mode::Compute(cs) if words < 8192 => format!("{} bytes: the program's LDS_SIZE ({} bytes) and the runtime words", words * 4, cs.lds_bytes),
+            _ => "D3D12 limit: 32 KB (the console allows 64 KB)".to_string(),
+        };
+        let _ = writeln!(h, "groupshared uint xcl_lds[{words}]; // {size}{note}\n#define XCL_LDS_MASK {}u", words - 1);
+    }
+
     /// Storage and functions of the split wave64 form (`PRELUDE_X64`).
     fn x64_prelude(&self, h: &mut String) {
         let threads = self.x64_hw_threads();
         let waves = threads.div_ceil(64).max(1) as usize;
         let slot = self.x64_words;
-        // slots (console wave, half, parity), the arrival counters (console wave, half), the
-        // wave counter of `xcl_x_thread`
-        let (slots, counters) = (waves * 4 * slot, waves * 2);
+        let (slots, counters) = self.x64_slots_counters();
         let _ = writeln!(h, "#define XCL_X_THREADS {threads}u\n#define XCL_X_WAVES {waves}u\n#define XCL_X_SLOT {slot}u\n#define XCL_X_SPIN {}", self.x64_spin() as u32);
         if self.x64_lds() {
-            // the D3D12 limit (32 KB) is the whole block already: the exchange (and optional
-            // safe-barrier words at 8189..8190) takes its top, the program's LDS accesses stop
-            // below it (`XCL_X_LDS_TOP`)
+            // the exchange (and optional safe-barrier words below the last) takes the top of
+            // the block, the program's LDS accesses stop below it (`XCL_X_LDS_TOP`)
+            let words = self.lds_words() as usize;
             let bar_words = if self.safe_barrier { 2 } else { 0 };
-            let base = 8192 - slots - counters - 1 - bar_words;
-            h.push_str("groupshared uint xcl_lds[8192]; // D3D12 limit: 32 KB (the console allows 64 KB); the top holds the wave64 exchange\n");
+            let base = words - slots - counters - 1 - bar_words;
+            self.lds_decl(h, "; the top holds the wave64 exchange");
             let _ = writeln!(h, "#define XCL_X_LDS_TOP {}u", base - 1);
-            let _ = writeln!(h, "#define XCL_XS(i) xcl_lds[{base}u + (i)]\n#define XCL_XC(i) xcl_lds[{}u + (i)]\n#define XCL_XW xcl_lds[8191u]", base + slots);
+            let _ = writeln!(h, "#define XCL_XS(i) xcl_lds[{base}u + (i)]\n#define XCL_XC(i) xcl_lds[{}u + (i)]\n#define XCL_XW xcl_lds[{}u]", base + slots, words - 1);
         } else {
             let _ = writeln!(h, "groupshared uint xcl_xs[{slots}];\ngroupshared uint xcl_xc[{counters}];\ngroupshared uint xcl_xw;");
             h.push_str("#define XCL_XS(i) xcl_xs[(i)]\n#define XCL_XC(i) xcl_xc[(i)]\n#define XCL_XW xcl_xw\n");
@@ -4927,10 +4964,11 @@ impl Em {
         if !self.safe_barrier {
             return;
         }
+        let w = self.lds_words();
         if self.x64_lds() {
-            h.push_str("#define XCL_BAR_ALIVE xcl_lds[8189u]\n#define XCL_BAR_STATE xcl_lds[8190u]\n");
+            let _ = writeln!(h, "#define XCL_BAR_ALIVE xcl_lds[{}u]\n#define XCL_BAR_STATE xcl_lds[{}u]", w - 3, w - 2);
         } else if !self.x64() && self.uses_lds {
-            h.push_str("#define XCL_LDS_TOP 8188u\n#define XCL_BAR_ALIVE xcl_lds[8189u]\n#define XCL_BAR_STATE xcl_lds[8190u]\n");
+            let _ = writeln!(h, "#define XCL_LDS_TOP {}u\n#define XCL_BAR_ALIVE xcl_lds[{}u]\n#define XCL_BAR_STATE xcl_lds[{}u]", w - 4, w - 3, w - 2);
         } else {
             h.push_str("groupshared uint xcl_bar_alive_g;\ngroupshared uint xcl_bar_state_g;\n#define XCL_BAR_ALIVE xcl_bar_alive_g\n#define XCL_BAR_STATE xcl_bar_state_g\n");
         }
@@ -5025,7 +5063,7 @@ impl Em {
                 let split = self.opt.hw_wave == 64 && !self.opt.wave64;
                 let lanes = if self.opt.wave64 || split { 64 } else { 32 };
                 if self.uses_lds && !self.x64_lds() {
-                    h.push_str("groupshared uint xcl_lds[8192]; // D3D12 limit: 32 KB (the console allows 64 KB)\n");
+                    self.lds_decl(&mut h, "");
                 }
                 // split wave64: 64 threads (the console wave) in two hardware wave32s
                 let hw_lanes = if self.x64() { 32 } else { lanes };
@@ -5109,7 +5147,7 @@ impl Em {
             Mode::Compute(cs) => {
                 let lanes = if self.opt.wave64 { 64 } else { 32 };
                 if self.uses_lds && !self.x64_lds() {
-                    h.push_str("groupshared uint xcl_lds[8192]; // D3D12 limit: 32 KB (the console allows 64 KB)\n");
+                    self.lds_decl(&mut h, "");
                 }
                 let [x, y, z] = cs.threads;
                 let remap = self.remap();
@@ -5122,11 +5160,11 @@ impl Em {
                 // takes the next `lanes` console threads as it arrives, lane l the l-th of them
                 let reorder = !self.x64() && y * z > 1;
                 if reorder {
-                    // console threads handed to waves so far: the program's top LDS word while
-                    // the waves take their threads (the console's LDS starts undefined; D3D12's
-                    // 32 KB has no room for another word next to a full `xcl_lds`)
+                    // console threads handed to waves so far: the block's top LDS word while
+                    // the waves take their threads (the console's LDS starts undefined; a block
+                    // of D3D12's 32 KB has no room for another word next to a full `xcl_lds`)
                     if self.uses_lds && !self.x64_lds() {
-                        h.push_str("#define XCL_WT xcl_lds[8191u]\n");
+                        let _ = writeln!(h, "#define XCL_WT xcl_lds[{}u]", self.lds_words() - 1);
                     } else {
                         h.push_str("groupshared uint xcl_wt;\n#define XCL_WT xcl_wt\n");
                     }
@@ -5217,7 +5255,7 @@ impl Em {
                 let native_lanes = if !self.opt.wave64 || self.x64() { 32 } else { 64 };
                 let lanes = if self.opt.wave64 { 64 } else { 32 };
                 if self.uses_lds && !self.x64_lds() {
-                    h.push_str("groupshared uint xcl_lds[8192]; // D3D12 limit: 32 KB (the console allows 64 KB)\n");
+                    self.lds_decl(&mut h, "");
                 }
                 self.safe_barrier_prelude(&mut h);
                 let t = ms.threads;
@@ -5264,7 +5302,7 @@ impl Em {
                     let maxt = g.max_vertex_count.saturating_sub(2).max(1);
                     let nreg = g.input_registers();
                     let fetched = super::fetched_registers(&g.es_inputs);
-                    h.push_str("groupshared uint xcl_lds[8192]; // D3D12 limit: 32 KB (the console allows 64 KB)\n");
+                    self.lds_decl(&mut h, "");
                     h.push_str("[WaveSize(64)]\n[numthreads(64, 1, 1)]\nvoid main(uint gi : SV_GroupIndex, uint3 gid : SV_GroupID)\n{\n");
                     h.push_str("    lane_id = WaveGetLaneIndex();\n");
                     let _ = writeln!(h, "    uint xcl_total = io.Load({}u);\n    uint xcl_vin = io.Load({}u);", super::IO_GS_PRIMS * 4, super::IO_GS_VERTICES * 4);
