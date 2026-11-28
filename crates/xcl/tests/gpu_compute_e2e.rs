@@ -286,24 +286,25 @@ fn offline_split_compute_pipeline_is_reused_by_a_second_process() {
     let cold = run();
     let mut files: Vec<_> = fs::read_dir(cache.join("driver")).unwrap().flatten().map(|e| e.path()).collect();
     files.sort();
-    let pieces = files.len();
-    assert!(pieces >= 2, "expected >= 2 split piece blobs in driver cache, got {files:?}\n{cold}");
+    let blobs = files.len();
+    assert!(blobs >= 3, "expected >= 2 split piece blobs and a whole fallback, got {files:?}\n{cold}");
+    let pieces = blobs - 1;
     assert!(
         files.iter().all(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.ends_with(".chain.pso"))),
         "split compute precompile must write only .chain.pso files, got {files:?}"
     );
     assert!(files.iter().all(|p| p.metadata().unwrap().len() > 0));
-    assert!(cold.contains(&format!("pipelines made on the GPU {pieces}, refused 0")), "{cold}");
+    assert!(cold.contains(&format!("pipelines made on the GPU {blobs}, refused 0")), "{cold}");
     assert!(cold.contains(&format!("split compute programs: 1 ({pieces} pieces)")), "{cold}");
 
     let warm = run();
-    assert!(warm.contains(&format!("pipelines loaded from the driver cache {pieces}")), "{warm}");
+    assert!(warm.contains(&format!("pipelines loaded from the driver cache {blobs}")), "{warm}");
 
     // A corrupt .chain.pso is rejected and rebuilt cleanly while sibling pieces stay reused.
     fs::write(&files[0], b"invalid cached chain pipeline").unwrap();
     let recovered = run();
-    assert!(recovered.contains(&format!("pipelines made on the GPU {pieces}, refused 0")), "{recovered}");
-    assert!(recovered.contains(&format!("pipelines loaded from the driver cache {}", pieces - 1)), "{recovered}");
+    assert!(recovered.contains(&format!("pipelines made on the GPU {blobs}, refused 0")), "{recovered}");
+    assert!(recovered.contains(&format!("pipelines loaded from the driver cache {}", blobs - 1)), "{recovered}");
     assert!(files[0].metadata().unwrap().len() > b"invalid cached chain pipeline".len() as u64);
     let _ = fs::remove_dir_all(&dir);
 }

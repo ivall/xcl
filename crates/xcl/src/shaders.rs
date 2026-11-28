@@ -1353,8 +1353,8 @@ mod pipeline_cap_tests {
             &[],
         )
         .expect("piece1 DXC compile");
-        // Larger than both pieces so a cap between piece size and whole size proves each piece
-        // is capped individually rather than against the unsplit whole container.
+        // A distinct whole form exercises its own cache entry and cold-build cap. Its DXIL
+        // size relative to either piece depends on the compiler version.
         let whole = recomp::dxc::compile(
             "RWByteAddressBuffer mem : register(u2); \
              [numthreads(1,1,1)] void main() { \
@@ -1376,30 +1376,32 @@ mod pipeline_cap_tests {
             samplers: vec![],
         };
 
-        pipelines.max_dxil = max_piece;
+        pipelines.max_dxil = max_piece.max(whole.len());
         pipelines.make(&compiled);
         let p0_path = scratch.0.join(driver_cache::name_for(&piece0, 0, true));
         let p1_path = scratch.0.join(driver_cache::name_for(&piece1, 0, true));
         let whole_path = scratch.0.join(driver_cache::name_for(&whole, 0, false));
+        let whole_chain_path = scratch.0.join(driver_cache::name_for(&whole, 0, true));
         assert_eq!(pipelines.split_programs.load(Ordering::Relaxed), 1);
         assert_eq!(pipelines.split_pieces.load(Ordering::Relaxed), 2);
-        assert_eq!(pipelines.made.load(Ordering::Relaxed), 2);
+        assert_eq!(pipelines.made.load(Ordering::Relaxed), 3);
         assert_eq!(pipelines.refused.load(Ordering::Relaxed), 0);
         assert_eq!(pipelines.reused.load(Ordering::Relaxed), 0);
         assert_eq!(pipelines.capped.load(Ordering::Relaxed), 0);
         assert!(p0_path.is_file() && p0_path.metadata().unwrap().len() > 0, "piece 0 .chain.pso missing");
         assert!(p1_path.is_file() && p1_path.metadata().unwrap().len() > 0, "piece 1 .chain.pso missing");
+        assert!(whole_chain_path.is_file() && whole_chain_path.metadata().unwrap().len() > 0, "whole form .chain.pso missing");
         assert!(!whole_path.exists(), "unsplit whole .pso should not be written for a split compute program");
 
-        // Second pass reuses both cached piece blobs.
+        // Second pass reuses both pieces and the whole fallback.
         pipelines.make(&compiled);
-        assert_eq!(pipelines.reused.load(Ordering::Relaxed), 2);
-        assert_eq!(pipelines.made.load(Ordering::Relaxed), 4);
+        assert_eq!(pipelines.reused.load(Ordering::Relaxed), 3);
+        assert_eq!(pipelines.made.load(Ordering::Relaxed), 6);
         assert_eq!(pipelines.refused.load(Ordering::Relaxed), 0);
 
         // Runtime-side check: the dispatch-chain root signature accepts each cached .chain.pso blob.
         let chain_rs = recomp::pso::dispatch_chain_root_signature(&pipelines.dev, &[]).expect("dispatch chain RS");
-        for (dxil, path) in [(&piece0, &p0_path), (&piece1, &p1_path)] {
+        for (dxil, path) in [(&piece0, &p0_path), (&piece1, &p1_path), (&whole, &whole_chain_path)] {
             let blob = std::fs::read(path).expect("read cached .chain.pso");
             let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 pRootSignature: std::mem::ManuallyDrop::new(Some(chain_rs.clone())),
@@ -1421,9 +1423,31 @@ mod pipeline_cap_tests {
         pipelines.make(&compiled);
         assert!(!p1_path.exists(), "rejected over-cap .chain.pso should be removed");
         assert_eq!(pipelines.capped.load(Ordering::Relaxed), 1);
-        if piece0.len() <= pipelines.max_dxil {
-            assert_eq!(pipelines.reused.load(Ordering::Relaxed), reused_before + 1);
-        }
+        // Valid cached blobs stay reusable even when they exceed the cold-build cap.
+        assert_eq!(pipelines.reused.load(Ordering::Relaxed), reused_before + 2);
+
+        // Restore the rejected piece before testing a cold whole with both pieces cached.
+        pipelines.max_dxil = max_piece.max(whole.len());
+        let reused_before = pipelines.reused.load(Ordering::Relaxed);
+        let made_before = pipelines.made.load(Ordering::Relaxed);
+        pipelines.make(&compiled);
+        assert!(p0_path.is_file() && p0_path.metadata().unwrap().len() > 0, "piece 0 .chain.pso missing");
+        assert!(p1_path.is_file() && p1_path.metadata().unwrap().len() > 0, "restored piece 1 .chain.pso missing");
+        assert_eq!(pipelines.reused.load(Ordering::Relaxed), reused_before + 2);
+        assert_eq!(pipelines.made.load(Ordering::Relaxed), made_before + 3);
+        assert_eq!(pipelines.refused.load(Ordering::Relaxed), 0);
+
+        // A missing whole form obeys its cap regardless of how large the cached pieces are.
+        std::fs::remove_file(&whole_chain_path).unwrap();
+        pipelines.max_dxil = whole.len() - 1;
+        let capped_before = pipelines.capped.load(Ordering::Relaxed);
+        let made_before = pipelines.made.load(Ordering::Relaxed);
+        let reused_before = pipelines.reused.load(Ordering::Relaxed);
+        pipelines.make(&compiled);
+        assert!(!whole_chain_path.exists(), "over-cap cold whole form must not be built");
+        assert_eq!(pipelines.capped.load(Ordering::Relaxed), capped_before + 1);
+        assert_eq!(pipelines.made.load(Ordering::Relaxed), made_before + 2);
+        assert_eq!(pipelines.reused.load(Ordering::Relaxed), reused_before + 2);
     }
 }
 
@@ -1471,7 +1495,9 @@ impl Pipelines {
     /// The compute pipeline of `c` (made and released). When direct translation split the program
     /// into a dispatch chain of at least two pieces, each piece is built and cached under the
     /// dispatch-chain root signature (`.chain.pso`) as the runtime does (`dispatch_chain::build`),
-    /// instead of the unsplit whole container.
+    /// and so is the whole program: the runtime needs it under that signature when an indirect
+    /// dispatch cannot run the pieces. Ordinary CLI preparation must cover the same forms as
+    /// a launch worker (xcl-dev/xcl#2551).
     fn make(&self, c: &recomp::pso::Compiled) {
         self.make_with_cache_path(c, None);
     }
@@ -1498,6 +1524,7 @@ impl Pipelines {
                         }
                     });
                 }
+                self.make_one(&c.dxil, &c.samplers, true, None);
                 return;
             }
         }
@@ -2185,12 +2212,6 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                         Ok(c) => {
                             if let Some(p) = pipelines {
                                 p.make(&c);
-                                // (a title's preparation worker too: the title would otherwise
-                                // build a split program's whole form at its first ExecuteIndirect,
-                                // on its own thread, 15 – 25 s a program cold)
-                                if (startup.is_some() || std::env::var_os("XCL_PRECOMPILE_PARENT").is_some()) && c.dispatch_chain.as_ref().is_some_and(|plan| plan.pieces.len() >= 2) {
-                                    p.make_one(&c.dxil, &c.samplers, true, None);
-                                }
                             }
                             compiled.fetch_add(1, Ordering::Relaxed)
                         }

@@ -256,6 +256,9 @@ Fill the reusable DXIL cache ahead of a run with the read-only package wrapper. 
 - For compute shaders that XCL can split, the runtime first tries the saved driver blob for
   the whole shader. A usable blob lets the GPU run it in one dispatch. If the blob is missing
   or the driver rejects it, XCL builds the split pieces.
+- **Offline compute preparation**: `--precompile --pipelines` prepares both split pieces and their
+  whole fallback, using the same root signature and driver-cache names as runtime indirect dispatch.
+  Startup workers use the same preparation path.
 - **`--pipelines` size cap**: a compute program whose DXIL is over 8 MiB and that has no saved
   blob is left to the runtime instead of being compiled in the pass — those compiles take tens
   of minutes and gigabytes and stopped the pass on the biggest programs. `XCL_PIPELINE_MAX_KB`
