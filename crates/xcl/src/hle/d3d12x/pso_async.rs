@@ -449,8 +449,11 @@ mod used {
     fn get() -> &'static Used {
         static U: OnceLock<Used> = OnceLock::new();
         U.get_or_init(|| {
-            // (a test neither reads nor writes the user's file)
-            if cfg!(test) {
+            // Only a title's run reads and writes the user's file. A test does neither: the
+            // crate's own (`cfg(test)`), and one in `tests/`, which links the crate without
+            // `cfg(test)` – the retail pipeline tests' keys made the title build their
+            // pipelines ahead in its next run.
+            if cfg!(test) || crate::state::boot().is_none() {
                 return Used { earlier: RwLock::new(HashSet::new()), now: Mutex::new((HashSet::new(), None)) };
             }
             let path = crate::gpu::recomp::dxc::cache_dir().join("used-pipelines.txt");
