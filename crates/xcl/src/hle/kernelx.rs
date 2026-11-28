@@ -232,6 +232,34 @@ pub mod mirrors {
             .filter_map(|(&gpu, &(size, cpu))| (cpu_va >= cpu && cpu_va < cpu + size).then(|| gpu + (cpu_va - cpu)))
             .collect()
     }
+
+    /// True when `[va, va + len)` overlaps any registered GPU-view reservation.
+    pub fn overlaps_gpu_view(va: usize, len: usize) -> bool {
+        let Some(end) = va.checked_add(len) else { return true };
+        if len == 0 {
+            return false;
+        }
+        let s = STATE.lock().unwrap();
+        if let Some((&gpu, &(size, _))) = s.gpu.range(..=va).next_back() {
+            if va < gpu + size {
+                return true;
+            }
+        }
+        s.gpu.range(va..end).next().is_some()
+    }
+
+    /// Resolve `va` to its paired CPU-view address when `va` lies in a GPU view with no page
+    /// mapped at `va` itself, else return `va`.
+    pub fn resolve(va: usize) -> usize {
+        let Some(src) = source(va) else { return va };
+        if super::physical_page_at(va) {
+            return va;
+        }
+        let mut m: super::mem::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        let mapped = unsafe { super::mem::VirtualQuery(va as *const std::ffi::c_void, &mut m, std::mem::size_of_val(&m)) } != 0
+            && m.State == super::mem::MEM_COMMIT;
+        if mapped { va } else { src }
+    }
 }
 
 /// Graphics memory (MEM_GRAPHICS, committed, no fixed address) comes from the unified

@@ -1,7 +1,7 @@
 //! Bounded preparation of file-backed zlib requests. The queue thread owns
 //! file reads, cancellation checks, and retirement; decoders own private buffers.
 
-use super::{note_request, read_exact_at, writable, Entry, FileInner, QueueInner, Request, E_ABORT, E_ACCESS_VIOLATION, E_FILE_HANDLE, E_ZLIB_DATA};
+use super::{mirror_writable, note_request, read_exact_at, write_virtual_destination, Entry, FileInner, QueueInner, Request, E_ABORT, E_ACCESS_VIOLATION, E_FILE_HANDLE, E_ZLIB_DATA};
 use crate::util::{HRESULT, S_OK};
 use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
@@ -423,7 +423,7 @@ impl<'a> Pipeline<'a> {
         }
         note_request(&req);
         let loaded = (|| {
-            if !writable(req.destination as usize, req.destination_size as usize) {
+            if !mirror_writable(req.destination as usize, req.destination_size as usize) {
                 return Err(E_ACCESS_VIOLATION);
             }
             let handle = task.file.as_ref().and_then(|file| file.handle()).ok_or(E_FILE_HANDLE)?;
@@ -459,10 +459,9 @@ impl<'a> Pipeline<'a> {
         notify_test(self.queue, TestEvent::BeforeRetire(task.seq));
         let result = result.and_then(|payload| {
             let n = task.req.destination_size as usize;
-            let at = task.req.destination as usize;
             // The title can unmap the destination while a decoder runs. The late
             // check resolves lazy pages, and the kernel copy handles a subsequent unmap.
-            if writable(at, n) && (n == 0 || write_destination(at, &payload.bytes[..n])) {
+            if write_virtual_destination(task.req.destination as usize, &payload.bytes[..n]) {
                 Ok(())
             } else {
                 Err(E_ACCESS_VIOLATION)
@@ -481,7 +480,7 @@ extern "system" {
     fn NtWriteVirtualMemory(process: HANDLE, at: *mut c_void, data: *const c_void, len: usize, done: *mut usize) -> i32;
 }
 
-fn write_destination(at: usize, bytes: &[u8]) -> bool {
+pub(super) fn write_destination(at: usize, bytes: &[u8]) -> bool {
     let mut done = 0;
     // Use the current-process handle so an access fault is returned as a status.
     let status = unsafe {
