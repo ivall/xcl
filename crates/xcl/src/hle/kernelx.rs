@@ -478,13 +478,7 @@ pub unsafe extern "system" fn VirtualFree(addr: *mut c_void, size: usize, t: u32
         return 1;
     }
     if let Some(u) = crate::gpu::uma::get().filter(|u| u.contains(addr as usize)) {
-        if t & 0x8000 != 0 {
-            return u.free(addr as usize) as BOOL;
-        }
-        if t & 0x4000 != 0 && size > 0 {
-            std::ptr::write_bytes(addr as *mut u8, 0, size);
-        }
-        return 1;
+        return coherent_virtual_free(u, addr, size, t);
     }
     let ok = mem::VirtualFree(addr, size, t);
     if ok != 0 && t & 0x8000 != 0 && GRAPHICS_RESERVATIONS.lock().unwrap().remove(&(addr as usize)).is_some() {
@@ -492,6 +486,22 @@ pub unsafe extern "system" fn VirtualFree(addr: *mut c_void, size: usize, t: u32
         mirrors::released(addr as usize);
     }
     ok
+}
+
+unsafe fn coherent_virtual_free(u: &crate::gpu::uma::Uma, addr: *mut c_void, size: usize, t: u32) -> BOOL {
+    let release = t & mem::MEM_RELEASE != 0;
+    let decommit = t & mem::MEM_DECOMMIT != 0;
+    if release == decommit || (release && size != 0) {
+        fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    if release {
+        return u.free(addr as usize) as BOOL;
+    }
+    if size > 0 {
+        std::ptr::write_bytes(addr as *mut u8, 0, size);
+    }
+    1
 }
 
 pub unsafe extern "system" fn VirtualFreeEx(proc_: HANDLE, addr: *mut c_void, size: usize, t: u32) -> BOOL {
@@ -3024,6 +3034,32 @@ mod tests {
             assert_eq!(XMemVirtualQuery(proc_, page, info.as_mut_ptr() as _), 1);
             assert_eq!((info[6] as u32) & 3, 0, "PAGE_GUARD page must not be marked CPU-readable");
             mem::VirtualFree(page, 0, mem::MEM_RELEASE);
+        }
+    }
+
+    #[test]
+    fn coherent_release_rejects_invalid_requests_without_freeing() {
+        let grain = crate::gpu::uma::GRAIN;
+        let u = crate::gpu::uma::Uma::with_windows(1, 4 * grain).unwrap();
+        let p = u.alloc(grain, grain).unwrap();
+        unsafe {
+            std::ptr::write_bytes(p, 0x5A, grain);
+            for (size, flags) in [
+                (grain, mem::MEM_RELEASE),
+                (0, mem::MEM_RELEASE | mem::MEM_DECOMMIT),
+                (0, 0),
+            ] {
+                fnd::SetLastError(0);
+                assert_eq!(coherent_virtual_free(&u, p.cast(), size, flags), 0, "size {size}, flags {flags:#x}");
+                assert_eq!(fnd::GetLastError(), fnd::ERROR_INVALID_PARAMETER);
+                assert!(u.is_title_address(p as usize));
+                assert!(std::slice::from_raw_parts(p, grain).iter().all(|&v| v == 0x5A));
+            }
+            assert_eq!(coherent_virtual_free(&u, p.cast(), 0x1000, mem::MEM_DECOMMIT), 1);
+            assert!(std::slice::from_raw_parts(p, 0x1000).iter().all(|&v| v == 0));
+            assert!(std::slice::from_raw_parts(p.add(0x1000), grain - 0x1000).iter().all(|&v| v == 0x5A));
+            assert_eq!(coherent_virtual_free(&u, p.cast(), 0, mem::MEM_RELEASE), 1);
+            assert!(!u.is_title_address(p as usize));
         }
     }
 
