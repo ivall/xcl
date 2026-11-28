@@ -532,7 +532,11 @@ pub(super) unsafe extern "system" fn set_graphics_root_signature(this: *mut c_vo
     let _detail = crate::stall::detail_span(crate::stall::StallKind::DetailBind);
     let layout = console_list::layout_of(rs as usize);
     with(this, |s| {
-        s.args_gfx = vec![0u8; layout.as_ref().map_or(0, |l| l.size as usize)];
+        // the same root signature again keeps the bound arguments (D3D12: only a different
+        // one invalidates them)
+        if !console_list::same_layout(&s.layout_gfx, &layout) {
+            s.args_gfx = vec![0u8; layout.as_ref().map_or(0, |l| l.size as usize)];
+        }
         s.layout_gfx = layout;
         s.rs_gfx = rs as usize;
     });
@@ -1339,7 +1343,9 @@ pub(super) unsafe extern "system" fn set_compute_root_signature(this: *mut c_voi
     let _detail = crate::stall::detail_span(crate::stall::StallKind::DetailBind);
     let layout = console_list::layout_of(rs as usize);
     with(this, |s| {
-        s.args = vec![0u8; layout.as_ref().map_or(0, |l| l.size as usize)];
+        if !console_list::same_layout(&s.layout, &layout) {
+            s.args = vec![0u8; layout.as_ref().map_or(0, |l| l.size as usize)];
+        }
         s.layout = layout;
     });
 }
@@ -3032,6 +3038,50 @@ void main(uint t : SV_GroupIndex) {
         assert_eq!(console_list::take_pending_for_test(old_alloc), vec![0x7102_5000]);
         assert_eq!(reset_state_for_test(from).0, 0x7102_0200, "the active producer must remain untouched");
         remove_state_for_test(from);
+    }
+
+    #[test]
+    fn the_same_root_signature_again_keeps_the_root_arguments() {
+        let list = 0x7100_0301usize as *mut c_void;
+        let (rs_a, rs_b) = (0x7100_0310usize, 0x7100_0320usize);
+        console_list::note_root_signature(rs_a, &test_rts0_blob());
+        console_list::note_root_signature(rs_b, &test_rts0_blob());
+        let set = |gfx: bool, rs: usize| unsafe {
+            if gfx { set_graphics_root_signature(list, rs as *mut c_void) } else { set_compute_root_signature(list, rs as *mut c_void) }
+        };
+        let args = |gfx: bool| with(list, |s| if gfx { s.args_gfx.clone() } else { s.args.clone() });
+        reset(list, 0x7100_0330, 0);
+        set(false, rs_a);
+        set(true, rs_a);
+        unsafe { set_compute_root_constant(list, 0, 0xABCD, 0) };
+        assert!(args(false).iter().any(|b| *b != 0));
+        assert!(args(true).iter().all(|b| *b == 0), "compute and graphics arguments are separate");
+        // the same signature again: the arguments stay
+        set(false, rs_a);
+        assert_eq!(&args(false)[..4], &0xABCDu32.to_le_bytes());
+        // graphics is independent: a different one there leaves compute alone
+        unsafe { set_graphics_root_constant(list, 0, 0x1234, 0) };
+        set(true, rs_b);
+        assert!(args(true).iter().all(|b| *b == 0));
+        assert_eq!(&args(false)[..4], &0xABCDu32.to_le_bytes());
+        // a different signature clears
+        set(false, rs_b);
+        assert!(args(false).iter().all(|b| *b == 0));
+        // a signature re-made at the same address is a different one
+        unsafe { set_compute_root_constant(list, 0, 0xABCD, 0) };
+        console_list::note_root_signature(rs_b, &test_rts0_blob());
+        set(false, rs_b);
+        assert!(args(false).iter().all(|b| *b == 0));
+        // Reset and ClearState clear, so the signature set again afterwards starts empty
+        unsafe { set_compute_root_constant(list, 0, 0xABCD, 0) };
+        clear_state(list, 0);
+        set(false, rs_b);
+        assert!(args(false).iter().all(|b| *b == 0));
+        unsafe { set_compute_root_constant(list, 0, 0xABCD, 0) };
+        reset(list, 0x7100_0330, 0);
+        set(false, rs_b);
+        assert!(args(false).iter().all(|b| *b == 0));
+        forget(list);
     }
 
     #[repr(C)]
