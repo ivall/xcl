@@ -3375,48 +3375,101 @@ unsafe fn scratch_args_pingpong(this: *mut c_void, dev: &ID3D12Device, bytes: u6
     Ok((buf, off, slot, prev_state))
 }
 
-thread_local! {
-    /// set by `stage_args_in_window` for the next `make_scaled_args_buffer` on this thread
-    static STAGED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+/// Where a two-pass ExecuteIndirect reads its arguments (or count) from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArgSource {
+    /// a console buffer in unified memory, at this address
+    Window(usize),
+    /// a PC buffer XCL does not track: its bytes are copied into the window first
+    Pc,
+    /// a tracked console buffer the range does not fit, or a PC buffer a bundle cannot copy
+    Invalid,
 }
 
-/// Bytes of the coherent-window ring that out-of-window indirect arguments are copied into.
-const STAGE_RING_BYTES: usize = 4 << 20;
+/// `tracked`: the console buffer `res` is (`console_buffer`), as (address, bytes); `off` and
+/// `len`: the title's offset and the bytes read there.
+fn arg_source(tracked: Option<(usize, usize)>, off: u64, len: usize, bundle: bool) -> ArgSource {
+    match tracked {
+        Some((p, n)) => match usize::try_from(off).ok().and_then(|o| Some((o, o.checked_add(len)?))) {
+            Some((o, end)) if end <= n => p.checked_add(o).map_or(ArgSource::Invalid, ArgSource::Window),
+            _ => ArgSource::Invalid,
+        },
+        None if bundle => ArgSource::Invalid,
+        None => ArgSource::Pc,
+    }
+}
 
-/// Copies `len` bytes at `off` of the PC buffer `res` (in `INDIRECT_ARGUMENT`) into a ring in
-/// the coherent window on `list`'s timeline, and returns the ring's unified-memory address.
-/// The ring is reused in order: it holds far more than the commands one frame's lists stage.
-unsafe fn stage_args_in_window(list: &ID3D12GraphicsCommandList, res: usize, off: u64, len: usize) -> Option<usize> {
-    static RING: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
-    static AT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    if res == 0 || len == 0 || len > STAGE_RING_BYTES / 4 {
-        return None;
+/// Whether `len` bytes at `off` fit a PC buffer of `width` bytes.
+fn pc_range_fits(width: u64, off: u64, len: usize) -> bool {
+    len > 0 && off.checked_add(len as u64).is_some_and(|end| end <= width)
+}
+
+/// Copies each `(res, off, len)` (PC buffers in `INDIRECT_ARGUMENT`; `off` is the PC offset)
+/// into this recording's own unified memory (`ListState::arena`, retired with the recording at
+/// its allocator's reset), on `list`'s timeline. All ranges are checked and all space taken
+/// before any barrier or copy is recorded: on `None` the list is unchanged.
+unsafe fn stage_args_in_window(this: *mut c_void, list: &ID3D12GraphicsCommandList, ranges: &[(usize, u64, usize)]) -> Option<Vec<usize>> {
+    let u = crate::gpu::uma::get()?;
+    let mut plan = Vec::with_capacity(ranges.len());
+    for &(res, off, len) in ranges {
+        let raw = res as *mut c_void;
+        let src = ID3D12Resource::from_raw_borrowed(&raw)?;
+        let desc = src.GetDesc();
+        if res == 0 || desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || !pc_range_fits(desc.Width, off, len) {
+            return None;
+        }
+        plan.push((src.clone(), off, len));
     }
-    let base = (*RING.get_or_init(|| crate::gpu::uma::get()?.alloc(STAGE_RING_BYTES, 256).map(|p| p as usize)))?;
-    let step = (len + 255) & !255;
-    let mut at = AT.fetch_add(step, Ordering::Relaxed);
-    if at + step > STAGE_RING_BYTES {
-        AT.store(step, Ordering::Relaxed);
-        at = 0;
+    let mut dsts = Vec::with_capacity(plan.len());
+    for &(_, _, len) in &plan {
+        let p = with(this, |s| s.arena.take(u, len.max(16), 256, &mut s.uma))? as usize;
+        let (win, win_off) = super::real::uma_window_buffer(p, len)?;
+        let raw = win as *mut c_void;
+        dsts.push((p, ID3D12Resource::from_raw_borrowed(&raw)?.clone(), win_off));
     }
-    let dst = base + at;
-    let (win, win_off) = super::real::uma_window_buffer(dst, len)?;
-    let (src_raw, win_raw) = (res as *mut c_void, win as *mut c_void);
-    let src = ID3D12Resource::from_raw_borrowed(&src_raw)?;
-    let win = ID3D12Resource::from_raw_borrowed(&win_raw)?;
-    emit_transition(list, src, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    list.CopyBufferRegion(win, win_off, src, off, len as u64);
-    emit_transition(list, src, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
-    // the window buffer was promoted to COPY_DEST from COMMON: back to COMMON for the shader
-    emit_transition(list, win, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
-    STAGED.with(|s| s.set(true));
+    for ((src, off, len), (_, win, win_off)) in plan.iter().zip(&dsts) {
+        emit_transition(list, src, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        list.CopyBufferRegion(win, *win_off, src, *off, *len as u64);
+        emit_transition(list, src, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+        // the window buffer was promoted to COPY_DEST from COMMON: back to COMMON for the shader
+        emit_transition(list, win, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+    }
     let n = STAGED_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
     if n <= 4 || n.is_power_of_two() {
-        crate::xlog_info!("D3D12.X: indirect arguments outside the memory windows copied into the coherent window ({len} B, {n} so far)");
+        crate::xlog_info!("D3D12.X: indirect arguments outside the memory windows copied into the list's unified memory ({n} so far)");
     }
-    Some(dst)
+    Some(dsts.into_iter().map(|(p, _, _)| p).collect())
 }
 static STAGED_COUNT: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+mod stage_args_tests {
+    use super::{arg_source, pc_range_fits, ArgSource};
+
+    #[test]
+    fn a_tracked_buffer_out_of_range_is_refused_not_copied() {
+        let buf = Some((0x1000usize, 64usize));
+        assert_eq!(arg_source(buf, 16, 48, false), ArgSource::Window(0x1010));
+        assert_eq!(arg_source(buf, 16, 49, false), ArgSource::Invalid, "past its end");
+        assert_eq!(arg_source(buf, 65, 0, false), ArgSource::Invalid, "offset past its end");
+        assert_eq!(arg_source(buf, u64::MAX, 4, false), ArgSource::Invalid, "offset overflow");
+        assert_eq!(arg_source(Some((usize::MAX - 8, 64)), 16, 4, false), ArgSource::Invalid, "address overflow");
+    }
+
+    #[test]
+    fn only_an_untracked_buffer_outside_a_bundle_is_copied() {
+        assert_eq!(arg_source(None, 0, 12, false), ArgSource::Pc);
+        assert_eq!(arg_source(None, 0, 12, true), ArgSource::Invalid);
+    }
+
+    #[test]
+    fn a_pc_copy_must_fit_the_buffer() {
+        assert!(pc_range_fits(256, 244, 12));
+        assert!(!pc_range_fits(256, 245, 12));
+        assert!(!pc_range_fits(256, 0, 0), "nothing to copy");
+        assert!(!pc_range_fits(u64::MAX, u64::MAX - 4, 12), "end overflow");
+    }
+}
 
 /// The arguments of `max` commands at UMA address `src`, rewritten for the two passes
 /// (`SCALE_ARGS_HLSL`) into a scratch block: the block (INDIRECT_ARGUMENT until the caller puts
@@ -3426,7 +3479,7 @@ static STAGED_COUNT: AtomicU64 = AtomicU64::new(0);
 /// through the title's buffer: its state on the PC is the title's and not known here. So is the
 /// count (`count`: its UMA address, when the title gave a count buffer).
 #[allow(clippy::too_many_arguments)]
-unsafe fn make_scaled_args_buffer(this: *mut c_void, list: &ID3D12GraphicsCommandList, src: usize, count: Option<usize>, max: u32, stride: u32, mesh_offset: u32, split: u32, cap: u32) -> Result<(ID3D12Resource, u64), String> {
+unsafe fn make_scaled_args_buffer(this: *mut c_void, list: &ID3D12GraphicsCommandList, src: usize, count: Option<usize>, staged: bool, max: u32, stride: u32, mesh_offset: u32, split: u32, cap: u32) -> Result<(ID3D12Resource, u64), String> {
     if super::list_x::tracked_list_type(this) == Some(D3D12_COMMAND_LIST_TYPE_BUNDLE) {
         return Err("command bundles cannot record indirect argument barriers".into());
     }
@@ -3437,8 +3490,7 @@ unsafe fn make_scaled_args_buffer(this: *mut c_void, list: &ID3D12GraphicsComman
     if let Some(p) = count {
         super::real::uma_window_buffer(p, 4).ok_or("the indirect count is not in a memory window")?;
     }
-    // staged arguments are copied in this segment: a hoisted prelude would read the ring first
-    let staged = STAGED.with(|s| s.replace(false));
+    // staged arguments are copied in this segment: a hoisted prelude would read them first
     if !staged && can_hoist_prelude(this) {
         if let Some((src_win, src_off)) = uma_win_off(u, src, commands as usize) {
             let cnt_loc = match count {
@@ -3662,10 +3714,6 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         let off = usize::try_from(args_off).ok()?;
         (off <= n).then(|| p.checked_add(off).map(|addr| (addr, n - off))).flatten()
     });
-    let count_at = super::real::console_buffer(count_buf).and_then(|(p, n)| {
-        let off = usize::try_from(count_off).ok()?;
-        (off.checked_add(4)? <= n).then(|| p.checked_add(off)).flatten()
-    });
     let (args_off_title, count_off_title) = (args_off, count_off);
     let (args_off, count_off) = (args_off + super::real::buffer_delta(args), count_off + super::real::buffer_delta(count_buf));
     if let Some(tp) = super::real::two_pass_of(pso) {
@@ -3689,14 +3737,31 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                     return Ok(());
                 }
                 let commands = max as usize * msig.byte_stride as usize;
-                let src = match commands_at {
-                    Some((p, n)) if commands <= n => p,
-                    // a PC buffer outside the memory windows (a smaller coherent window): its
-                    // commands are copied into the window ring on the GPU first
-                    _ => match stage_args_in_window(list, args, args_off, commands) {
-                        Some(p) => p,
-                        None => return Err("its arguments are not in a console buffer in unified memory".into()),
-                    },
+                // resolve the arguments and the count first: a range a tracked buffer does not
+                // hold is refused before anything is recorded; untracked PC buffers are copied
+                let bundle = super::list_x::tracked_list_type(this) == Some(D3D12_COMMAND_LIST_TYPE_BUNDLE);
+                let src_kind = arg_source(super::real::console_buffer(args), args_off_title, commands, bundle);
+                let count_kind = (count_buf != 0).then(|| arg_source(super::real::console_buffer(count_buf), count_off_title, 4, bundle));
+                let mut copies = Vec::new();
+                match src_kind {
+                    ArgSource::Invalid => return Err("its arguments are not in a console buffer in unified memory".into()),
+                    ArgSource::Pc => copies.push((args, args_off, commands)),
+                    ArgSource::Window(_) => {}
+                }
+                match count_kind {
+                    Some(ArgSource::Invalid) => return Err("its count is not in a console buffer in unified memory".into()),
+                    Some(ArgSource::Pc) => copies.push((count_buf, count_off, 4)),
+                    _ => {}
+                }
+                let staged = if copies.is_empty() {
+                    Vec::new()
+                } else {
+                    stage_args_in_window(this, list, &copies).ok_or("its out-of-window arguments could not be copied into unified memory")?
+                };
+                let mut staged_at = staged.iter().copied();
+                let src = match src_kind {
+                    ArgSource::Window(p) => p,
+                    _ => staged_at.next().ok_or("no staged arguments")?,
                 };
                 let record_bytes = tp.record.record_dwords() as u64 * 4;
                 let (res_buf, res_va, cap) = ensure_res_buffer(this, two_pass_indirect_bytes())?;
@@ -3704,17 +3769,14 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                 if cap == 0 {
                     return Err(format!("a record of {record_bytes} B does not fit the record buffer"));
                 }
-                let count = match (count_buf, count_at) {
-                    (0, _) => None,
-                    (_, Some(p)) => Some(p),
-                    _ => match stage_args_in_window(list, count_buf, count_off, 4) {
-                        Some(p) => Some(p),
-                        None => return Err("its count is not in a console buffer in unified memory".into()),
-                    },
+                let count = match count_kind {
+                    None => None,
+                    Some(ArgSource::Window(p)) => Some(p),
+                    _ => Some(staged_at.next().ok_or("no staged count")?),
                 };
                 // the groups past the record buffer, and the commands past the count, are dropped
                 // on the GPU (`SCALE_ARGS_HLSL`)
-                let (scaled, at) = make_scaled_args_buffer(this, list, src, count, max, msig.byte_stride, msig.mesh_offset, tp.mesh_groups_per_record, cap)?;
+                let (scaled, at) = make_scaled_args_buffer(this, list, src, count, !staged.is_empty(), max, msig.byte_stride, msig.mesh_offset, tp.mesh_groups_per_record, cap)?;
                 for (k, compute) in two_pass_steps(max) {
                     bind_two_pass_stage(this, list, pso, &tp, res_va, compute)?;
                     let (s, first) = if compute { (msig.companion_dispatch, at) } else { (sig, at + commands as u64) };
