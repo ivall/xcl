@@ -312,9 +312,7 @@ pub fn emit_with_nest(lw: &mut Lw, cfg: &Cfg, p: &Plan, head: Block, exit: Block
             let l = lw.sub(left, one);
             lw.s.m.store(budget, l, 4);
         }
-        for &i in &blk.insts {
-            lw.inst(&cfg.insts[i])?;
-        }
+        lw.lower_block_insts(&cfg.insts, &blk.insts, |_| None)?;
         let next = match blk.term {
             Term::End => lw.c(END),
             Term::Jump(_) => taken,

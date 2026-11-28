@@ -887,3 +887,133 @@ fn raw_loads_in_root_windows_respect_exec_and_bounds() {
         }
     }
 }
+
+/// Consecutive independent `v_readfirstlane_b32` / `v_readlane_b32` in split-wave64 mode
+/// share one cross-half `exchange_n` (one barrier pair in `Partner::Present`, one spin loop
+/// in `Partner::Spin`) and validate.
+#[test]
+fn split_readlane_batch_merges_present_and_spin_exchanges() {
+    use crate::gpu::recomp::CsInterface;
+    const V: u64 = 256;
+    let code = prog(&[
+        ("V_READFIRSTLANE_B32", "ENC_VOP1", &[("VDST", 10), ("SRC0", V)], None),
+        ("V_READFIRSTLANE_B32", "ENC_VOP1", &[("VDST", 11), ("SRC0", V + 1)], None),
+        ("V_READFIRSTLANE_B32", "ENC_VOP1", &[("VDST", 12), ("SRC0", V + 2)], None),
+        ("V_READFIRSTLANE_B32", "ENC_VOP1", &[("VDST", 13), ("SRC0", V + 3)], None),
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 14), ("SRC0", V + 4), ("SRC1", 128 + 7)], None),
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 15), ("SRC0", V + 5), ("SRC1", 128 + 41)], None),
+        // Consume all 6 SGPRs so DCE keeps every exchange result live.
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 10), ("SSRC0", 10), ("SSRC1", 11)], None),
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 10), ("SSRC0", 10), ("SSRC1", 12)], None),
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 10), ("SSRC0", 10), ("SSRC1", 13)], None),
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 10), ("SSRC0", 10), ("SSRC1", 14)], None),
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 10), ("SSRC0", 10), ("SSRC1", 15)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 6), ("SRC0", 10)], None),
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 0), ("DATA", 6), ("SADDR", 0x7F)], None),
+    ]);
+    let ko = KernelOptions { wave64: true, split: true, mem_windows: 1, sampler_base: 0 };
+
+    // 1-wave group (Partner::Present): 1 setup barrier + 2 exchange_n barriers = 3 (vs 1 + 12 = 13 unbatched).
+    let cs64 = CsInterface { threads: [64, 1, 1], user_sgprs: 2, tgid: [false; 3], tg_size: false, tid_components: 1 };
+    let dxil64 = super::kernel::translate_compute(&code, ko, &cs64).unwrap_or_else(|e| panic!("cs64: {e}")).dxil;
+    if crate::gpu::recomp::dxc::location().is_ok() {
+        let dis64 = super::validate::disassemble(&dxil64).expect("disasm cs64");
+        let barriers = dis64.matches("call void @dx.op.barrier(").count();
+        assert_eq!(barriers, 3, "expected 1 setup + 2 batched exchange barriers, got {barriers}");
+    }
+
+    // 2-wave group (Partner::Spin): 1 setup atomic + 2 spin-loop atomics = 3 (vs 1 + 12 = 13 unbatched).
+    let cs128 = CsInterface { threads: [128, 1, 1], user_sgprs: 2, tgid: [false; 3], tg_size: false, tid_components: 1 };
+    let dxil128 = super::kernel::translate_compute(&code, ko, &cs128).unwrap_or_else(|e| panic!("cs128: {e}")).dxil;
+    if crate::gpu::recomp::dxc::location().is_ok() {
+        let dis128 = super::validate::disassemble(&dxil128).expect("disasm cs128");
+        let atomics = dis128.matches("atomicrmw add").count();
+        assert_eq!(atomics, 3, "expected 1 setup + 2 batched spin-exchange atomics, got {atomics}");
+    }
+}
+
+/// SGPR read-after-write hazards (lane selector written by an earlier item, or EXEC written)
+/// split the batch rather than merging across a dependency.
+#[test]
+fn split_readlane_batch_respects_sgpr_hazards() {
+    use crate::gpu::recomp::CsInterface;
+    const V: u64 = 256;
+    let ko = KernelOptions { wave64: true, split: true, mem_windows: 1, sampler_base: 0 };
+    let cs64 = CsInterface { threads: [64, 1, 1], user_sgprs: 2, tgid: [false; 3], tg_size: false, tid_components: 1 };
+
+    // Case 1: second v_readlane reads s10 written by first v_readlane -> 2 separate exchanges (1 + 4 = 5 barriers).
+    let dep = prog(&[
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 10), ("SRC0", V), ("SRC1", 128 + 5)], None),
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 11), ("SRC0", V + 1), ("SRC1", 10)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 6), ("SRC0", 11)], None),
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 0), ("DATA", 6), ("SADDR", 0x7F)], None),
+    ]);
+    let dxil_dep = super::kernel::translate_compute(&dep, ko, &cs64).unwrap_or_else(|e| panic!("dep: {e}")).dxil;
+
+    // Case 2: first v_readfirstlane writes EXEC_LO (126) -> second must not batch with it (1 + 4 = 5 barriers).
+    let exec_wr = prog(&[
+        ("V_READFIRSTLANE_B32", "ENC_VOP1", &[("VDST", 126), ("SRC0", V)], None),
+        ("V_READFIRSTLANE_B32", "ENC_VOP1", &[("VDST", 11), ("SRC0", V + 1)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 6), ("SRC0", 11)], None),
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 0), ("DATA", 6), ("SADDR", 0x7F)], None),
+    ]);
+    let dxil_exec = super::kernel::translate_compute(&exec_wr, ko, &cs64).unwrap_or_else(|e| panic!("exec_wr: {e}")).dxil;
+
+    if crate::gpu::recomp::dxc::location().is_ok() {
+        let b_dep = super::validate::disassemble(&dxil_dep).expect("disasm dep").matches("call void @dx.op.barrier(").count();
+        assert_eq!(b_dep, 5, "RAW lane-selector hazard must split into 2 exchanges (5 barriers), got {b_dep}");
+        let b_exec = super::validate::disassemble(&dxil_exec).expect("disasm exec").matches("call void @dx.op.barrier(").count();
+        assert_eq!(b_exec, 5, "EXEC write must split into 2 exchanges (5 barriers), got {b_exec}");
+    }
+}
+
+/// Batched split-wave64 `v_readfirstlane_b32` / `v_readlane_b32` (both lower-half and upper-half
+/// lanes plus a dependent chain) produce exact RDNA2 results on the GPU.
+#[test]
+fn gpu_split_readlane_batch_executes_correctly() {
+    use crate::gpu::recomp::runner::{self, KernelState};
+    const V: u64 = 256;
+    let code = prog(&[
+        // Batch 1 (EXEC = all 64 lanes, first active = lane 0):
+        //   s10 = v0[0], s11 = v1[0], s12 = v2[7], s13 = v3[41]
+        ("V_READFIRSTLANE_B32", "ENC_VOP1", &[("VDST", 10), ("SRC0", V)], None),
+        ("V_READFIRSTLANE_B32", "ENC_VOP1", &[("VDST", 11), ("SRC0", V + 1)], None),
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 12), ("SRC0", V + 2), ("SRC1", 128 + 7)], None),
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 13), ("SRC0", V + 3), ("SRC1", 128 + 41)], None),
+        // Dependent chain (must NOT merge): s14 = v4[35] (= 52), then s15 = v5[s14] (= v5[52])
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 14), ("SRC0", V + 4), ("SRC1", 128 + 35)], None),
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 15), ("SRC0", V + 5), ("SRC1", 14)], None),
+        // Mask off lower half so first active lane is 37 (bit 5 of EXEC_HI = 0x20),
+        // then batch 2 reads v0[37] and v1[37] from the upper half.
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 128)], None),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 127), ("SSRC0", 128 + 32)], None),
+        ("V_READFIRSTLANE_B32", "ENC_VOP1", &[("VDST", 16), ("SRC0", V)], None),
+        ("V_READFIRSTLANE_B32", "ENC_VOP1", &[("VDST", 17), ("SRC0", V + 1)], None),
+    ]);
+    let ko = KernelOptions { wave64: true, split: true, mem_windows: 1, sampler_base: 0 };
+    let dxil = translate(&code, ko).unwrap_or_else(|e| panic!("split translate: {e}"));
+    super::validate::validate(&dxil).unwrap_or_else(|e| panic!("validator: {e}"));
+    if runner::adapter().is_err() || runner::wave32_supported() != Ok(true) || crate::gpu::recomp::dxc::location().is_err() {
+        runner::skip_test("no GPU / DXC / wave32");
+        return;
+    }
+    let mut st = KernelState::default();
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        let l = l as u32;
+        r[0] = 0x1000 + l;
+        r[1] = 0x2000 + l * 3;
+        r[2] = 0x3000 + l * 5;
+        r[3] = 0x4000 + l * 7;
+        r[4] = if l == 35 { 52 } else { 1 };
+        r[5] = 0x5000 + l * 11;
+    }
+    let r = runner::run(&dxil, &st, &[]).expect("GPU run");
+    assert_eq!(r.sgpr[10], 0x1000, "s10 = v0[0]");
+    assert_eq!(r.sgpr[11], 0x2000, "s11 = v1[0]");
+    assert_eq!(r.sgpr[12], 0x3000 + 7 * 5, "s12 = v2[7]");
+    assert_eq!(r.sgpr[13], 0x4000 + 41 * 7, "s13 = v3[41]");
+    assert_eq!(r.sgpr[14], 52, "s14 = v4[35]");
+    assert_eq!(r.sgpr[15], 0x5000 + 52 * 11, "s15 = v5[52]");
+    assert_eq!(r.sgpr[16], 0x1000 + 37, "s16 = v0[37]");
+    assert_eq!(r.sgpr[17], 0x2000 + 37 * 3, "s17 = v1[37]");
+}

@@ -590,6 +590,48 @@ impl Lw {
         self.sel(mine, m, o)
     }
 
+    /// Batched [`Lw::read_lane_uniform`] for independent consecutive `v_readfirstlane_b32` /
+    /// `v_readlane_b32` instructions: performs one cross-half [`Lw::exchange_n`] for the
+    /// whole run (one barrier pair in `Partner::Present`, one spin-exchange loop in
+    /// `Partner::Spin`).
+    pub fn read_lane_uniform_batch(&mut self, items: &[(Value, Value)]) -> Vec<Value> {
+        if items.is_empty() {
+            return Vec::new();
+        }
+        if !self.split {
+            return items.iter().map(|&(v, l)| self.rla(v, l)).collect();
+        }
+        let mut mine_vals = Vec::with_capacity(items.len());
+        let mut last_l31: Option<(Value, Value)> = None;
+        for &(v, l) in items {
+            let l31 = match last_l31 {
+                Some((prev_l, prev_l31)) if prev_l == l => prev_l31,
+                _ => {
+                    let l31 = self.andc(l, 31);
+                    last_l31 = Some((l, l31));
+                    l31
+                }
+            };
+            mine_vals.push(self.s.wave_read_lane_at(v, l31));
+        }
+        let others = self.exchange_n(&mine_vals);
+        let mut out = Vec::with_capacity(items.len());
+        let mut last_mine: Option<(Value, Value)> = None;
+        for ((&(_, l), m), o) in items.iter().zip(mine_vals).zip(others) {
+            let mine = match last_mine {
+                Some((prev_l, prev_mine)) if prev_l == l => prev_mine,
+                _ => {
+                    let lh = self.lshrc(l, 5);
+                    let mine = self.cmp(Pred::Eq, lh, self.half);
+                    last_mine = Some((l, mine));
+                    mine
+                }
+            };
+            out.push(self.sel(mine, m, o));
+        }
+        out
+    }
+
     /// `v` of lane `l` within the reader's 32-lane half (DPP, swizzle, permlane).
     pub fn read_lane_half(&mut self, v: Value, l: Value) -> Value {
         if self.split {

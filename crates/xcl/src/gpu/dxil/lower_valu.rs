@@ -1430,6 +1430,181 @@ impl Lw {
             self.selc(le, 0, m)
         }
     }
+
+    /// Lowers a basic block's instruction indices in order, batching consecutive independent
+    /// `v_readfirstlane_b32` / `v_readlane_b32` exchanges in split-wave64 mode into one
+    /// [`Lw::exchange_n`].
+    pub fn lower_block_insts(
+        &mut self,
+        all: &[Decoded],
+        indices: &[usize],
+        mut reload: impl FnMut(usize) -> Option<super::reload::Reload>,
+    ) -> LResult<()> {
+        if !self.split || self.xslot < 2 || self.guard_override.is_some() {
+            for &i in indices {
+                self.reload = reload(i);
+                self.inst(&all[i])?;
+            }
+            self.reload = None;
+            return Ok(());
+        }
+        let max_batch = self.xslot as usize;
+        let mut pos = 0usize;
+        while pos < indices.len() {
+            let mut written = 0u128;
+            let mut len = 0usize;
+            while pos + len < indices.len() && len < max_batch {
+                let d = &all[indices[pos + len]];
+                let Some(dst) = readlane_batch_eligible(d, written) else {
+                    break;
+                };
+                if let Dst::S(n) = dst {
+                    if n < 128 && n != 125 {
+                        written |= 1u128 << n;
+                    }
+                }
+                len += 1;
+            }
+            if len < 2 {
+                let i = indices[pos];
+                self.reload = reload(i);
+                self.inst(&all[i])?;
+                pos += 1;
+                continue;
+            }
+            self.reload = None;
+            let z = self.c(0);
+            let wmask = if self.wave64 { 63 } else { 31 };
+            let mut first_lane: Option<Value> = None;
+            let mut items: Vec<(Value, Value)> = Vec::with_capacity(len);
+            let mut dsts: Vec<Dst> = Vec::with_capacity(len);
+            for k in 0..len {
+                let d = &all[indices[pos + k]];
+                self.pc = d.pc;
+                self.dpp_enable = None;
+                let (outs, ins) = Self::ops(d);
+                let u = self.sources(d, &ins, false)?;
+                let dst = outs.first().map(|o| Self::dst_of(d, o)).unwrap_or(Dst::Null);
+                let a = u.first().map(|s| s.w()).unwrap_or(z);
+                let lane = if d.inst.name == "V_READFIRSTLANE_B32" {
+                    *first_lane.get_or_insert_with(|| {
+                        let (el, eh) = self.exec_mask();
+                        self.first_lane(el, eh)
+                    })
+                } else {
+                    let b = u.get(1).map(|s| s.w()).unwrap_or(z);
+                    self.andc(b, wmask)
+                };
+                items.push((a, lane));
+                dsts.push(dst);
+            }
+            let vals = self.read_lane_uniform_batch(&items);
+            for (dst, v) in dsts.into_iter().zip(vals) {
+                self.write32(&dst, v);
+            }
+            pos += len;
+        }
+        self.reload = None;
+        Ok(())
+    }
+}
+
+/// Returns the destination of a `v_readfirstlane_b32` / `v_readlane_b32` if it can safely join
+/// a split-wave64 exchange batch whose earlier items wrote `written_sgprs` (bit `r` = SGPR `r`).
+fn readlane_batch_eligible(d: &Decoded, written_sgprs: u128) -> Option<Dst> {
+    if d.variant != Variant::Plain {
+        return None;
+    }
+    if !matches!(d.inst.name, "V_READFIRSTLANE_B32" | "V_READLANE_B32") {
+        return None;
+    }
+    let (outs, ins) = Lw::ops(d);
+    let dst = outs.first().map(|o| Lw::dst_of(d, o)).unwrap_or(Dst::Null);
+    if matches!(dst, Dst::V(_) | Dst::S(126) | Dst::S(127)) {
+        return None;
+    }
+    if d.inst.name == "V_READFIRSTLANE_B32" && (written_sgprs & (3u128 << 126)) != 0 {
+        return None;
+    }
+    for o in ins {
+        match o.field {
+            Some("LITERAL") => {}
+            Some(f) => {
+                if o.ty.starts_with("OPR_VGPR") && d.enc.field_width(f) <= 8 {
+                    continue;
+                }
+                let v = Lw::field(d, f);
+                match v {
+                    0..=124 | 126 | 127 => {
+                        if (written_sgprs & (1u128 << v)) != 0 {
+                            return None;
+                        }
+                    }
+                    251 => {
+                        if (written_sgprs & (3u128 << 106)) != 0 {
+                            return None;
+                        }
+                    }
+                    252 => {
+                        if (written_sgprs & (3u128 << 126)) != 0 {
+                            return None;
+                        }
+                    }
+                    125 | 128..=208 | 235..=248 | 253 | 255 | 256..=511 => {}
+                    _ => return None,
+                }
+            }
+            None => match o.ty {
+                "OPR_VCC" => {
+                    if (written_sgprs & (3u128 << 106)) != 0 {
+                        return None;
+                    }
+                }
+                "OPR_EXEC" | "OPR_SDST_EXEC" => {
+                    if (written_sgprs & (3u128 << 126)) != 0 {
+                        return None;
+                    }
+                }
+                "OPR_SDST_M0" => {
+                    if (written_sgprs & (1u128 << 124)) != 0 {
+                        return None;
+                    }
+                }
+                "OPR_SSRC_SPECIAL_SCC" => {}
+                _ => return None,
+            },
+        }
+    }
+    Some(dst)
+}
+
+/// Longest consecutive independent `v_readfirstlane_b32` / `v_readlane_b32` run within any
+/// basic block (stopping at block `leaders`), used to size split-wave64 exchange slots.
+pub(super) fn max_readlane_batch(insts: &[Decoded], leaders: &std::collections::BTreeSet<u64>) -> u32 {
+    let mut best = 0u32;
+    let mut i = 0usize;
+    while i < insts.len() {
+        let mut written = 0u128;
+        let mut len = 0u32;
+        while i + (len as usize) < insts.len() {
+            let d = &insts[i + len as usize];
+            if len > 0 && leaders.contains(&d.pc) {
+                break;
+            }
+            let Some(dst) = readlane_batch_eligible(d, written) else {
+                break;
+            };
+            if let Dst::S(n) = dst {
+                if n < 128 && n != 125 {
+                    written |= 1u128 << n;
+                }
+            }
+            len += 1;
+        }
+        best = best.max(len);
+        i += (len as usize).max(1);
+    }
+    best
 }
 
 #[cfg(test)]

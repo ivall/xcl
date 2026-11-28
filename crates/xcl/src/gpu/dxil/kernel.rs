@@ -414,11 +414,7 @@ fn translate_on_this_thread(
             let l = lw.sub(left, one);
             lw.wr(VAR_BUDGET, l);
         }
-        for &i in &cfg.blocks[b].insts {
-            lw.reload = reloads.get(b, i);
-            lw.inst(&cfg.insts[i])?;
-        }
-        lw.reload = None;
+        lw.lower_block_insts(&cfg.insts, &cfg.blocks[b].insts, |i| reloads.get(b, i))?;
         match cfg.blocks[b].term {
             Term::Jump(t) if es_block && in_gs(t) => {
                 // the ES's s_setpc_b64 into the GS: through the phase switch
@@ -649,6 +645,15 @@ impl Lw {
         }
         if split && std::env::var_os("XCL_X64_ALL_MASKS").is_none() {
             lw.whole_live = crate::gpu::recomp::x64_masks::by_pc(insts, kernel);
+        }
+        if split {
+            let batch_max = super::lower_valu::max_readlane_batch(insts, leaders);
+            if batch_max >= 2 {
+                // Keep LDS-carved exchange storage bounded (<= 256 dwords = 1 KiB); without
+                // LDS a dedicated groupshared array safely holds up to 16 words per half.
+                let cap = if uses_lds { (64 / lw.waves.max(1)).clamp(1, 8) } else { 16 };
+                slot = slot.max(batch_max.min(cap));
+            }
         }
         lw.setup_storage(uses_lds, if split { slot } else { 1 });
         if let (Some(t), true) = (group_threads, split) {
