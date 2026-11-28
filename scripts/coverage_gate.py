@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Direct-DXIL coverage baseline and gate.
 
-`xcl shaders <pack> --direct --sample 0 --json` sweeps every console program in a shader
-pack through the direct translator and prints per-stage outcome counts. Run that sweep (or
+`xcl shaders <pack> --direct --sample 0 --validate --json` sweeps every console program in a
+shader pack through the direct translator, runs DXC's validator on each result and prints
+per-stage outcome counts (without `--validate` a release build never validates, so
+`validator_failed` would stay 0 whatever the translator emits). Run that sweep (or
 hand in its saved JSON) and compare the counts against a committed baseline: a stage that
 translated fewer programs than the baseline, or gained validator failures, panicked or
 timed out, is a coverage regression - the class of bug a sibling project lost 323 shader
@@ -29,6 +31,14 @@ def sweep_json(stdout):
         if line.startswith("{"):
             return json.loads(line)
     raise ValueError("no JSON report in the sweep output")
+
+
+def sweep_command(xcl, rpf, threads=None):
+    """The sweep the gate runs: every program, each translation through the validator."""
+    cmd = [str(xcl), "shaders", str(rpf), "--direct", "--sample", "0", "--validate", "--json"]
+    if threads:
+        cmd += ["--threads", str(threads)]
+    return cmd
 
 
 def compare(baseline, run):
@@ -65,10 +75,7 @@ def main(argv=None):
     else:
         if not (args.xcl and args.rpf):
             ap.error("--xcl and --rpf are required unless --run-json is given")
-        cmd = [str(args.xcl), "shaders", str(args.rpf), "--direct", "--sample", "0", "--json"]
-        if args.threads:
-            cmd += ["--threads", str(args.threads)]
-        proc = subprocess.run(cmd, capture_output=True, text=True)
+        proc = subprocess.run(sweep_command(args.xcl, args.rpf, args.threads), capture_output=True, text=True)
         try:
             run = sweep_json(proc.stdout)
         except ValueError as e:

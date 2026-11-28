@@ -2,7 +2,7 @@ import json
 import unittest
 from pathlib import Path
 
-from coverage_gate import compare, sweep_json
+from coverage_gate import compare, sweep_command, sweep_json
 
 STAGES = {
     "CS": {"total": 100, "translated": 95, "unsupported": 5, "validator_failed": 0, "panicked": 0, "timeout": 0},
@@ -56,6 +56,17 @@ class CompareTests(unittest.TestCase):
         bad, notes = compare(self.baseline, r)
         self.assertEqual(bad, [])
         self.assertEqual(notes, ["MS: new stage in the sweep"])
+
+
+class SweepCommandTests(unittest.TestCase):
+    def test_sweep_validates_every_program(self):
+        # without --validate a release xcl never runs the validator, so validator_failed
+        # would read 0 in every sweep and the gate could not catch a validator regression
+        cmd = sweep_command(Path("xcl.exe"), Path("pack.rpf"))
+        self.assertEqual(cmd, ["xcl.exe", "shaders", "pack.rpf", "--direct", "--sample", "0", "--validate", "--json"])
+
+    def test_threads_are_passed_on(self):
+        self.assertEqual(sweep_command("xcl.exe", "pack.rpf", 4)[-2:], ["--threads", "4"])
 
 
 class SweepJsonTests(unittest.TestCase):
