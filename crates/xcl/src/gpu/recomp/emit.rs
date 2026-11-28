@@ -5069,8 +5069,8 @@ impl Em {
             Mode::Vertex(vs) => {
                 h.push_str("struct XclIn {\n");
                 let inputs: Vec<&SigElement> = vs.inputs.iter().filter(|e| e.system_value == 0 && !e.name.starts_with("SV_")).collect();
-                for e in &inputs {
-                    let _ = writeln!(h, "    {}4 a{} : {};", hlsl_type(e), e.register, e.semantic());
+                for (k, e) in inputs.iter().enumerate() {
+                    let _ = writeln!(h, "    {}4 a{k} : {};", hlsl_type(e), e.semantic());
                 }
                 h.push_str("    uint xcl_vid : SV_VertexID;\n    uint xcl_iid : SV_InstanceID;\n};\n");
                 out_struct(&mut h, "XclOut", &vs.outputs);
@@ -5095,10 +5095,31 @@ impl Em {
                     } else if let Some(e) = sv_at {
                         if e.system_value == 6 { "xi.xcl_vid" } else { "xi.xcl_iid" }.to_string()
                     } else {
-                        // the fetch shader's VGPRs: four per register the program reads (`fetched_registers`)
+                        // the fetch shader's VGPRs: four per register the program reads (`fetched_registers`);
+                        // elements packed into one register share its VGPRs by mask (each semantic loads into
+                        // its own XclIn field starting at component 0)
                         inputs
                             .iter()
-                            .find_map(|e| vs.input_vgpr(e.register).filter(|&b| v >= b && v < b + 4).map(|b| format!("asuint(xi.a{}[{}])", e.register, v - b)))
+                            .enumerate()
+                            .find_map(|(k, e)| {
+                                let b = vs.input_vgpr(e.register)?;
+                                if v < b || v >= b + 4 {
+                                    return None;
+                                }
+                                let chan = (v - b) as u8;
+                                if (e.mask >> chan) & 1 != 0 {
+                                    let comp = (e.mask & ((1u8 << chan) - 1)).count_ones();
+                                    Some(format!("asuint(xi.a{k}[{comp}])"))
+                                } else {
+                                    None
+                                }
+                            })
+                            .or_else(|| {
+                                inputs
+                                    .iter()
+                                    .enumerate()
+                                    .find_map(|(k, e)| vs.input_vgpr(e.register).filter(|&b| v >= b && v < b + 4).map(|b| format!("asuint(xi.a{k}[{}])", v - b)))
+                            })
                             .unwrap_or_else(|| "0u".into())
                     };
                     let _ = writeln!(h, "    uint v{v} = {init};");

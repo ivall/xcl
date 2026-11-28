@@ -5415,6 +5415,40 @@ fn vs_system_values_in_isg1_registers() {
 }
 
 #[test]
+fn vertex_packed_isg1_inputs_get_distinct_fields_and_components() {
+    let vs = super::VsInterface {
+        inputs: vec![
+            el("POSITION", 0, 0, 3, 0, 0x7),
+            el("TEXCOORD", 0, 0, 3, 1, 0x3),
+            el("TEXCOORD", 1, 0, 3, 1, 0xC),
+        ],
+        outputs: vec![el("SV_Position", 0, 1, 3, 0, 0xF)],
+        attr_base: 4,
+        params: None,
+    };
+    let code = prog(&[
+        ("V_ADD_F32", "ENC_VOP2", &[("VDST", 20), ("SRC0", V + 4), ("VSRC1", 7)], None),  // POSITION.x + POSITION.w (IA default)
+        ("V_ADD_F32", "ENC_VOP2", &[("VDST", 21), ("SRC0", V + 8), ("VSRC1", 9)], None),  // TEXCOORD0.x + TEXCOORD0.y
+        ("V_ADD_F32", "ENC_VOP2", &[("VDST", 22), ("SRC0", V + 10), ("VSRC1", 11)], None), // TEXCOORD1.x + TEXCOORD1.y (packed in reg 1 .zw)
+        ("EXP", "ENC_EXP", &[("TGT", 12), ("EN", 0xF), ("VSRC0", 20), ("VSRC1", 21), ("VSRC2", 22), ("VSRC3", 7), ("DONE", 1)], None),
+    ]);
+    let t = translate(&code, &Options { mode: Mode::Vertex(vs), wave64: true, ..Default::default() }).unwrap();
+    assert!(t.complete(), "{:?}\n{}", t.unsupported_why, t.hlsl);
+    assert!(t.hlsl.contains("float4 a0 : POSITION0;"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("float4 a1 : TEXCOORD0;"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("float4 a2 : TEXCOORD1;"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("uint v4 = asuint(xi.a0[0]);"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("uint v7 = asuint(xi.a0[3]);"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("uint v8 = asuint(xi.a1[0]);"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("uint v9 = asuint(xi.a1[1]);"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("uint v10 = asuint(xi.a2[0]);"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("uint v11 = asuint(xi.a2[1]);"), "{}", t.hlsl);
+    if super::dxc::location().is_ok() {
+        super::dxc::compile(&t.hlsl, "main", "vs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+    }
+}
+
+#[test]
 #[ignore]
 fn probe_standard_swizzle_support() {
     use windows::Win32::Graphics::Direct3D12::*;
