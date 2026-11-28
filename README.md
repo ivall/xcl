@@ -434,6 +434,12 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 - Title data: `%LOCALAPPDATA%\XCL\<title>\` (`%XCL_DATA_ROOT%`): `xcl.toml`, `overlay\`, `saves\`,
   `pls\` (the title's `S:\`), `temp\` (`T:\`), `cache\`, `logs\xcl.log`, `logs\report.json` (the
   previous run's: `xcl.prev.log`, `report.prev.json`).
+- **Title memory budget:** the title reads its memory budget from `TitleMemoryStatus` (and
+  `XMemGetWorkingSetStatistics`). `title_memory_mb` in `xcl.toml` sets it in MiB; `0` (the default) is the
+  console's budget – 13 824 MiB for a Series X (`device_type = "anaconda"`), 8 192 for a Series S
+  (`"lockhart"`) – and any other value replaces it. On a GPU with less video memory than that budget
+  (8 GB cards, [#1337](https://github.com/ivall/xcl/issues/1337)), lowering it lets a title that plans its
+  streaming against the budget stay within the card, e.g. a few GB below its memory.
 
 </details>
 
