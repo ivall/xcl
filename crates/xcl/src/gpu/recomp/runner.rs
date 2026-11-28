@@ -16,6 +16,8 @@ use windows::Win32::Graphics::Dxgi::*;
 
 use super::{KERNEL_LANES, KERNEL_RES_DWORDS, KERNEL_SCC_SLOT, KERNEL_SGPRS, KERNEL_VGPRS};
 use crate::gpu::fence;
+use crate::gpu::agility::configuration_interface;
+use windows::Win32::Graphics::Direct3D12::{ID3D12Debug, CLSID_D3D12Debug};
 
 /// Initial state of a kernel run.
 #[derive(Clone)]
@@ -90,6 +92,12 @@ fn init() -> Result<Gpu, String> {
             let _ = crate::gpu::agility::enable_debug_layer();
         }
         let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(e)?;
+        // Enable debug layer BEFORE creating the device if XCL_D3D12_DEBUG is set
+        if std::env::var_os("XCL_D3D12_DEBUG").is_some() {
+            if let Ok(debug) = configuration_interface::<ID3D12Debug>(&CLSID_D3D12Debug) {
+                debug.EnableDebugLayer();
+            }
+        }
         // `XCL_ADAPTER` picks the adapter (default: the first in high-performance order)
         let sel = crate::gpu::adapter::Selector::from_env_or("auto");
         let (adapter, name): (IDXGIAdapter1, String) = if sel == crate::gpu::adapter::Selector::Warp {
