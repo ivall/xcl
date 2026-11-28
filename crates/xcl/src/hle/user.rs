@@ -37,6 +37,7 @@ pub fn exports() -> Vec<(&'static str, usize)> {
     let mut v = crate::hle_exports![CreateWindowExA, RegisterClassExA];
     // titles that make their window the Unicode way (Fortnite) get the console's screen too
     v.push(("CreateWindowExW", create_window_ex_w as usize));
+    v.push(("RegisterClassExW", register_class_ex_w as usize));
     v
 }
 
@@ -92,6 +93,19 @@ pub unsafe extern "system" fn RegisterClassExA(c: *const WndClassEx<u8>) -> u16 
         icon_small: c.icon_small,
     };
     RegisterClassExW(&w)
+}
+
+/// RegisterClassExW of the console's ntuser API set: validates cbSize and calls the native
+/// RegisterClassExW directly without string conversion.
+pub unsafe extern "system" fn register_class_ex_w(c: *const WndClassEx<u16>) -> u16 {
+    if c.is_null() {
+        return 0;
+    }
+    if (*c).cb_size != std::mem::size_of::<WndClassEx<u16>>() as u32 {
+        windows_sys::Win32::Foundation::SetLastError(windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    RegisterClassExW(c)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -290,6 +304,49 @@ mod tests {
             VirtualFree(base, 0, MEM_RELEASE);
             assert_eq!(atom, 0);
             assert_eq!(error, windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER);
+        }
+    }
+
+    #[test]
+    fn register_class_ex_w_accepts_valid_class_and_rejects_invalid_size() {
+        unsafe {
+            let instance = GetModuleHandleW(std::ptr::null()) as usize;
+            let class_name = wide("XclValidUnicodeClassTest");
+            let mut c = WndClassEx {
+                cb_size: std::mem::size_of::<WndClassEx<u16>>() as u32,
+                style: 0x3,
+                wnd_proc: DefWindowProcW as usize,
+                cls_extra: 0,
+                wnd_extra: 0,
+                instance,
+                icon: 0,
+                cursor: 0,
+                background: 0,
+                menu_name: std::ptr::null(),
+                class_name: class_name.as_ptr(),
+                icon_small: 0,
+            };
+
+            // Invalid size check
+            c.cb_size = 0;
+            SetLastError(0x1234_5678);
+            let atom_bad = register_class_ex_w(&c);
+            assert_eq!(atom_bad, 0);
+            assert_eq!(GetLastError(), windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER);
+
+            // Valid registration
+            c.cb_size = std::mem::size_of::<WndClassEx<u16>>() as u32;
+            let atom = register_class_ex_w(&c);
+            assert_ne!(atom, 0, "register_class_ex_w failed: {}", GetLastError());
+
+            let mut info: WndClassEx<u16> = std::mem::zeroed();
+            info.cb_size = std::mem::size_of_val(&info) as u32;
+            let found = GetClassInfoExW(instance, class_name.as_ptr(), &mut info);
+            assert_ne!(UnregisterClassW(class_name.as_ptr(), instance), 0);
+            assert_ne!(found, 0);
+            assert_eq!(info.style, c.style);
+            assert_eq!(info.wnd_proc, c.wnd_proc);
+            assert_eq!(info.instance, instance);
         }
     }
 }
