@@ -3763,7 +3763,7 @@ impl Em {
                 let e = match name {
                     "v_add_f64" => format!("{} + {}", f64v(0), f64v(1)),
                     "v_mul_f64" => format!("{} * {}", f64v(0), f64v(1)),
-                    "v_fma_f64" => format!("fma({}, {}, {})", f64v(0), f64v(1), f64v(2)),
+                    "v_fma_f64" => format!("fma_d({}, {}, {})", f64v(0), f64v(1), f64v(2)),
                     "v_min_f64" => format!("min({}, {})", f64v(0), f64v(1)),
                     "v_max_f64" => format!("max({}, {})", f64v(0), f64v(1)),
                     "v_rcp_f64" => format!("rcp_d({})", f64v(0)),
@@ -6671,6 +6671,9 @@ uint sat_i32(int64_t r) { return select(r > (int64_t)0x7FFFFFFF, 0x7FFFFFFFu, se
 float div_fixup(float q, float d, float n) { return select(or(or(isnan(d), isnan(n)), or(d == 0.0f, or(isinf(d), isinf(n)))), n / d, q); }
 float fma_legacy(float a, float b, float c) { return (a == 0.0f || b == 0.0f) ? c : mad(a, b, c); }
 float mad_nf(float a, float b, float c) { precise float p = a * b; precise float r = p + c; return r; }
+// v_fma_f64 rounds once. Without `precise` a driver may split the fma and merge its a * b with
+// the same product elsewhere in the shader (RADV through vkd3d-proton).
+double fma_d(double a, double b, double c) { precise double r = fma(a, b, c); return r; }
 // IEEE-754 binary32 -> binary16 under RDNA2 MODE[3:2]: 0 = RNE, 1 = +inf, 2 = -inf, 3 = RTZ.
 uint f32_to_f16_rm(float f, uint rm) {
     uint x = asuint(f);

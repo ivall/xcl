@@ -8654,6 +8654,38 @@ fn gpu_nonfused_mad_and_mac_prevent_fma_contraction() {
 }
 
 #[test]
+fn gpu_v_fma_f64_stays_fused_beside_the_same_product() {
+    if !gpu_ready() {
+        return;
+    }
+    // v_fma_f64(x, x, -p) with p = x * x already rounded is the rounding error of p. A driver
+    // that splits the fma can merge its x * x with p and returns 0. Compiled with the
+    // runtime's DXC arguments (no -Gis).
+    let code = prog(&[
+        ("V_MUL_F64", "ENC_VOP3", &[("VDST", 2), ("SRC0", V), ("SRC1", V)], None),
+        ("V_FMA_F64", "ENC_VOP3", &[("VDST", 4), ("SRC0", V), ("SRC1", V), ("SRC2", V + 2), ("NEG", 4)], None),
+    ]);
+    let opt = Options { wave64: false, hw_wave: 32, ..Options::default() };
+    let t = translate(&code, &opt).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap();
+
+    let x = 1.0 + 1.0 / 32.0 + 2f64.powi(-52);
+    let mut st = KernelState::default();
+    st.sgpr[127] = 0;
+    st.vgpr[0][0] = x.to_bits() as u32;
+    st.vgpr[0][1] = (x.to_bits() >> 32) as u32;
+    let r = runner::run(&dxil, &st, &[]).unwrap();
+
+    let f = |i: usize| r.vgpr[0][i] as u64 | (r.vgpr[0][i + 1] as u64) << 32;
+    let p = x * x;
+    assert_eq!(f(2), p.to_bits(), "v_mul_f64");
+    let want = x.mul_add(x, -p);
+    assert_ne!(want, 0.0);
+    assert_eq!(f(4), want.to_bits(), "v_fma_f64: {:e} against {want:e}", f64::from_bits(f(4)));
+}
+
+#[test]
 fn gpu_f16_defaults_to_round_to_nearest_even() {
     if !gpu_ready() {
         return;
