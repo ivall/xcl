@@ -1,0 +1,20 @@
+/* XCL Controller Prompts: keyboard and mouse glyphs in the title's prompt style. Lengths at 1080p. */
+.xp-glyph{box-sizing:border-box;display:inline-flex;align-items:center;justify-content:center;height:var(--glyph-size);flex:none;
+  background:var(--prompt-ink);color:var(--glyph-legend);font-family:var(--font-label);font-weight:700;font-size:17px;line-height:1;letter-spacing:.02em;text-transform:uppercase}
+.xp-disc{width:var(--glyph-size);border-radius:var(--radius-disc);font-size:16px}
+.xp-key{min-width:var(--glyph-size);padding:0 var(--keycap-pad);border-radius:var(--radius-keycap)}
+.xp-key--arrow{font-size:12px}
+.xp-mouse{display:inline-block;width:20px;height:var(--glyph-size);flex:none}
+.xp-item{display:inline-flex;align-items:center;gap:var(--label-glyph-gap);white-space:nowrap}
+.xp-label{font-family:var(--font-label);font-weight:700;font-size:26px;line-height:27px;color:var(--prompt-ink);text-transform:uppercase}
+.xp-keys{display:inline-flex;align-items:center;gap:4px}
+.xp-item--disabled .xp-label{color:var(--disabled-fill);-webkit-text-stroke:1.5px var(--glyph-legend);paint-order:stroke fill}
+.xp-item--disabled .xp-glyph{background:var(--disabled-fill);box-shadow:0 0 0 1.5px var(--glyph-legend)}
+.xp-bar{display:flex;align-items:center;justify-content:flex-end;gap:var(--item-gap);padding:0 var(--safe-right) var(--safe-bottom) var(--safe-left)}
+.xp-bar__hint{margin-right:auto;font-family:var(--font-hint);font-size:24px;line-height:30px;color:var(--hint-ink)}
+.xp-stack{display:flex;flex-direction:column;align-items:flex-end;padding:0 var(--safe-right) var(--safe-bottom) 0}
+.xp-stack>.xp-item{height:var(--stack-pitch)}
+.xp-stack>.xp-item:last-child{height:var(--glyph-size)}
+.xp-surface-account{background:var(--surface-account)}
+.xp-surface-settings{background:linear-gradient(115deg,var(--surface-settings-light) 0 18%,var(--surface-settings) 18% 70%,var(--surface-settings-light))}
+.xp-surface-calibration{background:var(--surface-calibration)}

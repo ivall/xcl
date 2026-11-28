@@ -1,0 +1,29 @@
+/* XCL Controller Prompts — generated from tokens.json */
+:root, [data-theme="dark"] {
+  --prompt-ink: #f9f9f9;
+  --glyph-legend: #000000;
+  --hint-ink: #e6e6e6;
+  --disabled-fill: #676767;
+  --surface-account: #20202c;
+  --surface-settings: #4e3157;
+  --surface-settings-light: #613c68;
+  --surface-calibration: #3f3f3f;
+}
+:root {
+  --glyph-size: 27px;
+  --label-glyph-gap: 14px;
+  --item-gap: 21px;
+  --stack-pitch: 52px;
+  --safe-right: 40px;
+  --safe-bottom: 30px;
+  --safe-left: 35px;
+  --keycap-pad: 7px;
+  --radius-disc: 50%;
+  --radius-keycap: 6px;
+  --radius-mouse: 10px;
+  --font-label: "Barlow Condensed", "Arial Narrow", sans-serif;
+  --font-hint: "Figtree", "Segoe UI", sans-serif;
+}
+.prompt-label { font-family: var(--font-label); font-size: 26px; line-height: 27px; font-weight: 700; }
+.keycap-legend { font-family: var(--font-label); font-size: 17px; line-height: 27px; font-weight: 700; }
+.hint { font-family: var(--font-hint); font-size: 24px; line-height: 30px; font-weight: 400; }
