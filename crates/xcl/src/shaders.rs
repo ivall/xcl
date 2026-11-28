@@ -549,7 +549,7 @@ impl RecompAgg {
         }
         // `XCL_RECOMP_WINDOWS=4`: as a title with unified memory translates (`pso::mem_windows`)
         let mem_windows = std::env::var("XCL_RECOMP_WINDOWS").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
-        match recomp::translate(code, &recomp::Options { mode, wave64, mem_windows, ..Default::default() }) {
+        match recomp::translate_routed(code, &recomp::Options { mode, wave64, mem_windows, ..Default::default() }) {
             Ok(t) => {
                 let e = self.by_mode.entry(label.to_string()).or_default();
                 e.0 += 1;
@@ -1270,7 +1270,7 @@ fn measure_pso_result(input: &Input, hash: u64, repeat: usize, windows: u32, spl
         let c = recomp::pso::direct_compute(&blob, 0, windows, split).map_err(|e| Failed(format!("{name}: direct: {e}")))?;
         (c.dxil, c.samplers)
     } else {
-        let (translation, profile) = recomp::pso::console_translation(&blob, recomp::pso::Stage::Compute, 0, windows, split, false).map_err(|e| Failed(format!("{name}: {e}")))?;
+        let (translation, profile, _) = recomp::pso::console_translation(&blob, recomp::pso::Stage::Compute, 0, windows, split, false, recomp::CompactCs::get()).map_err(|e| Failed(format!("{name}: {e}")))?;
         let dxil = recomp::dxc::compile(&translation.hlsl, "main", profile, &[]).map_err(|e| Failed(format!("DXC: {e}")))?;
         (dxil, translation.static_samplers)
     };
@@ -3430,7 +3430,7 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                         // `translate_mesh`)
                         let split = if matches!(mode, recomp::Mode::Vertex(_) | recomp::Mode::Pixel(_)) { graphics_split } else { split };
                         let opt = recomp::Options { mode: mode.clone(), wave64: recomp::fssm_wave64(f, code), split_wave64: split, mem_windows: windows, ..Default::default() };
-                        let t = match recomp::translate(code, &opt) {
+                        let t = match recomp::translate_routed(code, &opt) {
                             Ok(t) if t.complete() => t,
                             Ok(_) => {
                                 if startup.is_some() { skipped.fetch_add(1, Ordering::Relaxed); }
