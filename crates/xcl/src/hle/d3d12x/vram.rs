@@ -147,6 +147,60 @@ pub fn gpu_owned(flags: u32) -> bool {
     flags & 0x7 != 0
 }
 
+/// What one of XCL's own heaps of video memory holds, for its residency priority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum HeapRole {
+    /// an arena of render targets and depth buffers (`arena_heap`)
+    TargetArena,
+    /// a tile pool of the sparse windows, which hold the title's buffers
+    WindowPool,
+    /// a 64 MiB pool of texture pages (`alloc_pool_heap`)
+    TexturePages,
+}
+
+/// The residency priority a heap of `role` gets, `None` for the default (`NORMAL`, no call).
+/// Over its video memory budget a process has heaps demoted to system memory, and Windows has
+/// no hint which matter: what a frame renders to and the title's buffers go before idle pages
+/// of textures only by chance. With them `HIGH`, the texture pages go first.
+pub(super) fn role_priority(role: HeapRole) -> Option<D3D12_RESIDENCY_PRIORITY> {
+    match role {
+        HeapRole::TargetArena | HeapRole::WindowPool => Some(D3D12_RESIDENCY_PRIORITY_HIGH),
+        HeapRole::TexturePages => None,
+    }
+}
+
+/// `XCL_RESIDENCY_PRIORITY=1` (read once, off by default): XCL's own heaps get the residency
+/// priority of their role (`role_priority`) when they are made; nothing is called per frame.
+fn residency_priority_wanted() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("XCL_RESIDENCY_PRIORITY").is_ok_and(|v| v.trim() == "1");
+        if on {
+            crate::xlog_info!("D3D12.X: XCL_RESIDENCY_PRIORITY: render-target arenas and window tile pools get HIGH residency priority, texture pages NORMAL");
+        }
+        on
+    })
+}
+
+/// Gives a new heap of `role` its residency priority when `XCL_RESIDENCY_PRIORITY=1`. A failure
+/// is logged (once) and leaves the heap at the default.
+pub(super) unsafe fn set_heap_priority(dev: &ID3D12Device, heap: &ID3D12Heap, role: HeapRole) {
+    if !residency_priority_wanted() {
+        return;
+    }
+    let Some(priority) = role_priority(role) else { return };
+    let set = dev.cast::<ID3D12Device1>().and_then(|d| {
+        let obj: ID3D12Pageable = heap.cast()?;
+        d.SetResidencyPriority(1, &Some(obj), &priority)
+    });
+    if let Err(e) = set {
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            crate::xlog_warn!("D3D12.X: XCL_RESIDENCY_PRIORITY: SetResidencyPriority ({role:?}): {e}");
+        }
+    }
+}
+
 /// A new arena's heap: `size` bytes of video memory for title addresses from `va`.
 unsafe fn arena_heap(dev: &ID3D12Device, va: usize, size: usize, align: usize) -> Option<ID3D12Heap> {
     let desc = D3D12_HEAP_DESC {
@@ -160,6 +214,9 @@ unsafe fn arena_heap(dev: &ID3D12Device, va: usize, size: usize, align: usize) -
     if let Err(e) = dev.CreateHeap(&desc, &mut heap) {
         crate::xlog_warn!("D3D12.X: video-memory arena for {va:#x}: CreateHeap: {e}");
         return None;
+    }
+    if let Some(h) = &heap {
+        set_heap_priority(dev, h, HeapRole::TargetArena);
     }
     let made = MADE_BYTES.fetch_add(size, std::sync::atomic::Ordering::Relaxed) + size;
     static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -530,6 +587,9 @@ unsafe fn alloc_pool_heap(dev: &ID3D12Device) -> Option<ID3D12Heap> {
     if let Err(e) = super::title_textures::own_work(|| dev.CreateHeap(&desc, &mut heap)) {
         crate::xlog_warn!("D3D12.X: no video memory for more pages of title textures ({e})");
         return None;
+    }
+    if let Some(h) = &heap {
+        set_heap_priority(dev, h, HeapRole::TexturePages);
     }
     heap
 }
@@ -1637,6 +1697,21 @@ mod tests {
     use std::time::{Duration, Instant};
 
     const MIB: usize = 1 << 20;
+
+    /// Render-target arenas and the windows' tile pools are kept over texture pages: they get
+    /// `HIGH`, texture pages the default (no call), and nothing gets `MAXIMUM` (the UMA upload
+    /// segment's, which every console program reads from).
+    #[test]
+    fn role_priority_keeps_targets_and_windows_over_texture_pages() {
+        assert_eq!(role_priority(HeapRole::TargetArena), Some(D3D12_RESIDENCY_PRIORITY_HIGH));
+        assert_eq!(role_priority(HeapRole::WindowPool), Some(D3D12_RESIDENCY_PRIORITY_HIGH));
+        assert_eq!(role_priority(HeapRole::TexturePages), None);
+        for role in [HeapRole::TargetArena, HeapRole::WindowPool, HeapRole::TexturePages] {
+            // (the values are unsigned: HIGH is 0xa0010000, past i32's range)
+            let p = role_priority(role).unwrap_or(D3D12_RESIDENCY_PRIORITY_NORMAL).0 as u32;
+            assert!(p >= D3D12_RESIDENCY_PRIORITY_NORMAL.0 as u32 && p < D3D12_RESIDENCY_PRIORITY_MAXIMUM.0 as u32, "{role:?}: {p:#x}");
+        }
+    }
 
     /// `remove_once_each` takes one occurrence for each time an item is named, keeps the rest
     /// (duplicates too) and items not named, and leaves the list as it was for nothing to take.

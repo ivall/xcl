@@ -1513,6 +1513,8 @@ impl State {
         }
         let heap = heap?;
         let _ = heap.SetName(windows::core::w!("xcl sparse tile pool"));
+        // (once, when made: a retired pool taken back above keeps the priority it got)
+        super::vram::set_heap_priority(&self.dev, &heap, super::vram::HeapRole::WindowPool);
         let h = self.add_pool(heap);
         Some(((h, 0), false))
     }
