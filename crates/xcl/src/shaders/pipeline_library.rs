@@ -384,7 +384,7 @@ void main() {{ output.Store(0, {n}); }}
 
     #[test]
     fn builder_deduplicates_names_and_atomically_replaces_output() {
-        let _serial = BUILD_TEST.lock().unwrap();
+        let _serial = BUILD_TEST.lock().unwrap_or_else(|e| e.into_inner());
         let Some((pipelines, dxil, root)) = fixture() else { return };
         let desc = compute_desc(&dxil, &root);
         let pso = unsafe { pipelines.dev.CreateComputePipelineState::<ID3D12PipelineState>(&desc) }
@@ -426,7 +426,7 @@ void main() {{ output.Store(0, {n}); }}
 
     #[test]
     fn graphics_pipeline_round_trips_through_serialized_library() {
-        let _serial = BUILD_TEST.lock().unwrap();
+        let _serial = BUILD_TEST.lock().unwrap_or_else(|e| e.into_inner());
         let Some((pipelines, _, _)) = fixture() else { return };
         let source = r#"
 #define RS ""
@@ -490,7 +490,7 @@ struct V { float4 p : SV_Position; };
 
     #[test]
     fn mesh_pipeline_round_trips_through_serialized_library() {
-        let _serial = BUILD_TEST.lock().unwrap();
+        let _serial = BUILD_TEST.lock().unwrap_or_else(|e| e.into_inner());
         let Some((pipelines, _, _)) = fixture() else { return };
         let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
         if unsafe {

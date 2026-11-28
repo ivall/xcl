@@ -230,7 +230,7 @@ mod tests {
             ..Default::default()
         };
         let pso = unsafe { pipelines.dev.CreateComputePipelineState::<ID3D12PipelineState>(&desc) }.unwrap();
-        let _serial = super::super::pipeline_library::BUILD_TEST.lock().unwrap();
+        let _serial = super::super::pipeline_library::BUILD_TEST.lock().unwrap_or_else(|e| e.into_inner());
         super::super::pipeline_library::abort();
         assert!(super::super::pipeline_library::begin(&pipelines.dev, None).unwrap());
         super::super::pipeline_library::store("fixture.pso".into(), &pso).unwrap();
