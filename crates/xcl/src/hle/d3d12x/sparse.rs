@@ -1198,6 +1198,7 @@ impl State {
 /// 4 GiB window boundary when `size <= 4 GiB`). Commits the CPU pages and maps VRAM tiles
 /// (or queues them until the D3D12 device exists). Returns `(address, rounded_size)`.
 pub unsafe fn alloc(size: usize, align: usize) -> Option<(usize, usize)> {
+    reclaim_released_blocks();
     let u = crate::gpu::uma::get()?;
     let (addr, rounded) = u.sparse_alloc(size, align)?;
     if VirtualAlloc(addr as *const c_void, rounded, MEM_COMMIT, PAGE_READWRITE).is_null() {
@@ -1211,6 +1212,7 @@ pub unsafe fn alloc(size: usize, align: usize) -> Option<(usize, usize)> {
 /// Allocate a zeroed, write-watched block strictly inside sparse window `window` (e.g.
 /// window 0 for 32-bit-addressed descriptor heaps). Returns `(address, rounded_size)`.
 pub unsafe fn alloc_in(window: usize, size: usize, align: usize) -> Option<(usize, usize)> {
+    reclaim_released_blocks();
     let u = crate::gpu::uma::get()?;
     let (addr, rounded) = u.sparse_alloc_in(window, size, align)?;
     if VirtualAlloc(addr as *const c_void, rounded, MEM_COMMIT, PAGE_READWRITE).is_null() {
@@ -1233,6 +1235,38 @@ pub unsafe fn free(p: usize) -> bool {
     decommitted(start, len);
     VirtualFree(p as *mut c_void, len, MEM_DECOMMIT);
     u.sparse_release(p).is_some()
+}
+
+/// Blocks from `alloc` / `alloc_in` whose resource or heap had its last Release, decommitted
+/// and given back by the next `reclaim_released_blocks`. Held only to push or take, never across
+/// a call out.
+static RELEASED_BLOCKS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+/// Held while `reclaim_released_blocks` gives blocks back: a caller that finds the queue empty
+/// because another thread took the blocks waits until they are back, so its allocation can use
+/// their addresses.
+static RECLAIMING: Mutex<()> = Mutex::new(());
+
+/// The last Release of a resource or heap whose memory is block `p` from `alloc` / `alloc_in`.
+/// D3D12 can make that Release inside a call of its own on another thread, and `before_execute`
+/// calls D3D12 with `STATE` held: `free` waits for `STATE` (`decommitted`), so the two threads
+/// would wait for each other. The block is queued instead. It stays reserved and committed until
+/// `reclaim_released_blocks` decommits it and gives it back, so its address is not handed out
+/// again before then.
+pub fn release_owned_block(p: usize) {
+    RELEASED_BLOCKS.lock().unwrap().push(p);
+}
+
+/// The blocks `release_owned_block` queued, decommitted and given back (`free`). Called by
+/// `alloc`, `alloc_in` and `before_execute`, without `STATE` held and outside any D3D12 callback.
+unsafe fn reclaim_released_blocks() {
+    let _one = RECLAIMING.lock().unwrap();
+    let blocks = std::mem::take(&mut *RELEASED_BLOCKS.lock().unwrap());
+    for p in blocks {
+        if !free(p) {
+            crate::xlog_warn!("sparse windows: released block at {p:#x} is not a sparse allocation");
+        }
+    }
 }
 
 /// After `queue.ExecuteCommandLists`: copy GPU-written sparse ranges (e.g. `Write32/64`,
@@ -1552,6 +1586,7 @@ pub fn note_watch(t: std::time::Duration, pages: usize) {
 /// pages from the write-watch, sorted) and the reused tiles are copied asynchronously into video
 /// memory, and `queue` GPU-waits for that and for new tile mappings.
 pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: usize) {
+    reclaim_released_blocks();
     let t0 = std::time::Instant::now();
     let mut g = lock_state();
     let Some(s) = g.as_mut() else { return };
@@ -1807,6 +1842,69 @@ mod tests {
         assert!(returns_while_the_state_is_held(|| forget_buffer(RES)), "forget_buffer waited for the sparse state's lock");
         drop(lock_state());
         assert!(!FORGOTTEN.lock().unwrap().contains(&RES));
+    }
+
+    /// The last Release of a resource or heap over a block from `alloc`, while another thread
+    /// holds the sparse state: the release does not wait for the state, and the block keeps its
+    /// address and its memory until `reclaim_released_blocks` decommits it and gives it back.
+    #[test]
+    fn an_owned_block_released_while_the_state_is_held_does_not_wait_for_it() {
+        let Some(u) = crate::gpu::uma::get().filter(|u| u.has_sparse()) else { return };
+        // 7 tiles: a size no other test asks for, so a reservation of it at `p` is this block
+        let Some((p, n)) = (unsafe { alloc(7 * TILE, TILE) }) else { return };
+        unsafe { std::ptr::write_volatile(p as *mut u64, 0x5eed) };
+        {
+            // no other thread gives the block back meanwhile (their allocations wait here)
+            let _no_reclaim = RECLAIMING.lock().unwrap();
+            assert!(returns_while_the_state_is_held(move || release_owned_block(p)), "release_owned_block waited for the sparse state's lock");
+            assert!(RELEASED_BLOCKS.lock().unwrap().contains(&p));
+            assert_eq!(u.sparse_reservation(p), Some((p, n)), "a released block's address went back before it was decommitted");
+            assert_eq!(unsafe { query_tile_holes(p) }, 0, "a released block was decommitted outside reclaim_released_blocks");
+            assert_eq!(unsafe { std::ptr::read_volatile(p as *const u64) }, 0x5eed);
+        }
+        unsafe { reclaim_released_blocks() };
+        assert!(!RELEASED_BLOCKS.lock().unwrap().contains(&p));
+        assert_ne!(u.sparse_reservation(p), Some((p, n)), "the released block was not given back");
+    }
+
+    /// A buffer's and a heap's last Release (`res_release`, `mem_heap_release`; D3D12 can make
+    /// them inside a call of its own) while another thread holds the sparse state: neither waits
+    /// for the state to free its block from `alloc`, and the next reclaim gives both blocks back.
+    #[test]
+    fn a_buffer_or_heap_released_while_the_state_is_held_does_not_wait_to_free_its_block() {
+        use super::super::real;
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+
+        let Some(u) = crate::gpu::uma::get().filter(|u| u.has_sparse()) else { return };
+        unsafe {
+            let Ok(dev) = crate::gpu::agility::create_device(None, D3D_FEATURE_LEVEL_11_0) else {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            };
+            let props = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+            let mut buffer: Option<ID3D12Resource> = None;
+            dev.CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &buffer_desc(TILE as u64), D3D12_RESOURCE_STATE_COMMON, None, &mut buffer).expect("buffer");
+            let buffer = buffer.expect("buffer");
+            let mut heap: Option<ID3D12Heap> = None;
+            let heap_desc = D3D12_HEAP_DESC { SizeInBytes: TILE as u64, Properties: props, Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS, ..Default::default() };
+            dev.CreateHeap(&heap_desc, &mut heap).expect("heap");
+            let heap = heap.expect("heap");
+            real::adopt(buffer.as_raw(), real::Kind::Resource);
+            real::adopt(heap.as_raw(), real::Kind::Heap);
+            // 9 and 11 tiles: sizes no other test asks for, so a reservation of one at its
+            // address is that block
+            let (b, bn) = alloc(9 * TILE, TILE).expect("a block for the buffer");
+            let (h, hn) = alloc(11 * TILE, TILE).expect("a block for the heap");
+            real::note_owned_buffer_for_test(buffer.as_raw() as usize, b, bn);
+            real::note_heap_block_for_test(heap.as_raw() as usize, h, hn);
+            let released = returns_while_the_state_is_held(move || {
+                drop(buffer);
+                drop(heap);
+            });
+            assert!(released, "a last Release waited for the sparse state's lock to free its block");
+            reclaim_released_blocks();
+            assert_ne!(u.sparse_reservation(b), Some((b, bn)), "the buffer's block was not given back");
+            assert_ne!(u.sparse_reservation(h), Some((h, hn)), "the heap's block was not given back");
+        }
     }
 
 

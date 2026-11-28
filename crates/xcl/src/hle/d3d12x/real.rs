@@ -177,6 +177,11 @@ static UMA_HEAPS: Mutex<Vec<Option<usize>>> = Mutex::new(Vec::new());
 type UmaBuffer = (usize, usize, bool);
 static UMA_BUFFERS: Mutex<Option<HashMap<usize, UmaBuffer>>> = Mutex::new(None);
 
+#[cfg(test)]
+pub(super) fn note_owned_buffer_for_test(res: usize, p: usize, bytes: usize) {
+    UMA_BUFFERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(res, (p, bytes, true));
+}
+
 /// Where a console-created buffer lives in unified memory (its console GPU address).
 pub fn console_buffer(res: usize) -> Option<(usize, usize)> {
     UMA_BUFFERS.lock().unwrap().as_ref()?.get(&res).map(|&(p, n, _)| (p, n))
@@ -1713,7 +1718,7 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
         let gone = UMA_BUFFERS.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize)));
         if let (Some((p, _, true)), Some(u)) = (gone, crate::gpu::uma::get()) {
             if u.is_sparse(p) {
-                super::sparse::free(p);
+                super::sparse::release_owned_block(p);
             } else {
                 u.free(p);
             }
@@ -3459,6 +3464,12 @@ struct HeapUma {
 /// DEFAULT/UPLOAD/CUSTOM heaps, coherent committed window for small explicit READBACK heaps)
 static HEAP_UMA: Mutex<Option<HashMap<usize, HeapUma>>> = Mutex::new(None);
 
+#[cfg(test)]
+pub(super) fn note_heap_block_for_test(heap: usize, p: usize, bytes: usize) {
+    let e = HeapUma { size: bytes, align: 0x1_0000, prefer_coherent: false, cpu_readback: false, block: Some(p) };
+    HEAP_UMA.lock().unwrap().get_or_insert_with(HashMap::new).insert(heap, e);
+}
+
 /// A heap the title made that may hold buffers: a block of unified memory as large stands for
 /// it. On the console every heap is memory the CPU and the GPU address alike, and console code
 /// reads buffers (root descriptors, V#s) from that memory – a PC heap's buffer has a GPU
@@ -3564,7 +3575,7 @@ unsafe extern "system" fn mem_heap_release(this: *mut c_void) -> u32 {
         let gone = HEAP_UMA.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize))).and_then(|e| e.block);
         if let (Some(p), Some(u)) = (gone, crate::gpu::uma::get()) {
             if u.is_sparse(p) {
-                super::sparse::free(p);
+                super::sparse::release_owned_block(p);
             } else {
                 u.free(p);
             }
