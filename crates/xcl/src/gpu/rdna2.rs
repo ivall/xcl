@@ -5,7 +5,6 @@
 //! encoding identification, literal constants, SDWA/DPP extension dwords and MIMG NSA.
 //! It is the first stage of the shader recompiler (console microcode → PC shaders).
 
-use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::sync::OnceLock;
 
@@ -92,12 +91,18 @@ pub struct Decoded {
     pub far_target: Option<u64>,
 }
 
+/// A primary encoding the decoder tries, with its instructions indexed by opcode.
+struct Primary {
+    enc: usize,
+    /// the OP field; `None` for encodings without one (EXP), whose single instruction is `insts[0]`
+    op: Option<&'static Field>,
+    /// instruction (and its encoding index) per opcode value, `1 << width(OP)` entries
+    insts: Vec<Option<(&'static Inst, usize)>>,
+}
+
 struct Tables {
     /// primary encodings ordered by spec priority
-    primary: Vec<usize>,
-    by_op: HashMap<(usize, u16), (&'static Inst, usize)>,
-    /// encodings without an OP field (EXP) → their single instruction
-    no_op: HashMap<usize, (&'static Inst, usize)>,
+    primary: Vec<Primary>,
 }
 
 /// Every instruction the decoder knows: the RDNA2 spec first, then the console
@@ -109,51 +114,71 @@ pub fn all_instructions() -> impl Iterator<Item = &'static Inst> {
 fn tables() -> &'static Tables {
     static T: OnceLock<Tables> = OnceLock::new();
     T.get_or_init(|| {
-        let mut primary: Vec<usize> = (0..ENCODINGS.len()).filter(|&i| ENCODINGS[i].primary).collect();
-        primary.sort_by_key(|&i| ENCODINGS[i].order);
-        let mut by_op = HashMap::new();
-        let mut no_op = HashMap::new();
+        let mut order: Vec<usize> = (0..ENCODINGS.len()).filter(|&i| ENCODINGS[i].primary).collect();
+        order.sort_by_key(|&i| ENCODINGS[i].order);
+        let mut primary: Vec<Primary> = order
+            .into_iter()
+            .map(|enc| {
+                let op = ENCODINGS[enc].field("OP");
+                let width = op.map_or(0, |_| ENCODINGS[enc].field_width("OP"));
+                Primary { enc, op, insts: vec![None; 1 << width] }
+            })
+            .collect();
+        // the first instruction to claim an opcode keeps it (spec before console extensions)
         for inst in all_instructions() {
-            for (ei, e) in inst.encs.iter().enumerate() {
-                by_op.entry((e.encoding as usize, e.opcode)).or_insert((inst, ei));
-                if ENCODINGS[e.encoding as usize].field("OP").is_none() {
-                    no_op.entry(e.encoding as usize).or_insert((inst, ei));
+            for (ie, e) in inst.encs.iter().enumerate() {
+                let Some(p) = primary.iter_mut().find(|p| p.enc == e.encoding as usize) else { continue };
+                let slot = if p.op.is_some() { e.opcode as usize } else { 0 };
+                if let Some(s @ None) = p.insts.get_mut(slot) {
+                    *s = Some((inst, ie));
                 }
             }
         }
-        Tables { primary, by_op, no_op }
+        Tables { primary }
     })
 }
 
+/// `cnt` (at most 64) bits of the little-endian bit stream `words` from bit `off`; bits
+/// past the last word read as zero. Takes whole runs of a word at a time.
 fn bits(words: &[u32], off: u32, cnt: u32) -> u64 {
+    debug_assert!(cnt <= 64);
     let mut v = 0u64;
-    for i in 0..cnt {
-        let b = off + i;
-        let w = words.get((b / 32) as usize).copied().unwrap_or(0);
-        v |= (((w >> (b % 32)) & 1) as u64) << i;
+    let mut got = 0u32;
+    while got < cnt {
+        let b = off + got;
+        let w = words.get((b / 32) as usize).copied().unwrap_or(0) as u64;
+        let take = (32 - b % 32).min(cnt - got);
+        v |= ((w >> (b % 32)) & ((1u64 << take) - 1)) << got;
+        got += take;
     }
     v
 }
 
 pub fn field_value(enc: &Encoding, words: &[u32], name: &str) -> Option<u64> {
-    let f = enc.field(name)?;
+    Some(field_bits(enc.field(name)?, words))
+}
+
+fn field_bits(f: &Field, words: &[u32]) -> u64 {
     let mut v = 0u64;
     let mut shift = 0u32;
     for &(off, cnt) in f.ranges {
         v |= bits(words, off as u32, cnt as u32) << shift;
         shift += cnt as u32;
     }
-    Some(v)
+    v
 }
 
-fn read_words(code: &[u8], n: usize) -> Vec<u32> {
-    (0..n)
-        .map(|i| {
-            code.get(i * 4..i * 4 + 4)
-                .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-                .unwrap_or(0)
-        })
-        .collect()
+/// Dwords of the widest encoding (160 bits); the decoder reads a candidate's fixed bits,
+/// opcode and source fields from them before it knows the instruction's length.
+const HEAD_WORDS: usize = 5;
+
+/// The first `HEAD_WORDS` dwords of `code`, zero past its last whole dword.
+fn read_head(code: &[u8]) -> [u32; HEAD_WORDS] {
+    let mut head = [0u32; HEAD_WORDS];
+    for (w, b) in head.iter_mut().zip(code.as_chunks::<4>().0) {
+        *w = u32::from_le_bytes(*b);
+    }
+    head
 }
 
 /// Operand types that are encoded as a scalar/vector source code and therefore can
@@ -177,21 +202,19 @@ pub fn decode(code: &[u8], pc: u64) -> Result<Decoded, DecodeError> {
     if code.len() < 4 {
         return Err(DecodeError::Truncated);
     }
-    let head = read_words(code, 2);
+    let words = read_head(code);
+    let head = &words[..2];
     let raw64 = head[0] as u64 | (head[1] as u64) << 32;
     let t = tables();
     let mut found = None;
-    for &ei in &t.primary {
-        let enc = &ENCODINGS[ei];
+    for p in &t.primary {
+        let enc = &ENCODINGS[p.enc];
         if raw64 & enc.fixed_mask != enc.fixed_value {
             continue;
         }
-        let hit = match field_value(enc, &head, "OP") {
-            Some(op) => t.by_op.get(&(ei, op as u16)),
-            None => t.no_op.get(&ei),
-        };
-        if let Some(&(inst, ie)) = hit {
-            found = Some((ei, inst, ie));
+        let slot = p.op.map_or(0, |f| field_bits(f, head) as usize);
+        if let Some(&(inst, ie)) = p.insts[slot].as_ref() {
+            found = Some((p.enc, inst, ie));
             break;
         }
     }
@@ -199,13 +222,13 @@ pub fn decode(code: &[u8], pc: u64) -> Result<Decoded, DecodeError> {
     let enc = &ENCODINGS[ei];
     let ienc = &inst.encs[ie];
     let base = enc.bits as usize / 8;
-    let base_words = read_words(code, base / 4);
+    let base_words = &words[..base / 4];
 
     let mut variant = Variant::Plain;
     let mut extra = 0usize;
     let mut has_literal = inst.always_literal;
     if is_valu32(enc) {
-        match field_value(enc, &base_words, "SRC0") {
+        match field_value(enc, base_words, "SRC0") {
             Some(0xF9) => variant = Variant::Sdwa,
             Some(0xFA) => variant = Variant::Dpp16,
             Some(0xE9) | Some(0xEA) => variant = Variant::Dpp8,
@@ -219,25 +242,25 @@ pub fn decode(code: &[u8], pc: u64) -> Result<Decoded, DecodeError> {
         has_literal = ienc.operands.iter().any(|o| {
             !o.implicit
                 && is_src_type(o.ty)
-                && o.field.and_then(|f| field_value(enc, &base_words, f)) == Some(255)
+                && o.field.and_then(|f| field_value(enc, base_words, f)) == Some(255)
         });
         // VALU: the literal is fetched whenever a source field selects it, even one the
         // opcode does not read – console compilers hide the shader hash in v_nop literals
         if !has_literal && is_valu(enc) {
-            has_literal = ["SRC0", "SRC1", "SRC2"].iter().any(|f| field_value(enc, &base_words, f) == Some(255));
+            has_literal = ["SRC0", "SRC1", "SRC2"].iter().any(|f| field_value(enc, base_words, f) == Some(255));
         }
     }
     if has_literal {
         extra += 4;
     }
     if enc.name == "ENC_MIMG" {
-        extra += 4 * field_value(enc, &base_words, "NSA").unwrap_or(0) as usize;
+        extra += 4 * field_value(enc, base_words, "NSA").unwrap_or(0) as usize;
     }
     let len = base + extra;
     if code.len() < len {
         return Err(DecodeError::Truncated);
     }
-    let words = read_words(code, len / 4);
+    let words: Vec<u32> = code[..len].as_chunks::<4>().0.iter().map(|b| u32::from_le_bytes(*b)).collect();
     let literal = has_literal.then(|| words[base / 4]);
     Ok(Decoded { pc, inst, ienc, enc, words, len, literal, variant, far_target: None })
 }
@@ -870,6 +893,7 @@ pub fn find_programs(blob: &[u8]) -> Vec<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     fn dis(bytes: &[u8]) -> String {
         format(&decode(bytes, 0).unwrap())
@@ -1290,5 +1314,153 @@ mod tests {
         }
         assert!(total > 2500 && modified > 250, "the SDWA tests are not all there: {total} lines, {modified} with source or output modifiers");
         assert!(wrong.is_empty(), "{} of {total} SDWA lines differ from LLVM's, the first: {:?}", wrong.len(), &wrong[..wrong.len().min(8)]);
+    }
+
+    #[test]
+    fn opcode_tables_match_first_claim_lookup() {
+        // reference: the first instruction (spec, then console) listing an (encoding, opcode)
+        let mut first: HashMap<(usize, usize), *const Inst> = HashMap::new();
+        for inst in all_instructions() {
+            for e in inst.encs {
+                let enc = e.encoding as usize;
+                let slot = if ENCODINGS[enc].field("OP").is_some() { e.opcode as usize } else { 0 };
+                first.entry((enc, slot)).or_insert(inst as *const Inst);
+            }
+        }
+        let t = tables();
+        let mut filled = 0;
+        for p in &t.primary {
+            for (slot, hit) in p.insts.iter().enumerate() {
+                assert_eq!(hit.map(|(i, _)| i as *const Inst), first.get(&(p.enc, slot)).copied(), "{} op {slot}", ENCODINGS[p.enc].name);
+                if let Some((inst, ie)) = hit {
+                    assert_eq!(inst.encs[*ie].encoding as usize, p.enc);
+                    filled += 1;
+                }
+            }
+        }
+        assert!(filled > 1000, "only {filled} opcodes");
+    }
+
+    /// The bit-at-a-time extraction `bits` replaced, kept as the reference.
+    fn bits_one_at_a_time(words: &[u32], off: u32, cnt: u32) -> u64 {
+        let mut v = 0u64;
+        for i in 0..cnt {
+            let b = off + i;
+            let w = words.get((b / 32) as usize).copied().unwrap_or(0);
+            v |= (((w >> (b % 32)) & 1) as u64) << i;
+        }
+        v
+    }
+
+    #[test]
+    fn bits_matches_one_at_a_time() {
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x as u32
+        };
+        for len in 0..=6usize {
+            for _ in 0..64 {
+                let words: Vec<u32> = (0..len).map(|_| next()).collect();
+                // past the end too: those bits read as zero
+                for off in 0..(len as u32 * 32 + 40) {
+                    for cnt in 0..=64 {
+                        assert_eq!(bits(&words, off, cnt), bits_one_at_a_time(&words, off, cnt), "{words:x?} off {off} cnt {cnt}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn field_value_matches_one_at_a_time_for_every_field() {
+        let words = [0xDEAD_BEEFu32, 0x0123_4567, 0x89AB_CDEF, 0xF0F0_0F0F, 0x5A5A_A5A5];
+        for enc in ENCODINGS.iter() {
+            for f in enc.fields {
+                let mut want = 0u64;
+                let mut shift = 0u32;
+                for &(off, cnt) in f.ranges {
+                    want |= bits_one_at_a_time(&words, off as u32, cnt as u32) << shift;
+                    shift += cnt as u32;
+                }
+                assert_eq!(field_value(enc, &words, f.name), Some(want), "{} {}", enc.name, f.name);
+            }
+        }
+    }
+
+    #[test]
+    fn decoded_words_are_the_instruction_dwords() {
+        for b in llvm_corpus_bytes() {
+            let Ok(d) = decode(&b, 0) else { continue };
+            let want: Vec<u32> = b[..d.len].as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c)).collect();
+            assert_eq!(d.words, want, "{b:02x?}");
+            if let Some(l) = d.literal {
+                assert_eq!(Some(&l), d.words.get(d.enc.bits as usize / 32), "{b:02x?}");
+            }
+        }
+        // a trailing partial dword is not part of a 4-byte instruction
+        let d = decode(&[0x01, 0x03, 0x80, 0xbe, 0xaa, 0xbb], 0).unwrap();
+        assert_eq!((d.len, d.words.as_slice()), (4, &[0xbe80_0301u32][..]));
+    }
+
+    /// Every instruction encoding in LLVM's gfx10 disassembler tests, as raw bytes.
+    fn llvm_corpus_bytes() -> Vec<Vec<u8>> {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/data/llvm-amdgpu");
+        let mut out = Vec::new();
+        for e in std::fs::read_dir(&dir).expect("tests/data/llvm-amdgpu") {
+            let p = e.unwrap().path();
+            if p.extension().map(|x| x != "txt").unwrap_or(true) {
+                continue;
+            }
+            for line in std::fs::read_to_string(&p).unwrap().lines() {
+                let Some((_, enc)) = line.split_once("; encoding: [") else { continue };
+                let Some(enc) = enc.split(']').next() else { continue };
+                let bytes: Vec<u8> = enc
+                    .split(',')
+                    .filter_map(|b| u8::from_str_radix(b.trim().trim_start_matches("0x"), 16).ok())
+                    .collect();
+                if bytes.len() >= 4 {
+                    out.push(bytes);
+                }
+            }
+        }
+        out
+    }
+
+    /// Release microbenchmark: decode the LLVM corpus and read every operand field, as the
+    /// recompiler does per instruction.
+    /// `cargo test --release -p xcl --lib rdna2::tests::bench_decode -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn bench_decode() {
+        let corpus = llvm_corpus_bytes();
+        let (runs, rounds) = (15, 8);
+        let mut sink = 0u64;
+        let mut best = std::time::Duration::MAX;
+        for _ in 0..runs {
+            let t0 = std::time::Instant::now();
+            for _ in 0..rounds {
+                for b in &corpus {
+                    if let Ok(d) = decode(std::hint::black_box(b), 0) {
+                        sink = sink.wrapping_add(d.len as u64);
+                        for o in d.ienc.operands {
+                            if let Some(f) = o.field {
+                                sink = sink.wrapping_add(field_value(d.enc, &d.words, f).unwrap_or(0));
+                            }
+                        }
+                    }
+                }
+            }
+            best = best.min(t0.elapsed());
+        }
+        let n = (rounds * corpus.len()) as f64;
+        println!(
+            "bench_decode: {} instructions x {rounds}, best of {runs}: {:.2} ms, {:.1} ns/instruction (sink {sink})",
+            corpus.len(),
+            best.as_secs_f64() * 1e3,
+            best.as_secs_f64() * 1e9 / n
+        );
     }
 }
