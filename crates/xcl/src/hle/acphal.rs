@@ -711,8 +711,15 @@ struct XApuStream {
     active: bool,
 }
 
+#[derive(Default)]
+struct XApuResults {
+    queue: VecDeque<XApuResult>,
+    enqueued: u32,
+    dequeued: u32,
+}
+
 struct XApu {
-    results: Mutex<VecDeque<XApuResult>>,
+    results: Mutex<XApuResults>,
     channels: Mutex<Vec<XApuStream>>,
     data: usize,
     ready: usize,
@@ -775,7 +782,7 @@ where
         return E_OUTOFMEMORY;
     }
     channels.resize_with(n_streams, || XApuStream { channels: 2, decoder: None, active: false });
-    let x = Box::new(XApu { results: Mutex::new(VecDeque::new()), channels: Mutex::new(channels), data, ready, frames_per_output: i.frames_per_output });
+    let x = Box::new(XApu { results: Mutex::new(XApuResults::default()), channels: Mutex::new(channels), data, ready, frames_per_output: i.frames_per_output });
     std::ptr::write_unaligned(output, XApuConnectOutput { data: data as *mut c_void, ready: ready as *mut c_void });
     *handle = Box::into_raw(x) as *mut c_void;
     let (process, streams) = (i.process, i.streams);
@@ -881,7 +888,7 @@ pub unsafe extern "system" fn XApuDisconnect(handle: *mut c_void) -> HRESULT {
     S_OK
 }
 
-/// XApuEnqueueCommand(handle, &command, &results waiting): done at once – a Process command
+/// XApuEnqueueCommand(handle, &command, &enqueued total): done at once – a Process command
 /// decodes its Opus packet into the output buffer (silence of the length asked for where there is
 /// nothing to decode)
 pub unsafe extern "system" fn XApuEnqueueCommand(handle: *mut c_void, command: *const XApuCommand, count: *mut u32) -> HRESULT {
@@ -955,13 +962,14 @@ pub unsafe extern "system" fn XApuEnqueueCommand(handle: *mut c_void, command: *
             report_progress();
         }
     }
-    let n = {
-        let mut q = x.results.lock().unwrap();
-        q.push_back(r);
-        q.len() as u32
+    let total_enqueued = {
+        let mut st = x.results.lock().unwrap();
+        st.queue.push_back(r);
+        st.enqueued = st.enqueued.wrapping_add(1);
+        st.enqueued
     };
     if !count.is_null() {
-        *count = n;
+        *count = total_enqueued;
     }
     if x.ready != 0 && c.options & 1 != 0 {
         SetEvent(x.ready as _);
@@ -975,7 +983,15 @@ pub unsafe extern "system" fn XApuDequeueResult(handle: *mut c_void, result: *mu
         return E_INVALIDARG;
     }
     trace_command("xapu-dequeue", 0);
-    match (*(handle as *const XApu)).results.lock().unwrap().pop_front() {
+    let popped = {
+        let mut st = (*(handle as *const XApu)).results.lock().unwrap();
+        let r = st.queue.pop_front();
+        if r.is_some() {
+            st.dequeued = st.dequeued.wrapping_add(1);
+        }
+        r
+    };
+    match popped {
         Some(r) => {
             std::ptr::write_unaligned(result, r);
             S_OK
@@ -984,16 +1000,19 @@ pub unsafe extern "system" fn XApuDequeueResult(handle: *mut c_void, result: *mu
     }
 }
 
-/// XApuGetResultCount(handle, &count) -> count
+/// XApuGetResultCount(handle, &dequeued total) -> pending results
 pub unsafe extern "system" fn XApuGetResultCount(handle: *mut c_void, total: *mut u32) -> u32 {
     if handle.is_null() {
         return 0;
     }
-    let n = (*(handle as *const XApu)).results.lock().unwrap().len() as u32;
+    let (pending, dequeued) = {
+        let st = (*(handle as *const XApu)).results.lock().unwrap();
+        (st.queue.len() as u32, st.dequeued)
+    };
     if !total.is_null() {
-        *total = n;
+        *total = dequeued;
     }
-    n
+    pending
 }
 
 /// XApuGetUtilization(…, &utilization): streams available and the most there can be
@@ -1306,6 +1325,93 @@ mod tests {
             let mut mbi: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
             assert_ne!(VirtualQuery(allocated_ptr as *const c_void, &mut mbi, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()), 0);
             assert_eq!(mbi.State, MEM_FREE, "data buffer must be released when event creation fails");
+        }
+    }
+
+    #[test]
+    fn xapu_enqueue_and_result_count_report_cumulative_totals() {
+        unsafe {
+            let input = XApuConnectInput { process: 1, streams: 2, commands_per_stream: 4, data_bytes: 0, frames_per_output: 256, options: 0 };
+            let mut out = XApuConnectOutput { data: std::ptr::null_mut(), ready: std::ptr::null_mut() };
+            let mut h = std::ptr::null_mut();
+            assert_eq!(XApuConnect(&input, &mut out, &mut h), S_OK);
+
+            let cmd = |sequence: u32| XApuCommand { kind: XAPU_DEACTIVATE, stream: 0, sequence, options: 0, context: std::ptr::null_mut() };
+
+            // Initial state: 0 pending, 0 dequeued.
+            let mut total = 0xDEAD_BEEFu32;
+            assert_eq!(XApuGetResultCount(h, &mut total), 0);
+            assert_eq!(total, 0);
+
+            // Enqueue 2 commands: *count tracks cumulative enqueued (1, then 2); total dequeued stays 0.
+            let (mut count, c1, c2) = (0u32, cmd(1), cmd(2));
+            assert_eq!(XApuEnqueueCommand(h, &c1, &mut count), S_OK);
+            assert_eq!(count, 1);
+            assert_eq!(XApuEnqueueCommand(h, &c2, &mut count), S_OK);
+            assert_eq!(count, 2);
+            assert_eq!(XApuGetResultCount(h, &mut total), 2);
+            assert_eq!(total, 0);
+
+            // Dequeue 1st result: 1 pending, 1 dequeued.
+            let mut res: XApuResult = std::mem::zeroed();
+            assert_eq!(XApuDequeueResult(h, &mut res), S_OK);
+            assert_eq!({ res.id.sequence }, 1);
+            assert_eq!(XApuGetResultCount(h, &mut total), 1);
+            assert_eq!(total, 1);
+
+            // Dequeue 2nd result: 0 pending, 2 dequeued.
+            assert_eq!(XApuDequeueResult(h, &mut res), S_OK);
+            assert_eq!({ res.id.sequence }, 2);
+            assert_eq!(XApuGetResultCount(h, &mut total), 0);
+            assert_eq!(total, 2);
+
+            // Empty dequeue returns XAPU_NO_RESULTS and must not increment dequeued total.
+            assert_eq!(XApuDequeueResult(h, &mut res), XAPU_NO_RESULTS);
+            assert_eq!(XApuGetResultCount(h, &mut total), 0);
+            assert_eq!(total, 2);
+
+            // Enqueue 3rd command: *count is cumulative 3 (not queue len 1); pending 1, dequeued 2.
+            let c3 = cmd(3);
+            assert_eq!(XApuEnqueueCommand(h, &c3, &mut count), S_OK);
+            assert_eq!(count, 3);
+            assert_eq!(XApuGetResultCount(h, &mut total), 1);
+            assert_eq!(total, 2);
+
+            // Null optional out-parameters and null handle stay safe.
+            let c4 = cmd(4);
+            assert_eq!(XApuEnqueueCommand(h, &c4, std::ptr::null_mut()), S_OK);
+            assert_eq!(XApuGetResultCount(h, std::ptr::null_mut()), 2);
+            let mut untouched = 0xCAFE_BABEu32;
+            assert_eq!(XApuGetResultCount(std::ptr::null_mut(), &mut untouched), 0);
+            assert_eq!(untouched, 0xCAFE_BABE);
+            assert_eq!(XApuEnqueueCommand(std::ptr::null_mut(), &c4, &mut count), E_INVALIDARG);
+            assert_eq!(XApuDequeueResult(h, std::ptr::null_mut()), E_INVALIDARG);
+
+            assert_eq!(XApuDisconnect(h), S_OK);
+        }
+    }
+
+    #[test]
+    fn xapu_cumulative_counters_wrap_at_u32_max() {
+        unsafe {
+            let input = XApuConnectInput { process: 1, streams: 1, commands_per_stream: 2, data_bytes: 0, frames_per_output: 256, options: 0 };
+            let mut out = XApuConnectOutput { data: std::ptr::null_mut(), ready: std::ptr::null_mut() };
+            let mut h = std::ptr::null_mut();
+            assert_eq!(XApuConnect(&input, &mut out, &mut h), S_OK);
+            {
+                let mut st = (*(h as *const XApu)).results.lock().unwrap();
+                st.enqueued = u32::MAX;
+                st.dequeued = u32::MAX;
+            }
+            let cmd = XApuCommand { kind: XAPU_DEACTIVATE, stream: 0, sequence: 1, options: 0, context: std::ptr::null_mut() };
+            let (mut count, mut total) = (123u32, 456u32);
+            assert_eq!(XApuEnqueueCommand(h, &cmd, &mut count), S_OK);
+            assert_eq!(count, 0);
+            let mut res: XApuResult = std::mem::zeroed();
+            assert_eq!(XApuDequeueResult(h, &mut res), S_OK);
+            assert_eq!(XApuGetResultCount(h, &mut total), 0);
+            assert_eq!(total, 0);
+            assert_eq!(XApuDisconnect(h), S_OK);
         }
     }
 }
