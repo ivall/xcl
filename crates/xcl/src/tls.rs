@@ -248,9 +248,54 @@ unsafe fn fill_block(block: *mut u8, img: &TlsImage) {
 /// The slot xcl.exe's own TLS moved to when the title's executable took slot 0 (NO_INDEX: not
 /// moved).
 static XCL_SLOT: AtomicU32 = AtomicU32::new(NO_INDEX);
-/// TEBs of the threads whose slots were exchanged by `take_slot_zero` itself (their TLS
-/// callback, if it still comes, leaves them as they are); held during the exchange
-static MOVED: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+struct ThreadHandle(usize);
+
+impl ThreadHandle {
+    fn raw(&self) -> *mut core::ffi::c_void {
+        self.0 as *mut core::ffi::c_void
+    }
+
+    unsafe fn is_alive(&self) -> bool {
+        use windows_sys::Win32::Foundation::WAIT_TIMEOUT;
+        use windows_sys::Win32::System::Threading::WaitForSingleObject;
+        self.0 != 0 && WaitForSingleObject(self.raw(), 0) == WAIT_TIMEOUT
+    }
+}
+
+impl Drop for ThreadHandle {
+    fn drop(&mut self) {
+        if self.0 != 0 {
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(self.raw()) };
+        }
+    }
+}
+
+struct SuspendGuard(*mut core::ffi::c_void);
+
+impl SuspendGuard {
+    unsafe fn suspend(handle: *mut core::ffi::c_void) -> Option<Self> {
+        use windows_sys::Win32::System::Threading::SuspendThread;
+        (SuspendThread(handle) != u32::MAX).then_some(Self(handle))
+    }
+}
+
+impl Drop for SuspendGuard {
+    fn drop(&mut self) {
+        unsafe { windows_sys::Win32::System::Threading::ResumeThread(self.0) };
+    }
+}
+
+struct MovedTeb {
+    teb: usize,
+    tid: u32,
+    // Holding a handle prevents TID reuse while tracked and detects threads killed
+    // without DLL_THREAD_DETACH (e.g. TerminateThread).
+    handle: ThreadHandle,
+}
+
+/// Threads whose slots were exchanged by `take_slot_zero` itself (their TLS callback, if it
+/// still comes, leaves them as they are); held during the exchange.
+static MOVED: std::sync::Mutex<Vec<MovedTeb>> = std::sync::Mutex::new(Vec::new());
 
 /// xcl.exe's `_tls_index` (its TLS directory's AddressOfIndex)
 unsafe fn own_tls_index() -> Option<*mut u32> {
@@ -269,35 +314,65 @@ unsafe fn own_tls_index() -> Option<*mut u32> {
     (index != 0).then_some(index as *mut u32)
 }
 
-/// The TEBs of the process's threads (the current one first).
-unsafe fn thread_tebs() -> Vec<*mut u8> {
+/// Safely read a pointer-sized word from the current process without faulting if a thread
+/// unmapped its TEB concurrently.
+unsafe fn read_own_ptr(addr: usize) -> Option<usize> {
+    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    if addr == 0 {
+        return None;
+    }
+    let mut val = 0usize;
+    let mut read = 0usize;
+    let ok = ReadProcessMemory(
+        GetCurrentProcess(),
+        addr as *const core::ffi::c_void,
+        &mut val as *mut usize as *mut core::ffi::c_void,
+        std::mem::size_of::<usize>(),
+        &mut read,
+    );
+    (ok != 0 && read == std::mem::size_of::<usize>()).then_some(val)
+}
+
+/// Open handles to all other threads currently in this process.
+unsafe fn other_threads() -> Vec<(u32, ThreadHandle)> {
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
-    use windows_sys::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32};
-    use windows_sys::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThreadId, OpenThread, THREAD_QUERY_INFORMATION};
-    let mut out = vec![current_teb()];
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
+    };
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcessId, GetCurrentThreadId, OpenThread, THREAD_QUERY_INFORMATION,
+        THREAD_SUSPEND_RESUME, THREAD_SYNCHRONIZE,
+    };
+    let mut out = Vec::new();
     let (pid, tid) = (GetCurrentProcessId(), GetCurrentThreadId());
     let snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
     if snap == INVALID_HANDLE_VALUE {
         return out;
     }
+    let access = THREAD_QUERY_INFORMATION | THREAD_SUSPEND_RESUME | THREAD_SYNCHRONIZE;
     let mut te: THREADENTRY32 = std::mem::zeroed();
     te.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
     let mut ok = Thread32First(snap, &mut te) != 0;
     while ok {
         if te.th32OwnerProcessID == pid && te.th32ThreadID != tid {
-            let h = OpenThread(THREAD_QUERY_INFORMATION, 0, te.th32ThreadID);
+            let h = OpenThread(access, 0, te.th32ThreadID);
             if !h.is_null() {
-                let mut tbi: ThreadBasicInformation = std::mem::zeroed();
-                if NtQueryInformationThread(h, 0, &mut tbi as *mut _ as *mut _, std::mem::size_of::<ThreadBasicInformation>() as u32, std::ptr::null_mut()) >= 0 && !tbi.teb.is_null() {
-                    out.push(tbi.teb);
-                }
-                CloseHandle(h);
+                out.push((te.th32ThreadID, ThreadHandle(h as usize)));
             }
         }
         ok = Thread32Next(snap, &mut te) != 0;
     }
     CloseHandle(snap);
     out
+}
+
+struct PendingSwap {
+    tid: u32,
+    teb: usize,
+    xcl_block: usize,
+    carrier_block: *mut u8,
+    handle: ThreadHandle,
 }
 
 /// The title's executable gets TLS slot 0, as on Windows (and the console) the process's
@@ -314,25 +389,100 @@ pub unsafe fn take_slot_zero(img_name: &str, title_index: *mut u32, k: u32) -> R
         return Err(format!("xcl.exe's TLS index is {}, not 0", *own));
     }
     let mut moved = MOVED.lock().map_err(|_| "TLS lock poisoned")?;
-    let tebs = thread_tebs();
-    // 1. slot k = slot 0 (xcl.exe's block) in every thread; the carrier blocks kept
-    let mut carriers: Vec<(*mut *mut u8, *mut u8)> = Vec::new();
-    for &teb in &tebs {
-        let arr = *(teb.add(0x58) as *const *mut *mut u8);
-        if arr.is_null() {
-            continue;
+    // Publish XCL_SLOT before snapshotting threads so threads attaching or detaching
+    // concurrently serialize on `MOVED` instead of racing the exchange.
+    XCL_SLOT.store(k, Ordering::SeqCst);
+
+    let others = other_threads();
+    let mut pending: Vec<PendingSwap> = Vec::with_capacity(others.len());
+
+    // 1. slot k = slot 0 (xcl.exe's block) in every live thread; keep carrier blocks for phase 2.
+    // Suspend each peer only across raw syscalls and pointer reads/writes (no allocs or locks).
+    for (tid, handle) in others {
+        let info = {
+            let Some(_guard) = SuspendGuard::suspend(handle.raw()) else {
+                continue;
+            };
+            if !handle.is_alive() {
+                None
+            } else {
+                let mut tbi: ThreadBasicInformation = std::mem::zeroed();
+                let st = NtQueryInformationThread(
+                    handle.raw(),
+                    0,
+                    &mut tbi as *mut _ as *mut _,
+                    std::mem::size_of::<ThreadBasicInformation>() as u32,
+                    std::ptr::null_mut(),
+                );
+                if st >= 0 && !tbi.teb.is_null() {
+                    let teb = tbi.teb as usize;
+                    read_own_ptr(teb + 0x58).and_then(|arr_addr| {
+                        if arr_addr == 0 {
+                            return None;
+                        }
+                        let arr = arr_addr as *mut *mut u8;
+                        let xcl_block = read_own_ptr(arr as usize)?;
+                        let carrier_block = read_own_ptr(arr.add(k as usize) as usize)?;
+                        // Skip threads mid-LdrpAllocateTls whose slot blocks are not populated yet;
+                        // their upcoming on_thread_attach will perform the swap once ready.
+                        if xcl_block == 0 || carrier_block == 0 {
+                            return None;
+                        }
+                        *arr.add(k as usize) = xcl_block as *mut u8;
+                        Some((teb, xcl_block, carrier_block as *mut u8))
+                    })
+                } else {
+                    None
+                }
+            }
+        };
+        if let Some((teb, xcl_block, carrier_block)) = info {
+            pending.push(PendingSwap { tid, teb, xcl_block, carrier_block, handle });
         }
-        carriers.push((arr, *arr.add(k as usize)));
-        *arr.add(k as usize) = *arr;
-        moved.push(teb as usize);
     }
+
+    let cur_arr = *(current_teb().add(0x58) as *const *mut *mut u8);
+    let cur_carrier = if !cur_arr.is_null() {
+        let b = *cur_arr.add(k as usize);
+        *cur_arr.add(k as usize) = *cur_arr;
+        Some((cur_arr, b))
+    } else {
+        None
+    };
+
     fence(Ordering::SeqCst);
-    XCL_SLOT.store(k, Ordering::Release);
     std::ptr::write_volatile(own, k);
     fence(Ordering::SeqCst);
-    // 2. accesses that read index 0 before finish, then slot 0 = the title's block
+
+    // 2. accesses that read index 0 before finish, then slot 0 = the title's block.
     windows_sys::Win32::System::Threading::Sleep(20);
-    for (arr, block) in carriers {
+
+    let mut swapped_others = 0usize;
+    for slot in pending {
+        let swapped = {
+            let Some(_guard) = SuspendGuard::suspend(slot.handle.raw()) else {
+                continue;
+            };
+            if !slot.handle.is_alive() {
+                false
+            } else if let Some(arr_addr) = read_own_ptr(slot.teb + 0x58) {
+                if arr_addr != 0 && read_own_ptr(arr_addr) == Some(slot.xcl_block) {
+                    *(arr_addr as *mut *mut u8) = slot.carrier_block;
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        };
+        if swapped {
+            moved.push(MovedTeb { teb: slot.teb, tid: slot.tid, handle: slot.handle });
+            swapped_others += 1;
+        }
+    }
+
+    if let Some((arr, block)) = cur_carrier {
         *arr = block;
     }
     if !title_index.is_null() {
@@ -343,8 +493,9 @@ pub unsafe fn take_slot_zero(img_name: &str, title_index: *mut u32, k: u32) -> R
             img.index.store(0, Ordering::Release);
         }
     }
+    let total_threads = usize::from(cur_carrier.is_some()) + swapped_others;
     drop(moved);
-    crate::xlog_info!("TLS: {img_name} has slot 0 (as a process's executable); xcl.exe's own TLS is in slot {k} – {} threads", tebs.len());
+    crate::xlog_info!("TLS: {img_name} has slot 0 (as a process's executable); xcl.exe's own TLS is in slot {k} – {total_threads} threads");
     Ok(())
 }
 
@@ -356,7 +507,11 @@ unsafe fn exchange_for_new_thread(teb: *mut u8) {
         return;
     }
     let Ok(mut moved) = MOVED.lock() else { return };
-    if let Some(i) = moved.iter().position(|&t| t == teb as usize) {
+    let cur_tid = windows_sys::Win32::System::Threading::GetCurrentThreadId();
+    // Prune entries for threads that exited without DLL_THREAD_DETACH (e.g. TerminateThread)
+    // so a recycled TEB address cannot skip the slot exchange for a new thread.
+    moved.retain(|e| e.handle.is_alive());
+    if let Some(i) = moved.iter().position(|e| e.teb == teb as usize && e.tid == cur_tid) {
         // exchanged by take_slot_zero before it ran: done (and the TEB may come back later)
         moved.swap_remove(i);
         return;
@@ -376,8 +531,9 @@ pub fn on_thread_detach() {
         return;
     }
     let teb = unsafe { current_teb() } as usize;
+    let tid = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
     if let Ok(mut moved) = MOVED.lock() {
-        moved.retain(|&t| t != teb);
+        moved.retain(|e| !(e.teb == teb && e.tid == tid) && unsafe { e.handle.is_alive() });
     }
 }
 
