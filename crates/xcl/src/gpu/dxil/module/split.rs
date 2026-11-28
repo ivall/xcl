@@ -121,6 +121,10 @@ impl Shader {
                             && self.m.const_u64(args[1]) == Some(crate::gpu::dxil::ops::barrier::GROUP_SYNC as u64) => {
                         exchange = match exchange { 1 => 2, 3 => 0, _ => return None };
                     }
+                    // Copy the ADD at its original site. Its returned i32 uses the
+                    // same continuation slots as other scalars if live at a cut.
+                    Op::Call(f, args) if self.m.funcs[*f as usize].name == "dx.op.atomicBinOp.i32"
+                        && self.m.const_u64(args[2]) == Some(0) => {}
                     // Sub-dword stores use interlocked AND/OR. They return an
                     // old word that nobody observes; every write stays in place.
                     Op::Call(f, args) if self.m.funcs[*f as usize].name == "dx.op.atomicBinOp.i32"
@@ -613,6 +617,8 @@ impl Module {
 
         // In reverse postorder of the original graph, flooding the transpose
         // visits one component at a time in topological order (Kosaraju).
+        let has_uav_add = self.insts.iter().any(|d| matches!(&d.op, Op::Call(f, args)
+            if self.funcs[*f as usize].name == "dx.op.atomicBinOp.i32" && self.const_u64(args[2]) == Some(0)));
         let mut visited = vec![false; self.blocks.len()];
         let mut blocks = vec![Vec::new()];
         let mut stages = vec![usize::MAX; self.blocks.len()];
@@ -634,6 +640,18 @@ impl Module {
                         stack.push(p);
                     }
                 }
+            }
+            // A polling group could wait for another group's ADD in a later dispatch.
+            // Keep the whole pipeline if a loop can read writable global memory.
+            if has_uav_add && (component.len() > 1 || predecessors[root].contains(&root))
+                && component.iter().any(|&b| self.blocks[b].iter().any(|&i| {
+                    let Op::Call(f, _) = &self.insts[i as usize].op else { return false };
+                    let name = &self.funcs[*f as usize].name;
+                    ["dx.op.atomic", "dx.op.rawBufferLoad.", "dx.op.bufferLoad.", "dx.op.textureLoad."]
+                        .iter().any(|prefix| name.starts_with(prefix))
+                }))
+            {
+                return None;
             }
             // The target is soft for an indivisible component. A component
             // above it occupies a piece by itself; bound that exception so a
@@ -789,6 +807,86 @@ mod tests {
         for _ in 0..4 { m.bin(BinOp::Add, one, one); }
         m.ret();
         assert!(m.dispatch_plan(4).is_none());
+    }
+
+    #[test]
+    fn dispatch_chain_carries_uav_add_result_to_later_load() {
+        let geometry = [32, 1, 1];
+        let cs = CsInterface { threads: geometry, ..Default::default() };
+        let options = KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 };
+        let mut lw = Lw::new(&[], &Default::default(), options, &Entry::Compute(cs));
+        let (tid, _) = lw.setup_lanes_compute(geometry, false);
+        let mem = lw.mems[0];
+        let offset = lw.shlc(tid, 2);
+        let increment = lw.c(7);
+        let old = lw.s.raw_atomic(mem, crate::gpu::dxil::ops::AtomicOp::Add, offset, increment);
+        let mut value = lw.c(0);
+        let i32 = lw.s.m.i32();
+        let width = lw.s.wave_lane_count();
+        // conditional loads: blocks the optimiser cannot merge into one
+        for _ in 0..24 {
+            let pred = lw.cur();
+            let update = lw.s.m.new_block();
+            let join = lw.s.m.new_block();
+            let taken = lw.cmp(Pred::ULt, tid, width);
+            lw.s.m.cond_br(taken, update, join);
+            lw.s.m.set_block(update);
+            let current = lw.s.raw_load(mem, offset, 1)[0];
+            let added = lw.add(value, current);
+            lw.s.m.br(join);
+            lw.s.m.set_block(join);
+            let merged = lw.s.m.phi(i32);
+            lw.s.m.add_incoming(merged, added, update);
+            lw.s.m.add_incoming(merged, value, pred);
+            value = merged;
+        }
+        value = lw.add(value, old);
+        let dest = lw.addc(offset, 128);
+        lw.s.raw_store(mem, dest, &[value]);
+        lw.s.m.ret();
+        lw.s.m.optimize();
+        let plan = lw.s.m.dispatch_plan(32).unwrap();
+        assert!(plan.edges.iter().any(|edge| edge.live.contains(&old)));
+        let chain = lw.s.split_compute(geometry, None, 32).expect("admit a UAV ADD");
+        let whole = lw.s.finish_optimized(geometry, Some(32)).unwrap();
+        if !runner::wave32_supported().unwrap_or(false) {
+            runner::skip_test("no wave32 GPU");
+            return;
+        }
+        let input: Vec<u32> = (1..=32).chain([0; 32]).collect();
+        let expected: Vec<_> = (1..=32).map(|v| v + 7)
+            .chain((1..=32).map(|v| v + 24 * (v + 7))).collect();
+        assert_eq!(runner::dispatch(&whole, [1, 1, 1], &[], &input).unwrap(), expected);
+        assert_eq!(runner::dispatch_split(&chain, [1, 1, 1], &input).unwrap(), expected);
+    }
+
+    #[test]
+    fn dispatch_chain_declines_uav_add_with_a_polling_loop() {
+        use crate::gpu::dxil::{container::Stage, ops::AtomicOp, shader::Shader};
+        let mut s = Shader::new(Stage::Compute, (6, 6));
+        let mem = s.raw_uav(0, 0);
+        let zero = s.m.i32c(0);
+        let one = s.m.i32c(1);
+        let poll = s.m.new_block();
+        let end = s.m.new_block();
+        s.m.br(poll);
+        s.m.set_block(poll);
+        let value = s.raw_load(mem, zero, 1)[0];
+        let waiting = s.m.cmp(Pred::Eq, value, zero);
+        s.m.cond_br(waiting, poll, end);
+        s.m.set_block(end);
+        for _ in 0..8 {
+            let next = s.m.new_block();
+            s.raw_store(mem, zero, &[value]);
+            s.m.br(next);
+            s.m.set_block(next);
+        }
+        s.m.ret();
+        assert!(s.m.dispatch_plan(16).is_some());
+        // A different group could be waiting on this very increment.
+        s.m.set_insert_before_term(true);
+        s.raw_atomic(mem, AtomicOp::Add, zero, one);
+        assert!(s.m.dispatch_plan(16).is_none());
     }
 
     fn compare(threads: u32, extra_adds: u32) {
