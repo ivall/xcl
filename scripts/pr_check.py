@@ -129,9 +129,11 @@ def check(body, head, files, is_main_ancestor, *, test_only=False):
 
     if not test_only and any(runtime(p) or builds_runtime(p) for p, *_ in files):
         blocks = smoke_blocks(body)
-        mine = [b for b in blocks if len(b.get("commit", "")) >= 7 and head.startswith(b["commit"].split()[0])]
+        # a block's commit is the first word of its `commit:` line; fewer than 7 digits name no commit
+        sha = lambda b: (b.get("commit", "").split() or [""])[0]
+        mine = [b for b in blocks if len(sha(b)) >= 7 and head.startswith(sha(b))]
         clean = [b for b in mine if "uncommitted" not in b.get("commit", "")]
-        base = [b for b in blocks if b not in mine and len(b.get("commit", "").split()[0] if b.get("commit") else "") >= 7]
+        base = [b for b in blocks if b not in mine and len(sha(b)) >= 7]
         if not clean:
             problems.append(f"the PR changes the runtime: **Regression run** needs an `xcl-smoke` block made on this PR's "
                             f"head commit {head[:12]} with no uncommitted changes (rerun scripts/smoke.ps1 after every push)")
