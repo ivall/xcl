@@ -1,8 +1,9 @@
 import json
 import unittest
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
-from coverage_gate import compare, sweep_json
+from coverage_gate import compare, main, sweep_json
 
 STAGES = {
     "CS": {"total": 100, "translated": 95, "unsupported": 5, "validator_failed": 0, "panicked": 0, "timeout": 0},
@@ -66,6 +67,33 @@ class SweepJsonTests(unittest.TestCase):
     def test_raises_without_a_report(self):
         with self.assertRaises(ValueError):
             sweep_json("no json here")
+
+
+class BaselineUpdateTests(unittest.TestCase):
+    def test_empty_sweep_preserves_existing_baseline(self):
+        with TemporaryDirectory() as directory:
+            baseline = Path(directory) / "baseline.json"
+            report = Path(directory) / "run.json"
+            original = json.dumps({"stages": STAGES}).encode()
+            baseline.write_bytes(original)
+            report.write_text('{"stages": {}}', encoding="utf-8")
+
+            result = main(["--update", "--run-json", str(report), "--baseline", str(baseline)])
+
+            self.assertEqual(result, 2)
+            self.assertEqual(baseline.read_bytes(), original)
+
+    def test_populated_sweep_updates_baseline(self):
+        with TemporaryDirectory() as directory:
+            baseline = Path(directory) / "baseline.json"
+            report = Path(directory) / "run.json"
+            baseline.write_text('{"stages": {}}', encoding="utf-8")
+            report.write_text(json.dumps(run()), encoding="utf-8")
+
+            result = main(["--update", "--run-json", str(report), "--baseline", str(baseline)])
+
+            self.assertEqual(result, 0)
+            self.assertEqual(json.loads(baseline.read_text(encoding="utf-8")), {"stages": STAGES})
 
 
 if __name__ == "__main__":

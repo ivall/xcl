@@ -9,7 +9,7 @@ timed out, is a coverage regression - the class of bug a sibling project lost 32
 translations to unnoticed. The baseline holds counts only: no program names, no game data.
 
   python scripts/coverage_gate.py --xcl target/release/xcl.exe --rpf PACK [--threads N]
-  python scripts/coverage_gate.py --update ...    rewrite the baseline from a fresh sweep
+  python scripts/coverage_gate.py --update ...    rewrite the baseline from a sweep with at least one stage
   python scripts/coverage_gate.py --run-json F    compare a saved sweep (no game needed)
 """
 import argparse
@@ -75,6 +75,9 @@ def main(argv=None):
             print(f"{e}\n{proc.stdout[-2000:]}\n{proc.stderr[-2000:]}", file=sys.stderr)
             return 2
     if args.update:
+        if not run["stages"]:
+            print("cannot update baseline: sweep contains no shader stages", file=sys.stderr)
+            return 2
         args.baseline.parent.mkdir(parents=True, exist_ok=True)
         args.baseline.write_text(json.dumps({"stages": run["stages"]}, indent=1, sort_keys=True) + "\n", encoding="utf-8")
         print(f"baseline written: {args.baseline}")
