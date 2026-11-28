@@ -70,7 +70,7 @@ type ContainerCb = unsafe extern "system" fn(*const ContainerInfo, *mut c_void) 
 type BlobCb = unsafe extern "system" fn(*const BlobInfo, *mut c_void) -> bool;
 
 /// File-name form of a container / blob name: unusual characters as %XX.
-fn enc(name: &str) -> String {
+pub(super) fn enc(name: &str) -> String {
     let mut out: String = name
         .bytes()
         .map(|b| if b.is_ascii_alphanumeric() || b"._- ".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") })
@@ -185,6 +185,7 @@ fn open_provider(config: Option<String>) -> *mut Provider {
     let id: String = enc(&config.unwrap_or_else(|| "default".into()));
     let root = crate::state::data_dir().join("gamesave").join(if id.is_empty() { "default".into() } else { id });
     let _ = std::fs::create_dir_all(&root);
+    super::save_import::import_once(&root);
     Box::into_raw(Box::new(Provider { magic: MAGIC_PROVIDER, root }))
 }
 
@@ -565,7 +566,7 @@ pub unsafe extern "system" fn XGameSaveSubmitBlobDelete(u: *mut Update, name: *c
     S_OK
 }
 
-fn apply(dir: &Path, display: Option<&str>, ops: &[(String, Option<Vec<u8>>)]) -> HRESULT {
+pub(super) fn apply(dir: &Path, display: Option<&str>, ops: &[(String, Option<Vec<u8>>)]) -> HRESULT {
     let _mutation = SAVE_MUTATION.lock().unwrap_or_else(|e| e.into_inner());
     let blobs = dir.join("b");
     if std::fs::create_dir_all(&blobs).is_err() {

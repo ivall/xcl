@@ -8,6 +8,7 @@ pub mod api;
 pub mod gamesave;
 pub mod gdk_table;
 pub mod networking;
+pub mod save_import;
 pub mod taskqueue;
 pub mod xasync;
 pub mod xsign;

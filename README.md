@@ -434,6 +434,10 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 - Title data: `%LOCALAPPDATA%\XCL\<title>\` (`%XCL_DATA_ROOT%`): `xcl.toml`, `overlay\`, `saves\`,
   `pls\` (the title's `S:\`), `temp\` (`T:\`), `cache\`, `logs\xcl.log`, `logs\report.json` (the
   previous run's: `xcl.prev.log`, `report.prev.json`).
+- PS5 story saves of the newer retail game: `XCL_IMPORT_SAVE=<folder>[;<folder>]`, each a decrypted PS5
+  save folder with `chives.dat`, writes the slot it names (`SARC0000`, `SARC0015` …) as the Xbox build's
+  container when the title opens its saves; an existing slot is left alone (`XCL_IMPORT_SAVE_FORCE=1`
+  replaces it). The title then lists and reads it; loading it still stops where a new game stops.
 
 </details>
 
