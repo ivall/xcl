@@ -957,6 +957,11 @@ impl Lw {
             })?;
             return Ok(());
         }
+        // gather4h / gather4h_pck / gather8h_pck fetch a horizontal row of texels, not the 2x2
+        // footprint of Gather: rejected until the row's position and rounding are measured
+        if base.starts_with("gather4h") || base.starts_with("gather8h") {
+            return err(d, "image_gather4h");
+        }
         let body = [1u64, 2, 3, 3, 2, 3, 3, 4][dim as usize];
         let sampling = base.starts_with("sample") || base.starts_with("gather4");
         let rest = base.trim_start_matches("sample").trim_start_matches("gather4");
@@ -2041,5 +2046,30 @@ mod heap_bounds_tests {
         let hlsl = recomp::translate(&code, &recomp::Options { mode: recomp::Mode::Pixel(ps), ..Default::default() }).expect("hlsl ps translate");
         assert!(hlsl.complete(), "hlsl ps unsupported: {:?}", hlsl.unsupported);
         assert!(hlsl.hlsl.contains("select(") && hlsl.hlsl.contains(&format!("{}u", super::VIEW_HEAP_MAX_SRV)), "expected convergent clamp in PS HLSL");
+    }
+
+    /// `image_gather4h(_pck)` and `image_gather8h_pck` read a horizontal row of texels rather
+    /// than a 2x2 Gather footprint: reject them in direct DXIL (parity with HLSL `#437`), while
+    /// keeping standard `image_gather4` translating and validating cleanly.
+    #[test]
+    fn direct_image_gather4h_and_8h_are_rejected() {
+        let fields: &[(&str, u64)] = &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0x1), ("DIM", 1)];
+        for name in ["IMAGE_GATHER4H", "IMAGE_GATHER4H_PCK", "IMAGE_GATHER8H_PCK"] {
+            let code = mimg_prog(&[(name, fields)]);
+            for wave64 in [false, true] {
+                let o = kernel::KernelOptions { wave64, split: false, mem_windows: 1, sampler_base: 0 };
+                let err = kernel::translate(&code, o).expect_err(&format!("{name} wave64={wave64} must be rejected"));
+                assert!(err.contains("image_gather4h"), "{name} wave64={wave64}: unexpected error {err}");
+            }
+            let ps = recomp::PsInterface::default();
+            let o = kernel::KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 };
+            let err = kernel::translate_pixel(&code, o, &ps).map(|_| ()).expect_err(&format!("{name} PS must be rejected"));
+            assert!(err.contains("image_gather4h"), "{name} PS: unexpected error {err}");
+        }
+        // Control: standard 2x2 image_gather4 still translates and passes DXIL validation.
+        let ok = mimg_prog(&[("IMAGE_GATHER4", fields)]);
+        let dxil = kernel::translate(&ok, kernel::KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 })
+            .expect("image_gather4 control must translate");
+        validate::validate(&dxil).expect("image_gather4 control must validate");
     }
 }
