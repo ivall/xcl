@@ -1,0 +1,63 @@
+# The Wine build, kept green: the same tree cross-built for `x86_64-pc-windows-gnullvm`, the target a
+# Wine host (macOS/CrossOver, Linux) compiles with. It catches the case the Windows job cannot see –
+# code that only builds with MSVC – before it blocks a host port.
+#
+# Built only, never run: the runner has no Wine and no GPU, so the test binaries are compiled and not
+# executed. What a host actually runs, with counts, is posted on the issue by the person who ran it
+# (CONTRIBUTING.md, "What a PR needs to be merged").
+#
+# The linker is LLVM-MinGW (clang + lld + UCRT import libraries), pinned to a release: rustc's gnullvm
+# target links with `-nolibc --unwindlib=libunwind`, options a GNU GCC driver rejects. It is not in
+# Homebrew.
+name: Mac cross-build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mac-cross-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gnullvm:
+    name: Cross-build for the Wine target (macOS, built only)
+    runs-on: macos-latest
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: 0
+      LLVM_MINGW: llvm-mingw-20261117-ucrt-macos-universal
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust (stable, Wine target)
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add x86_64-pc-windows-gnullvm
+          rustc --version
+
+      - name: LLVM-MinGW 20261117 (clang, lld, UCRT)
+        run: |
+          curl -fsSL "https://github.com/mstorsjo/llvm-mingw/releases/download/20261117/$LLVM_MINGW.tar.xz" -o /tmp/llvm-mingw.tar.xz
+          tar -C /tmp -xf /tmp/llvm-mingw.tar.xz
+          echo "/tmp/$LLVM_MINGW/bin" >> "$GITHUB_PATH"
+          echo "CARGO_TARGET_X86_64_PC_WINDOWS_GNULLVM_LINKER=x86_64-w64-mingw32-clang" >> "$GITHUB_ENV"
+
+      - uses: actions/cache@v4
+        with:
+          path: target
+          key: cargo-mac-gnullvm-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: cargo-mac-gnullvm-${{ runner.os }}-
+
+      - name: Build the workspace and its test binaries (not executed)
+        run: |
+          cargo build --workspace --locked --target x86_64-pc-windows-gnullvm
+          cargo test --no-run --release --locked --target x86_64-pc-windows-gnullvm
+          ls -l target/x86_64-pc-windows-gnullvm/release/xcl.exe
