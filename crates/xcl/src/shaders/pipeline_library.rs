@@ -126,7 +126,8 @@ pub(crate) fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Res
 
 pub(crate) struct NativeLibrary {
     library: ID3D12PipelineLibrary1,
-    _serialized: std::sync::Arc<[u8]>,
+    // Keep the read buffer: converting a Vec to Arc<[u8]> copies the whole library.
+    _serialized: std::sync::Arc<Vec<u8>>,
 }
 
 impl NativeLibrary {
@@ -144,14 +145,14 @@ impl NativeLibrary {
     }
 
     pub(crate) fn empty(device: &ID3D12Device) -> Result<Self> {
-        Self::open_shared(device, std::sync::Arc::from([]))
+        Self::open_shared(device, std::sync::Arc::new(Vec::new()))
     }
 
     pub(crate) fn open(device: &ID3D12Device, serialized: Vec<u8>) -> Result<Self> {
-        Self::open_shared(device, serialized.into())
+        Self::open_shared(device, std::sync::Arc::new(serialized))
     }
 
-    pub(crate) fn open_shared(device: &ID3D12Device, serialized: std::sync::Arc<[u8]>) -> Result<Self> {
+    pub(crate) fn open_shared(device: &ID3D12Device, serialized: std::sync::Arc<Vec<u8>>) -> Result<Self> {
         let device: ID3D12Device1 = device.cast()?;
         let library = if serialized.is_empty() {
             let mut library = std::ptr::null_mut();
@@ -330,6 +331,28 @@ void main() {{ output.Store(0, {n}); }}
             "pipeline library: unique={COUNT} serialized_bytes={} cold_ms={} open_us={} load_all_us={}",
             bytes.len(), build_time.as_millis(), open_time.as_micros(), load_time.as_micros()
         );
+    }
+
+    #[test]
+    fn reopened_library_retains_the_original_file_buffer() {
+        let Some((pipelines, dxil, root)) = fixture() else { return };
+        let desc = compute_desc(&dxil, &root);
+        let pso = unsafe { pipelines.dev.CreateComputePipelineState::<ID3D12PipelineState>(&desc) }
+            .expect("compute pipeline");
+        let library = NativeLibrary::empty(&pipelines.dev).expect("empty pipeline library");
+        library.store("shared", &pso).expect("store pipeline");
+        let bytes = library.serialize().expect("serialize pipeline library");
+        let original = bytes.as_ptr();
+        let reopened = NativeLibrary::open(&pipelines.dev, bytes).expect("reopen pipeline library");
+        assert_eq!(reopened._serialized.as_ptr(), original, "retain the original allocation");
+        let shared = reopened._serialized.clone();
+        let second = NativeLibrary::open_shared(&pipelines.dev, shared.clone()).expect("second owner");
+        assert_eq!(second._serialized.as_ptr(), original);
+        drop(shared);
+        drop(reopened);
+        drop(library);
+        second.load_compute("shared", &desc).expect("bytes survive the other owners");
+        drop_desc(desc);
     }
 
     #[test]

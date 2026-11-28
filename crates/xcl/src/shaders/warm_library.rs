@@ -31,8 +31,8 @@ struct Receipt {
 
 #[allow(dead_code)] // Consumed by the stacked lazy runtime integration.
 pub(crate) struct Ready {
-    pub(crate) graphics: Option<Arc<[u8]>>,
-    pub(crate) compute: Option<Arc<[u8]>>,
+    pub(crate) graphics: Option<Arc<Vec<u8>>>,
+    pub(crate) compute: Option<Arc<Vec<u8>>>,
 }
 
 static READY: Mutex<Option<Ready>> = Mutex::new(None);
@@ -66,10 +66,10 @@ fn paths(dir: &Path) -> (PathBuf, PathBuf, PathBuf) {
 
 fn pending(path: &Path) -> PathBuf { path.with_extension("plib.pending") }
 
-fn validate(path: &Path, expected: u64, device: &ID3D12Device) -> Option<Arc<[u8]>> {
+fn validate(path: &Path, expected: u64, device: &ID3D12Device) -> Option<Arc<Vec<u8>>> {
     let bytes = std::fs::read(path).ok()?;
     if bytes.len() as u64 != expected { return None }
-    let bytes: Arc<[u8]> = bytes.into();
+    let bytes = Arc::new(bytes);
     NativeLibrary::open_shared(device, bytes.clone()).ok()?;
     Some(bytes)
 }
@@ -112,11 +112,11 @@ pub(crate) fn publish(corpus: &Corpus, device: &ID3D12Device) -> Result<(), Stri
     let counts = corpus.counts();
     let graphics_pending = pending(&graphics);
     let compute_pending = pending(&compute);
-    let graphics_ready: Option<Arc<[u8]>> = (counts.0 != 0).then(|| std::fs::read(&graphics_pending)).transpose()
-        .map_err(|e| format!("Reading prepared graphics library: {e}"))?.map(Into::into);
-    let compute_ready: Option<Arc<[u8]>> = (counts.1 != 0).then(|| std::fs::read(&compute_pending)).transpose()
-        .map_err(|e| format!("Reading prepared compute library: {e}"))?.map(Into::into);
-    let open = |bytes: &Arc<[u8]>| NativeLibrary::open_shared(device, bytes.clone());
+    let graphics_ready: Option<Arc<Vec<u8>>> = (counts.0 != 0).then(|| std::fs::read(&graphics_pending)).transpose()
+        .map_err(|e| format!("Reading prepared graphics library: {e}"))?.map(Arc::new);
+    let compute_ready: Option<Arc<Vec<u8>>> = (counts.1 != 0).then(|| std::fs::read(&compute_pending)).transpose()
+        .map_err(|e| format!("Reading prepared compute library: {e}"))?.map(Arc::new);
+    let open = |bytes: &Arc<Vec<u8>>| NativeLibrary::open_shared(device, bytes.clone());
     graphics_ready.as_ref().map(open).transpose()
         .map_err(|e| format!("Validating prepared graphics library: {e}"))?;
     compute_ready.as_ref().map(open).transpose()
