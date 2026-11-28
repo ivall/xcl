@@ -161,7 +161,7 @@ impl Vfs {
         let overlay_dir = data_dir.join("overlay");
         let whiteout_file = overlay_dir.join(".xcl_whiteouts");
         let whiteouts = std::fs::read_to_string(&whiteout_file)
-            .map(|s| s.lines().filter(|l| !l.is_empty()).map(str::to_string).collect())
+            .map(|s| s.lines().filter(|l| !l.is_empty()).map(Self::wkey).collect())
             .unwrap_or_default();
         let mut mounts: Vec<(String, String)> = mounts
             .into_iter()
@@ -330,23 +330,28 @@ impl Vfs {
     }
 
     pub fn overlay_path(&self, rel: &str) -> String {
-        if rel.is_empty() {
+        let rel_norm = norm(rel);
+        let rel_clean = trim_sep(rel_norm.trim_start_matches('\\'));
+        if rel_clean.is_empty() {
             self.overlay.clone()
         } else {
-            format!("{}\\{rel}", self.overlay)
+            format!("{}\\{rel_clean}", self.overlay)
         }
     }
 
     pub fn original_path(&self, rel: &str) -> String {
-        if rel.is_empty() {
+        let rel_norm = norm(rel);
+        let rel_clean = trim_sep(rel_norm.trim_start_matches('\\'));
+        if rel_clean.is_empty() {
             self.game_root.clone()
         } else {
-            format!("{}\\{rel}", self.game_root)
+            format!("{}\\{rel_clean}", self.game_root)
         }
     }
 
     fn wkey(rel: &str) -> String {
-        rel.to_lowercase()
+        let n = norm(rel);
+        trim_sep(n.trim_start_matches('\\')).to_lowercase()
     }
 
     pub fn is_whiteout(&self, rel: &str) -> bool {
@@ -481,7 +486,9 @@ impl Vfs {
     /// only after the underlying file operation succeeds so a failed operation cannot
     /// resurrect a whited-out original.
     pub fn stage_write(&self, rel: &str) -> Result<String, u32> {
-        if let Some((parent_rel, _)) = rel.rsplit_once('\\') {
+        let rel_norm = norm(rel);
+        let rel_clean = trim_sep(rel_norm.trim_start_matches('\\'));
+        if let Some((parent_rel, _)) = rel_clean.rsplit_once('\\') {
             if !self.is_dir(parent_rel) {
                 return Err(ERROR_PATH_NOT_FOUND);
             }
@@ -633,17 +640,23 @@ impl Vfs {
     }
 
     fn check_original_dir_empty(&self, rel: &str) -> Result<(), u32> {
-        if self.is_whiteout(rel) {
+        let rel_clean = trim_sep(norm(rel).trim_start_matches('\\'));
+        if self.is_whiteout(&rel_clean) {
             return Ok(());
         }
-        let entries = match std::fs::read_dir(self.original_path(rel)) {
+        let entries = match std::fs::read_dir(self.original_path(&rel_clean)) {
             Ok(entries) => entries,
             Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory) => return Ok(()),
             Err(e) => return Err(e.raw_os_error().map(|c| c as u32).unwrap_or(ERROR_ACCESS_DENIED)),
         };
         for entry in entries {
             let entry = entry.map_err(|e| e.raw_os_error().map(|c| c as u32).unwrap_or(ERROR_ACCESS_DENIED))?;
-            let child = format!("{rel}\\{}", entry.file_name().to_string_lossy());
+            let name = entry.file_name();
+            let child = if rel_clean.is_empty() {
+                name.to_string_lossy().to_string()
+            } else {
+                format!("{rel_clean}\\{}", name.to_string_lossy())
+            };
             if !self.is_whiteout(&child) {
                 return Err(ERROR_DIR_NOT_EMPTY);
             }
@@ -652,32 +665,33 @@ impl Vfs {
     }
 
     pub fn remove_dir(&self, rel: &str) -> Result<(), u32> {
-        if rel.is_empty() {
+        let rel_clean = trim_sep(norm(rel).trim_start_matches('\\'));
+        if rel_clean.is_empty() {
             return Err(ERROR_ACCESS_DENIED);
         }
-        let ov = self.overlay_path(rel);
+        let ov = self.overlay_path(&rel_clean);
         let ov_path = Path::new(&ov);
         if let Ok(meta) = std::fs::metadata(ov_path) {
             if !meta.is_dir() {
                 return Err(ERROR_DIRECTORY);
             }
-            self.check_original_dir_empty(rel)?;
+            self.check_original_dir_empty(&rel_clean)?;
             std::fs::remove_dir(ov_path).map_err(|_| ERROR_DIR_NOT_EMPTY)?;
-            if Path::new(&self.original_path(rel)).exists() {
-                self.add_whiteout(rel);
+            if Path::new(&self.original_path(&rel_clean)).exists() {
+                self.add_whiteout(&rel_clean);
             }
-            self.record_write(rel);
+            self.record_write(&rel_clean);
             return Ok(());
         }
-        if !self.visible_in_original(rel) {
+        if !self.visible_in_original(&rel_clean) {
             return Err(ERROR_FILE_NOT_FOUND);
         }
-        if !Path::new(&self.original_path(rel)).is_dir() {
+        if !Path::new(&self.original_path(&rel_clean)).is_dir() {
             return Err(ERROR_DIRECTORY);
         }
-        self.check_original_dir_empty(rel)?;
-        self.add_whiteout(rel);
-        self.record_write(rel);
+        self.check_original_dir_empty(&rel_clean)?;
+        self.add_whiteout(&rel_clean);
+        self.record_write(&rel_clean);
         Ok(())
     }
 
@@ -916,6 +930,42 @@ mod tests {
         assert_eq!(v.remove_dir("data\\sub"), Ok(()));
         assert_eq!(v.remove_dir("data"), Ok(()));
         assert!(f.game().join("data").join("sub").is_dir());
+    }
+
+    #[test]
+    fn whiteouts_and_paths_normalize_slashes() {
+        let f = Fixture::new("norm_slashes");
+        let v = &f.vfs;
+
+        // Path helpers normalize forward slashes and strip leading/trailing separators
+        assert_eq!(v.overlay_path("data/test.txt"), format!("{}\\data\\test.txt", f.dir.join("xcldata").join("overlay").display()));
+        assert_eq!(v.overlay_path("/data/test.txt/"), format!("{}\\data\\test.txt", f.dir.join("xcldata").join("overlay").display()));
+        assert_eq!(v.original_path("data/test.txt"), format!("{}\\data\\test.txt", f.game().display()));
+        assert_eq!(v.original_path("/data/test.txt/"), format!("{}\\data\\test.txt", f.game().display()));
+
+        // Whiteouts query and match regardless of forward, leading or trailing slashes
+        assert_eq!(v.delete_file("data/gone.txt"), Ok(()));
+        assert!(v.is_whiteout("data\\gone.txt"));
+        assert!(v.is_whiteout("data/gone.txt"));
+        assert!(v.is_whiteout("/data/gone.txt"));
+        assert!(v.is_whiteout("\\data\\gone.txt"));
+
+        // Whiteouts under directory work with trailing slashes
+        assert!(v.has_whiteouts_under("data"));
+        assert!(v.has_whiteouts_under("data\\"));
+        assert!(v.has_whiteouts_under("data/"));
+        assert!(v.has_whiteouts_under("/data/"));
+        assert!(v.needs_merge("data"));
+        assert!(v.needs_merge("data\\"));
+        assert!(v.needs_merge("data/"));
+
+        // Directory whiteout hides children when queried with forward slashes
+        assert_eq!(v.delete_file("data\\hello.txt"), Ok(()));
+        assert_eq!(v.remove_dir("data/"), Ok(()));
+        assert!(v.is_whiteout("data"));
+        assert!(v.is_whiteout("data/hello.txt"));
+        assert!(v.is_whiteout("data\\hello.txt"));
+        assert!(v.is_whiteout("data/sub/file.txt"));
     }
 
     #[test]
