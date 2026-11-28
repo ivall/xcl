@@ -4,10 +4,15 @@ use std::fs;
 use std::path::PathBuf;
 use std::ptr::{null, null_mut};
 use std::time::{SystemTime, UNIX_EPOCH};
-use windows_sys::Win32::Foundation::{GetLastError, SetLastError, ERROR_PATH_NOT_FOUND};
+use windows_sys::Win32::Foundation::{
+    GetLastError, SetLastError, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND,
+};
 use windows_sys::Win32::Globalization::GetOEMCP;
 use windows_sys::Win32::Storage::FileSystem::{
-    AreFileApisANSI, GetDiskFreeSpaceExA, GetDiskFreeSpaceExW, SetFileApisToANSI, SetFileApisToOEM,
+    AreFileApisANSI, GetDiskFreeSpaceA, GetDiskFreeSpaceExA, GetDiskFreeSpaceExW,
+    GetDiskFreeSpaceW, GetFileAttributesA, GetFileAttributesExW, GetFileAttributesW,
+    GetFileExInfoStandard, SetFileApisToANSI, SetFileApisToOEM, INVALID_FILE_ATTRIBUTES,
+    WIN32_FILE_ATTRIBUTE_DATA,
 };
 use xcl::config::{Boot, Config};
 use xcl::util::wide;
@@ -143,6 +148,83 @@ fn disk_free_space_ex_reports_pls_quota() {
         let error = GetLastError();
         assert_eq!((result, error), (0, ERROR_PATH_NOT_FOUND));
         assert_eq!((available, total, free), (MIB - 579, host_total, MIB - 579));
+
+        // Test GetDiskFreeSpaceW and GetDiskFreeSpaceA on mounted alias P:\ and host directory
+        let (mut spc, mut bps, mut free_clusters, mut total_clusters) = (0u32, 0u32, 0u32, 0u32);
+        let res_w = GetDiskFreeSpaceW(
+            alias.as_ptr(),
+            &mut spc,
+            &mut bps,
+            &mut free_clusters,
+            &mut total_clusters,
+        );
+        assert_ne!(res_w, 0, "GetDiskFreeSpaceW on alias failed");
+        assert!(spc > 0 && bps > 0 && total_clusters > 0);
+
+        let (mut ansi_spc, mut ansi_bps, mut ansi_free_clusters, mut ansi_total_clusters) =
+            (0u32, 0u32, 0u32, 0u32);
+        let res_a = GetDiskFreeSpaceA(
+            b"P:\\\0".as_ptr(),
+            &mut ansi_spc,
+            &mut ansi_bps,
+            &mut ansi_free_clusters,
+            &mut ansi_total_clusters,
+        );
+        assert_ne!(res_a, 0, "GetDiskFreeSpaceA on alias failed");
+        assert_eq!((ansi_spc, ansi_bps), (spc, bps));
+
+        // Test GetFileAttributesW and GetFileAttributesA on existing and missing files
+        let existing = wide(r"P:\existing.bin");
+        let attrs_w = GetFileAttributesW(existing.as_ptr());
+        assert_ne!(attrs_w, INVALID_FILE_ATTRIBUTES);
+
+        let attrs_a = GetFileAttributesA(b"P:\\existing.bin\0".as_ptr());
+        assert_ne!(attrs_a, INVALID_FILE_ATTRIBUTES);
+        assert_eq!(attrs_w, attrs_a);
+
+        let nested = wide(r"s:/世界/nested.bin");
+        let attrs_nested = GetFileAttributesW(nested.as_ptr());
+        assert_ne!(attrs_nested, INVALID_FILE_ATTRIBUTES);
+
+        let missing_file = wide(r"P:\missing.bin");
+        SetLastError(0);
+        let missing_attrs = GetFileAttributesW(missing_file.as_ptr());
+        let err = GetLastError();
+        assert_eq!(missing_attrs, INVALID_FILE_ATTRIBUTES);
+        assert_eq!(err, ERROR_FILE_NOT_FOUND);
+
+        // Test GetFileAttributesExW on existing files (existing.bin = 123 B, nested.bin = 456 B)
+        let mut info: WIN32_FILE_ATTRIBUTE_DATA = std::mem::zeroed();
+        let res_ex = GetFileAttributesExW(
+            existing.as_ptr(),
+            GetFileExInfoStandard,
+            &mut info as *mut _ as *mut std::ffi::c_void,
+        );
+        assert_ne!(res_ex, 0, "GetFileAttributesExW on existing.bin failed");
+        assert_eq!(info.nFileSizeLow, 123);
+        assert_eq!(info.nFileSizeHigh, 0);
+
+        let mut nested_info: WIN32_FILE_ATTRIBUTE_DATA = std::mem::zeroed();
+        let res_nested_ex = GetFileAttributesExW(
+            nested.as_ptr(),
+            GetFileExInfoStandard,
+            &mut nested_info as *mut _ as *mut std::ffi::c_void,
+        );
+        assert_ne!(res_nested_ex, 0, "GetFileAttributesExW on nested.bin failed");
+        assert_eq!(nested_info.nFileSizeLow, 456);
+        assert_eq!(nested_info.nFileSizeHigh, 0);
+
+        // Test GetFileAttributesExW on missing file
+        let mut missing_info: WIN32_FILE_ATTRIBUTE_DATA = std::mem::zeroed();
+        SetLastError(0);
+        let res_missing_ex = GetFileAttributesExW(
+            missing_file.as_ptr(),
+            GetFileExInfoStandard,
+            &mut missing_info as *mut _ as *mut std::ffi::c_void,
+        );
+        let ex_err = GetLastError();
+        assert_eq!(res_missing_ex, 0);
+        assert_eq!(ex_err, ERROR_FILE_NOT_FOUND);
 
         fs::File::create(pls.join("fills-quota.bin"))
             .unwrap()
