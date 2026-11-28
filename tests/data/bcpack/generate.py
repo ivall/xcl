@@ -117,7 +117,7 @@ def encode(symbols, widths, reductions, model=0, carry=False, trim=False):
     return bytes(out)
 
 
-def generate(mode, units, seed, reduced, **options):
+def generate(mode, units, seed, reduced, out_dir=ROOT, **options):
     widths = WIDTHS[mode]
     rng = random.Random(seed)
     reductions = [rng.randrange(4) if reduced else 0 for width in widths]
@@ -125,7 +125,7 @@ def generate(mode, units, seed, reduced, **options):
                for width, reduction in zip(widths, reductions)]
     if mode == 1:
         symbols[1] = [0] * units
-    path = ROOT / f'bc{mode}-{units}-{seed}'
+    path = Path(out_dir) / f'bc{mode}-{units}-{seed}'
     path.with_suffix('.bin').write_bytes(encode(symbols, widths, reductions, **options))
     path.with_suffix('.lanes').write_bytes(b''.join(map(bytes, symbols)))
     return symbols, path
@@ -159,21 +159,26 @@ def assemble(symbols):
     return bytes(raw)
 
 
-if __name__ == '__main__':
-    for mode in WIDTHS:
+def generate_all(out_dir=ROOT, mode_filter=None):
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    modes = [mode_filter] if mode_filter is not None else list(WIDTHS.keys())
+    for mode in modes:
         cases = [(2, 0, False), (16, 1, True), (700, 2, False)]
         if mode not in (1, 7):
             cases = [(16, 1, True)]
         for units, seed, reduced in cases:
-            syms, path = generate(mode, units, seed, reduced)
+            syms, path = generate(mode, units, seed, reduced, out_dir=out_dir)
             if mode == 1:
                 path.with_suffix('.bc1').write_bytes(assemble(syms))
 
-    for units, seed, extra in [(1, 8, dict(trim=True)), (16, 9, dict(carry=True))]:
-        syms, path = generate(1, units, seed, False, **extra)
-        path.with_suffix('.bc1').write_bytes(assemble(syms))
+    if mode_filter is None or mode_filter == 1:
+        for units, seed, extra in [(1, 8, dict(trim=True)), (16, 9, dict(carry=True))]:
+            syms, path = generate(1, units, seed, False, out_dir=out_dir, **extra)
+            path.with_suffix('.bc1').write_bytes(assemble(syms))
 
-    for mode, widths in [(1, BC1), (7, BC7)]:
+    large_modes = [m for m in [(1, BC1), (7, BC7)] if mode_filter is None or mode_filter == m[0]]
+    for mode, widths in large_modes:
         units = 8192
         syms = [[0] * units for _ in widths]
         if mode == 1:
@@ -182,5 +187,32 @@ if __name__ == '__main__':
                 syms[8][i] = 5
             for i in range(31, units, 31):
                 syms[0][i] = 2
-        path = ROOT / f'bc{mode}-{units}-3.bin'
+        path = out_dir / f'bc{mode}-{units}-3.bin'
         path.write_bytes(encode(syms, widths, [0]*len(widths), model=15))
+
+
+def main(argv=None):
+    import argparse
+    parser = argparse.ArgumentParser(
+        description="Generate synthetic q=0 and q=15 BCPack test vectors."
+    )
+    parser.add_argument(
+        "--out-dir", "-o",
+        type=Path,
+        default=ROOT,
+        help="Directory to write generated test vectors (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--mode", "-m",
+        type=int,
+        choices=sorted(WIDTHS.keys()),
+        help="Generate vectors only for a specific BCPack mode (default: all modes).",
+    )
+    args = parser.parse_args(argv)
+    generate_all(out_dir=args.out_dir, mode_filter=args.mode)
+    return 0
+
+
+if __name__ == '__main__':
+    import sys
+    sys.exit(main())
