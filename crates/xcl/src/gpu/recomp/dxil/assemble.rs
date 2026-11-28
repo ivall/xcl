@@ -17,13 +17,41 @@ use windows::Win32::Graphics::Direct3D::Dxc::{
 
 type CreateInstance = unsafe extern "system" fn(*const GUID, *const GUID, *mut *mut c_void) -> HRESULT;
 
-fn errors(r: &IDxcOperationResult) -> String {
-    unsafe { r.GetErrorBuffer().map(|b| String::from_utf8_lossy(std::slice::from_raw_parts(b.GetBufferPointer() as *const u8, b.GetBufferSize())).into_owned()).unwrap_or_default() }
+unsafe fn blob_bytes<'a>(ptr: *const c_void, len: usize) -> Result<&'a [u8], &'static str> {
+    if len == 0 {
+        Ok(&[])
+    } else if ptr.is_null() {
+        Err("null DXC blob buffer")
+    } else {
+        Ok(std::slice::from_raw_parts(ptr.cast::<u8>(), len))
+    }
+}
+
+fn blob_len(len: usize) -> Result<u32, String> {
+    u32::try_from(len).map_err(|_| "assemble: IR larger than 4 GiB".to_string())
+}
+
+fn errors(r: &IDxcOperationResult, status: HRESULT) -> String {
+    let fallback = || format!("{status:?}");
+    let Ok(b) = (unsafe { r.GetErrorBuffer() }) else {
+        return fallback();
+    };
+    match unsafe { blob_bytes(b.GetBufferPointer(), b.GetBufferSize()) } {
+        Ok(bytes) => {
+            let text = String::from_utf8_lossy(bytes);
+            let trimmed = text.trim_end_matches('\0').trim();
+            if trimmed.is_empty() { fallback() } else { trimmed.to_string() }
+        }
+        Err(e) => format!("{e} ({status:?})"),
+    }
 }
 
 unsafe fn make<T: Interface>(create: CreateInstance, clsid: &GUID) -> Result<T, String> {
     let mut p = std::ptr::null_mut();
     create(clsid, &T::IID, &mut p).ok().map_err(|e| format!("DxcCreateInstance: {e}"))?;
+    if p.is_null() {
+        return Err("DxcCreateInstance: returned null interface".into());
+    }
     Ok(T::from_raw(p))
 }
 
@@ -38,19 +66,25 @@ pub fn assemble(ir: &str) -> Result<Vec<u8>, String> {
         let signer = GetModuleHandleW(crate::util::wide("dxil.dll").as_ptr());
         let sign = (!signer.is_null()).then(|| GetProcAddress(signer, b"DxcCreateInstance\0".as_ptr())).flatten().ok_or("assemble: no dxil.dll to sign with")?;
         let utils: IDxcUtils = make(create, &CLSID_DxcUtils)?;
-        let blob = utils.CreateBlob(ir.as_ptr() as *const c_void, ir.len() as u32, DXC_CP_UTF8).map_err(|e| format!("assemble: {e}"))?;
+        let blob = utils.CreateBlob(ir.as_ptr() as *const c_void, blob_len(ir.len())?, DXC_CP_UTF8).map_err(|e| format!("assemble: {e}"))?;
         let asm: IDxcAssembler = make(create, &CLSID_DxcAssembler)?;
         let r = asm.AssembleToContainer(&blob).map_err(|e| format!("assemble: {e}"))?;
-        if r.GetStatus().map_err(|e| format!("assemble: {e}"))?.is_err() {
-            return Err(format!("assemble: {}", errors(&r)));
+        let status = r.GetStatus().map_err(|e| format!("assemble: {e}"))?;
+        if status.is_err() {
+            return Err(format!("assemble: {}", errors(&r, status)));
         }
         let container = r.GetResult().map_err(|e| format!("assemble: {e}"))?;
         let v: IDxcValidator = make(std::mem::transmute::<usize, CreateInstance>(sign as usize), &CLSID_DxcValidator)?;
         let r = v.Validate(&container, DxcValidatorFlags_InPlaceEdit).map_err(|e| format!("validate: {e}"))?;
-        if r.GetStatus().map_err(|e| format!("validate: {e}"))?.is_err() {
-            return Err(format!("validate: {}", errors(&r)));
+        let status = r.GetStatus().map_err(|e| format!("validate: {e}"))?;
+        if status.is_err() {
+            return Err(format!("validate: {}", errors(&r, status)));
         }
-        Ok(std::slice::from_raw_parts(container.GetBufferPointer() as *const u8, container.GetBufferSize()).to_vec())
+        let bytes = blob_bytes(container.GetBufferPointer(), container.GetBufferSize()).map_err(|e| format!("assemble: {e}"))?;
+        if bytes.is_empty() {
+            return Err("assemble: empty DXIL container".into());
+        }
+        Ok(bytes.to_vec())
     }
 }
 
@@ -125,5 +159,79 @@ attributes #1 = { nounwind }
         let out = runner::dispatch(&dxil, [1, 1, 1], &[], &[0u32; 64]).unwrap();
         let want: Vec<u32> = (0..64).map(|i| 3 * i + 1).collect();
         assert_eq!(&out[..64], &want[..]);
+    }
+
+    #[test]
+    fn blob_bytes_and_blob_len_validate_null_empty_and_bounds() {
+        let sample = [1u8, 2, 3, 4];
+        unsafe {
+            assert_eq!(super::blob_bytes(std::ptr::null(), 0), Ok(&[][..]));
+            assert_eq!(super::blob_bytes(sample.as_ptr().cast(), 0), Ok(&[][..]));
+            assert!(super::blob_bytes(std::ptr::null(), 16).is_err());
+            assert_eq!(super::blob_bytes(sample.as_ptr().cast(), sample.len()), Ok(&sample[..]));
+        }
+        assert_eq!(super::blob_len(0), Ok(0));
+        assert_eq!(super::blob_len(u32::MAX as usize), Ok(u32::MAX));
+        #[cfg(target_pointer_width = "64")]
+        assert!(super::blob_len((u32::MAX as usize) + 1).is_err());
+    }
+
+    #[test]
+    fn make_rejects_null_interface_and_propagates_hresult() {
+        use windows::core::{IUnknown, GUID, HRESULT};
+        use windows::Win32::Foundation::{E_FAIL, S_OK};
+        unsafe extern "system" fn ok_null(_: *const GUID, _: *const GUID, out: *mut *mut std::ffi::c_void) -> HRESULT {
+            *out = std::ptr::null_mut();
+            S_OK
+        }
+        unsafe extern "system" fn fail_hr(_: *const GUID, _: *const GUID, _: *mut *mut std::ffi::c_void) -> HRESULT {
+            E_FAIL
+        }
+        let err = unsafe { super::make::<IUnknown>(ok_null, &GUID::zeroed()) }.unwrap_err();
+        assert!(err.contains("null interface"), "{err}");
+        assert!(unsafe { super::make::<IUnknown>(fail_hr, &GUID::zeroed()) }.is_err());
+    }
+
+    #[test]
+    fn errors_handles_null_empty_blob_trims_nuls_and_falls_back_to_hresult() {
+        use std::ffi::c_void;
+        use std::mem::{offset_of, size_of};
+        use windows::core::{IUnknown_Vtbl, Interface, HRESULT};
+        use windows::Win32::Foundation::{E_FAIL, S_OK};
+        use windows::Win32::Graphics::Direct3D::Dxc::{IDxcBlobEncoding_Vtbl, IDxcBlob_Vtbl, IDxcOperationResult, IDxcOperationResult_Vtbl};
+        #[repr(C)]
+        struct MockBlob { vtbl: *const usize, ptr: *const c_void, len: usize }
+        #[repr(C)]
+        struct MockOp { vtbl: *const usize, blob: *mut c_void, hr: HRESULT }
+        extern "system" fn unexpected() { std::process::abort(); }
+        unsafe extern "system" fn release(_: *mut c_void) -> u32 { 0 }
+        unsafe extern "system" fn buf_ptr(this: *mut c_void) -> *mut c_void { (*this.cast::<MockBlob>()).ptr as *mut c_void }
+        unsafe extern "system" fn buf_len(this: *mut c_void) -> usize { (*this.cast::<MockBlob>()).len }
+        unsafe extern "system" fn err_buf(this: *mut c_void, out: *mut *mut c_void) -> HRESULT {
+            let op = &*this.cast::<MockOp>();
+            if op.hr.is_err() { return op.hr; }
+            *out = op.blob;
+            S_OK
+        }
+        const SLOT: usize = size_of::<usize>();
+        let mut bvtbl = [unexpected as usize; size_of::<IDxcBlobEncoding_Vtbl>() / SLOT];
+        bvtbl[offset_of!(IUnknown_Vtbl, Release) / SLOT] = release as usize;
+        bvtbl[offset_of!(IDxcBlob_Vtbl, GetBufferPointer) / SLOT] = buf_ptr as usize;
+        bvtbl[offset_of!(IDxcBlob_Vtbl, GetBufferSize) / SLOT] = buf_len as usize;
+        let mut ovtbl = [unexpected as usize; size_of::<IDxcOperationResult_Vtbl>() / SLOT];
+        ovtbl[offset_of!(IDxcOperationResult_Vtbl, GetErrorBuffer) / SLOT] = err_buf as usize;
+        let run = |ptr: *const c_void, len: usize, hr: HRESULT| -> String {
+            let mut blob = MockBlob { vtbl: bvtbl.as_ptr(), ptr, len };
+            let mut op = MockOp { vtbl: ovtbl.as_ptr(), blob: std::ptr::from_mut(&mut blob).cast(), hr };
+            let raw = std::ptr::from_mut(&mut op).cast();
+            unsafe { super::errors(IDxcOperationResult::from_raw_borrowed(&raw).unwrap(), E_FAIL) }
+        };
+        let hr_str = format!("{E_FAIL:?}");
+        assert_eq!(run(std::ptr::null(), 0, S_OK), hr_str);
+        assert_eq!(run(b"  \0\0".as_ptr().cast(), 4, S_OK), hr_str);
+        assert_eq!(run(b"bad ir\n\0\0".as_ptr().cast(), 9, S_OK), "bad ir");
+        let corrupt = run(std::ptr::null(), 16, S_OK);
+        assert!(corrupt.contains("null DXC blob buffer") && corrupt.contains(&hr_str), "{corrupt}");
+        assert_eq!(run(std::ptr::null(), 0, E_FAIL), hr_str);
     }
 }
