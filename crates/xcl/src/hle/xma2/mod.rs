@@ -1792,7 +1792,10 @@ impl Decoder {
             self.current_stream = best;
         }
         for s in &mut self.streams {
-            s.skip_packets = s.skip_packets.saturating_sub(1);
+            // 0xFF is the XMA2 end-of-stream sentinel ("no more packets for this stream").
+            if s.skip_packets != 0xFF {
+                s.skip_packets = s.skip_packets.saturating_sub(1);
+            }
         }
     }
 
@@ -2360,5 +2363,30 @@ pub(crate) mod tests {
         assert!(dec.decode_buffer_i16(&ones, true).unwrap().is_empty());
         let garbage = vec![0x5Au8; PACKET_SIZE];
         let _ = dec.decode_buffer_i16(&garbage, true);
+    }
+
+    #[test]
+    fn eof_skip_packets_sentinel_255_is_never_decremented() {
+        let mut dec = Decoder::new(StreamConfig {
+            version: Version::Xma2,
+            sample_rate: 48_000,
+            channels: 4,
+            stream_channels: vec![2, 2],
+        })
+        .unwrap();
+        // Stream 0 signals EOF (skip_packets == 0xFF); stream 1 keeps decoding for 300 packets.
+        dec.current_stream = 0;
+        dec.streams[0].skip_packets = 0xFF;
+        dec.streams[1].skip_packets = 0;
+        for _ in 0..300 {
+            dec.advance_stream();
+            assert_eq!(dec.current_stream, 1, "active stream 1 must remain selected");
+            assert_eq!(dec.streams[0].skip_packets, 0xFF, "0xFF EOF sentinel must never decrement");
+        }
+        // Even if stream 1 sets skip_packets = 1, finished stream 0 (0xFF) must not steal the packet.
+        dec.streams[1].skip_packets = 1;
+        dec.advance_stream();
+        assert_eq!(dec.current_stream, 1, "finished stream 0 must not steal packets from stream 1");
+        assert_eq!(dec.streams[0].skip_packets, 0xFF);
     }
 }
