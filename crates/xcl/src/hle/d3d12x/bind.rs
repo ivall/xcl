@@ -2688,7 +2688,7 @@ unsafe fn prepare_two_pass_stage(
     if pso == 0 {
         return Err(if compute_pass { "two-pass compute pipeline" } else { "two-pass mesh pipeline" }.into());
     }
-    let w = |k: usize| super::real::uma_window_va(k).unwrap_or(first);
+    let w = |k: usize| window_view(super::real::uma_window_va(k), first);
     Ok(StageBind { rs, pso, views: [va(io_at), res_va, w(0), w(1), w(2), w(3)] })
 }
 
@@ -4315,6 +4315,14 @@ fn first_window(window0: Option<u64>, shadowed: bool) -> Result<u64, String> {
     Ok(first)
 }
 
+/// The root view a bind on XCL's ABI gives memory window `k` (`window`: `real::uma_window_va(k)`):
+/// its buffer, or `first` when it has none (no window, or no buffer on the GPU: 0). Direct DXIL
+/// compute reads every window slot (`with_mem_raw_loads`), so a null root view is a read of GPU
+/// VA 0, a page fault that removes the device.
+fn window_view(window: Option<u64>, first: u64) -> u64 {
+    window.filter(|&v| v != 0).unwrap_or(first)
+}
+
 /// Whether dispatches pass `recomp::dispatch_loop_budget` (`XCL_DISPATCH_LOOP_BUDGET=0`, read
 /// once: they leave `IO_LOOP_BUDGET` at 0 and every loop has the lane's 65 536 passes in both
 /// translators, as before, to compare). Here, not in `recomp`: that module's source is part of
@@ -4459,7 +4467,7 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
     views[1] = va(res_at);
     // (every window slot gets a buffer: direct DXIL compute reads all four, `with_mem_raw_loads`)
     for k in 0..4 {
-        views[2 + k] = super::real::uma_window_va(k).filter(|&v| v != 0).unwrap_or(first);
+        views[2 + k] = window_view(super::real::uma_window_va(k), first);
     }
     let real = real as *mut c_void;
     let pc = ID3D12PipelineState::from_raw_borrowed(&real).ok_or("pipeline")?.clone();
@@ -5683,6 +5691,16 @@ void main(uint t : SV_GroupIndex) {
         assert!(first_window(Some(0), true).is_err());
         assert_eq!(first_window(Some(0), false), Ok(0));
         assert_eq!(first_window(Some(0x7_0000_0000), true), Ok(0x7_0000_0000));
+    }
+
+    /// A window without a buffer on the GPU (address 0) gets window 0's buffer in both binds on
+    /// XCL's ABI (`bind_abi` and the two-pass stages), never a null root view.
+    #[test]
+    fn windows_without_a_buffer_take_window_0() {
+        let first = 0x7_0000_0000;
+        assert_eq!(window_view(Some(0), first), first);
+        assert_eq!(window_view(None, first), first);
+        assert_eq!(window_view(Some(0x8_0000_0000), first), 0x8_0000_0000);
     }
 
     /// The two passes get the addresses of the heaps set after their arguments, the view heap's
