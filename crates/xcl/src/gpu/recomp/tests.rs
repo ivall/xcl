@@ -48,6 +48,26 @@ fn mesh_ready() -> bool {
     }
 }
 
+/// A D3D12 that cannot place a heap over process memory: D3DMetal answers E_NOTIMPL
+/// (0x80004001) to `OpenExistingHeapFromAddress`. Such a host has no GPU UMA, so a test that
+/// needs it skips; any other error still fails the test.
+fn no_host_heaps(err: &str) -> bool {
+    if err.starts_with("OpenExistingHeapFromAddress") && err.contains("0x80004001") {
+        println!("no heaps over process memory on this D3D12 – skipping ({err})");
+        runner::skip_test("no GPU UMA");
+        return true;
+    }
+    false
+}
+
+/// `runner::run_in_arena`, or `None` after a `no_host_heaps` skip.
+fn run_in_arena_or_skip(dxil: &[u8], st: &KernelState, arena: &crate::gpu::uma::Uma) -> Option<runner::KernelResult> {
+    match runner::run_in_arena(dxil, st, arena) {
+        Err(e) if no_host_heaps(&e) => None,
+        r => Some(r.unwrap()),
+    }
+}
+
 /// The wave sizes a per-lane test runs in, as the `wave64` option: true where the GPU has
 /// wave64, and false on every GPU, so the test also runs on NVIDIA. Empty without a GPU or DXC.
 fn gpu_waves() -> Vec<bool> {
@@ -4106,7 +4126,7 @@ fn gpu_unified_memory_arena() {
         r[0] = l as u32;
         r[2] = 7 * l as u32;
     }
-    let r = runner::run_in_arena(&dxil, &st, &arena).unwrap();
+    let Some(r) = run_in_arena_or_skip(&dxil, &st, &arena) else { return };
     assert_eq!((r.sgpr[20], r.sgpr[21]), (0xC0FFEE, 0x1234), "s_load from process memory");
     for l in 0..64 {
         assert_eq!(r.vgpr[l][1], 1000 + l as u32, "lane {l} buffer_load from process memory");
@@ -4159,16 +4179,18 @@ fn gpu_mesh_mode_reads_memory_windows() {
     // V#: the vertex table in window 1, stride 16, 3 records
     st.sgpr[16..20].copy_from_slice(&[(w1 + 0x100) as u32, ((w1 >> 32) as u32) & 0xFFFF | 16 << 16, 3, 0]);
     let vd = ms.vert_dwords();
-    let positions = |windows: u32| -> Vec<[f32; 4]> {
+    let positions = |windows: u32| -> Option<Vec<[f32; 4]>> {
         let t = super::translate_mesh(&code, ms.clone(), true, runner::split_wave64(), windows).unwrap();
         assert!(t.complete(), "{:?}", t.unsupported_why);
         let cs = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}"));
-        let r = runner::run_in_arena(&cs, &st, &arena).unwrap();
+        let r = run_in_arena_or_skip(&cs, &st, &arena)?;
         assert_eq!((r.raw[0], r.raw[1]), (3, 1), "GS_ALLOC_REQ counts ({windows} windows)");
-        (0..3).map(|v| std::array::from_fn(|c| f32::from_bits(r.raw[MESH_HEADER + v * vd + c]))).collect()
+        Some((0..3).map(|v| std::array::from_fn(|c| f32::from_bits(r.raw[MESH_HEADER + v * vd + c]))).collect())
     };
-    assert_eq!(positions(2), vec![[-1.0, -1.0, 0.0, 1.0], [-1.0, 1.0, 0.0, 1.0], [0.0, -1.0, 0.0, 1.0]], "the vertex table from window 1");
-    assert_eq!(positions(1)[0], [9.0; 4], "one window: window 0 at the same offset (the old MS / GS translation)");
+    let Some(two) = positions(2) else { return };
+    assert_eq!(two, vec![[-1.0, -1.0, 0.0, 1.0], [-1.0, 1.0, 0.0, 1.0], [0.0, -1.0, 0.0, 1.0]], "the vertex table from window 1");
+    let Some(one) = positions(1) else { return };
+    assert_eq!(one[0], [9.0; 4], "one window: window 0 at the same offset (the old MS / GS translation)");
 }
 
 /// Memory above 4 GiB: two UMA windows 4 GiB apart; every access kind picks its window from
@@ -4249,7 +4271,7 @@ fn memory_windows_above_4_gib(heap: bool) {
         r[9] = hi(w1);
         r[11] = 1;
     }
-    let r = runner::run_in_arena(&dxil, &st, &arena).unwrap();
+    let Some(r) = run_in_arena_or_skip(&dxil, &st, &arena) else { return };
     assert_eq!((r.sgpr[20], r.sgpr[21]), (0xC0FFEE, 0x1234), "s_load from window 1");
     assert_eq!(r.sgpr[24..28], [1001, 1002, 1003, 1004], "s_buffer_load_dwordx4 from window 1");
     for l in 0..64u64 {
@@ -4368,7 +4390,7 @@ fn memory_windows_reject_out_of_uma_aliasing(heap: bool) {
         r[18] = 0x7777_7777;
     }
 
-    let r = runner::run_in_arena(&dxil, &st, &arena).unwrap();
+    let Some(r) = run_in_arena_or_skip(&dxil, &st, &arena) else { return };
     assert_eq!(r.sgpr[30], 0, "out-of-UMA s_load must return 0");
     assert_eq!(r.sgpr[31], 0xABCD_0123, "hi == 0 s_load must still read window 0 (32-bit descriptor tables)");
     assert_eq!(r.vgpr[0][2], 0, "out-of-UMA buffer_load must return 0");
@@ -4504,6 +4526,9 @@ fn gpu_sparse_vram_descriptors_buffers_and_xmem() {
     assert_eq!(u.shader_windows(), 4, "runtime layout has 4 shader windows");
     assert!(u.is_sparse_window(0) && u.is_sparse_window(1) && u.is_sparse_window(2), "windows 0..2 sparse VRAM");
     assert!(u.is_committed_window(3), "window 3 coherent committed RAM");
+    if no_host_heaps(&crate::hle::d3d12x::real::stats().uma_error) {
+        return;
+    }
     let windows = crate::hle::d3d12x::real::uma_window_vas();
     assert_eq!(windows.len(), 4);
     assert!(windows.iter().all(|&va| va != 0), "all 4 window GPU VAs must be valid: {windows:x?}");
@@ -5650,7 +5675,7 @@ fn gpu_bvh64_intersect_ray_across_memory_windows_and_grazing() {
         r[40] = 5; // relative root box32 at bvh_addr
         put_ray(r, 41);
     }
-    let res = runner::run_in_arena(&dxil, &st, &arena).unwrap();
+    let Some(res) = run_in_arena_or_skip(&dxil, &st, &arena) else { return };
     const F: u32 = u32::MAX;
     for l in 0..64usize {
         let v = &res.vgpr[l];
