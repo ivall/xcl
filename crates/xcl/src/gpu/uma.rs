@@ -196,6 +196,10 @@ impl Uma {
     /// the title can (a quarter of that window at most); the title's allocations still start
     /// at the window's start.
     pub fn reserve_pool(&self, bytes: usize) {
+        let mut pool = self.pool.lock().unwrap();
+        if pool.0 != 0 {
+            return;
+        }
         let Some(win) = self.kinds.iter().position(|w| matches!(w, WindowKind::Committed(_))) else { return };
         let win_size = self.window(win).1;
         let bytes = (bytes.min(win_size / 4) / ARENA_BLOCK) * ARENA_BLOCK;
@@ -222,7 +226,7 @@ impl Uma {
         };
         let p = self.base + at;
         unsafe { std::ptr::write_bytes(p as *mut u8, 0, bytes) };
-        *self.pool.lock().unwrap() = (p, p + bytes, (p..p + bytes).step_by(ARENA_BLOCK).rev().collect());
+        *pool = (p, p + bytes, (p..p + bytes).step_by(ARENA_BLOCK).rev().collect());
     }
 
     /// A block of `ARENA_BLOCK` bytes from XCL's pool (None: the pool is used up or absent).
@@ -702,6 +706,9 @@ impl Uma {
             // a block of XCL's pool goes back to the pool
             let mut g = self.pool.lock().unwrap();
             if p >= g.0 && p < g.1 {
+                if (p - g.0) % ARENA_BLOCK != 0 || g.2.contains(&p) {
+                    return false;
+                }
                 g.2.push(p);
                 return true;
             }
@@ -761,15 +768,20 @@ impl Arena {
     /// `n` bytes at an `align`-aligned address in committed unified memory (not zeroed), or
     /// None when committed unified memory is full.
     pub fn take(&mut self, u: &Uma, n: usize, align: usize, blocks: &mut Vec<usize>) -> Option<*mut u8> {
-        let align = align.max(16).next_power_of_two();
+        let align = align.max(16).checked_next_power_of_two()?;
         let n = n.max(1);
-        let at = (self.at + align - 1) & !(align - 1);
-        if self.at != 0 && at + n <= self.end {
-            self.at = at + n;
-            return Some(at as *mut u8);
+        if self.at != 0 {
+            if let Some(at) = self.at.checked_add(align - 1).map(|v| v & !(align - 1)) {
+                if let Some(next) = at.checked_add(n) {
+                    if next <= self.end {
+                        self.at = next;
+                        return Some(at as *mut u8);
+                    }
+                }
+            }
         }
-        if n > ARENA_BLOCK / 2 {
-            // a large piece: a block of its own (the current one stays in use)
+        if n > ARENA_BLOCK / 2 || align > GRAIN {
+            // a large or over-aligned piece: a block of its own (the current one stays in use)
             let p = u.alloc(n, align)?;
             blocks.push(p as usize);
             return Some(p);
@@ -1193,6 +1205,25 @@ mod tests {
     }
 
     #[test]
+    fn arena_take_enforces_large_alignment_and_checks_overflow() {
+        let u = Uma::with_windows(1, 4 << 20).unwrap();
+        // Occupy the first GRAIN so the next GRAIN-aligned block is NOT (2 * GRAIN)-aligned.
+        let _first = u.alloc(GRAIN, GRAIN).unwrap();
+        let mut a = Arena::default();
+        let mut blocks = Vec::new();
+        let p = a.take(&u, 256, 2 * GRAIN, &mut blocks).unwrap();
+        assert_eq!((p as usize) % (2 * GRAIN), 0, "Arena::take must honor align > GRAIN");
+
+        // Seed self.at != 0, then verify huge n / align return None instead of overflowing.
+        assert!(a.take(&u, 64, 16, &mut blocks).is_some());
+        assert!(a.take(&u, usize::MAX, 16, &mut blocks).is_none());
+        assert!(a.take(&u, 16, usize::MAX, &mut blocks).is_none());
+        for b in blocks {
+            assert!(u.free(b));
+        }
+    }
+
+    #[test]
     fn expanded_heap_window_shaders_translate_and_validate() {
         use crate::gpu::dxil::kernel::{translate, KernelOptions};
         use crate::gpu::rdna2::encode;
@@ -1234,6 +1265,32 @@ mod tests {
         assert_eq!(u.window_of(a), Some(0));
         assert_eq!(u.window_of(b), Some(1));
         assert!(u.free(a) && u.free(b));
+    }
+
+    #[test]
+    fn pool_free_rejects_interior_and_duplicate_pointers() {
+        let u = Uma::with_windows(1, 8 << 20).unwrap();
+        u.reserve_pool(2 * ARENA_BLOCK);
+        // Second reserve_pool call must be a no-op so it does not leak/orphan the first pool.
+        let used_after_first = u.used();
+        u.reserve_pool(2 * ARENA_BLOCK);
+        assert_eq!(u.used(), used_after_first);
+
+        let mut a = Arena::default();
+        let mut blocks = Vec::new();
+        assert!(a.take(&u, 64, 16, &mut blocks).is_some());
+        let b = blocks[0];
+        assert!(!u.free(b + 0x100), "interior pointer into pool block must be rejected");
+        assert!(u.free(b), "first free of pool block succeeds");
+        assert!(!u.free(b), "duplicate free of pool block must be rejected");
+
+        let mut drained = Vec::new();
+        while let Some(p) = u.pool_block() {
+            assert_eq!((p - u.pool.lock().unwrap().0) % ARENA_BLOCK, 0);
+            assert!(!drained.contains(&p));
+            drained.push(p);
+        }
+        assert_eq!(drained.len(), 2);
     }
 }
 
