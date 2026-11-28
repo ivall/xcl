@@ -109,6 +109,10 @@ pub fn exports() -> Vec<(&'static str, usize)> {
 pub const MEM_GRAPHICS: u32 = 0x1000_0000;
 mod placeholders;
 pub mod lazy;
+#[allow(dead_code)] // `replace_with_reservation` and its inverse: not used yet
+pub mod sections;
+pub mod guards;
+pub mod alias;
 pub const MEM_TITLE: u32 = 0x4000_0000;
 const STD_ALLOC_MASK: u32 = 0x1000 | 0x2000 | 0x8_0000 | 0x10_0000 | 0x20_0000 | 0x100_0000;
 const STD_PROTECT_MASK: u32 = 0xFF | 0x100 | 0x200 | 0x400;
@@ -213,8 +217,148 @@ pub mod mirrors {
     pub fn released(base: usize) {
         let mut s = STATE.lock().unwrap();
         s.cpu.retain(|&(b, _)| b != base);
-        s.gpu.remove(&base);
-        s.gpu.retain(|_, &mut (_, c)| c != base);
+        // the GPU views that go with it, and the pages mapped into them
+        let gone: Vec<(usize, usize)> = s.gpu.iter().filter(|&(&g, &(_, c))| g == base || c == base).map(|(&g, &(n, _))| (g, n)).collect();
+        for (g, n) in gone {
+            s.gpu.remove(&g);
+            let mut pages = PAGES.lock().unwrap();
+            let keys: Vec<usize> = pages.range(g..g + n).map(|(&k, _)| k).collect();
+            for k in keys {
+                pages.remove(&k);
+            }
+        }
+    }
+
+    /// Bytes of a page the queue's page-mapping method maps (the console's 64 KiB pages).
+    pub const PAGE: usize = 0x1_0000;
+
+    /// What a GPU-view page shows after the page-mapping method: the pool page it was given,
+    /// and the physical page the title had mapped there then (`None`: none). The console maps
+    /// that physical page, which the title often maps into the CPU view too – XCL keeps its
+    /// data where it was mapped last (`super::page_now`).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct Shown {
+        pub pool: usize,
+        pub page: Option<usize>,
+    }
+
+    /// Pages of GPU views the title pointed somewhere else with the queue's page-mapping
+    /// method (`CopyPageMappingsBatchX`, `apply_batches`): GPU-view page → what it shows, or
+    /// `None` for a page left unmapped. A page not listed shows its CPU view (`source`).
+    static PAGES: Mutex<BTreeMap<usize, Option<Shown>>> = Mutex::new(BTreeMap::new());
+
+    /// What the page-mapping method put under `va`: `Some(Some(a))` – `va` shows the bytes at
+    /// `a` (where XCL keeps the physical page now, else the pool page itself), `Some(None)` –
+    /// nothing (unmapped), `None` – the method never mapped that page.
+    pub fn mapped_source(va: usize) -> Option<Option<usize>> {
+        let off = va & (PAGE - 1);
+        let shown = *PAGES.lock().unwrap().get(&(va - off))?;
+        Some(shown.map(|s| s.page.and_then(super::page_now).unwrap_or(s.pool) + off))
+    }
+
+    /// One call of the queue's page-mapping method, `CopyPageMappingsBatchX(count, batches,
+    /// pool, pool pages, flags)` (queue #29; #31 in the newer layout). `count` batches of 24
+    /// bytes – the first destination address (u64), the number of ranges (u32), a pointer to
+    /// them at +16 – each range three u32: the kind (0: `count` pool pages from `start` on,
+    /// 1: pool page `start` at each of `count` pages, 2: unmapped, 3: left as they are),
+    /// `start` and `count`. Pages are 64 KiB; the pool is `pool_pages` of them at `pool`.
+    /// The layout as VIctory describes it (`crates/victory-gpu/src/queue.rs`, a reference
+    /// only: no code taken). Only pages of GPU views are recorded (the retail title maps into
+    /// nothing else). `None` – nothing recorded – when a batch or a range is not readable, a
+    /// range leaves the pool or has an unknown kind, or the call names over `MOST` pages.
+    pub unsafe fn apply_batches(count: u32, batches: usize, pool: usize, pool_pages: u32) -> Option<Mapped> {
+        let changes = decode_batches(count, batches, pool, pool_pages)?;
+        record(changes)
+    }
+
+    /// The mappings of one call of the page-mapping method (`apply_batches`), checked whole:
+    /// (GPU-view page, the pool page it is given or `None`: unmapped), in the call's order.
+    /// `None` when a batch or a range is not readable, a range leaves the pool or has an unknown
+    /// kind, or the call names over `MOST` pages.
+    pub unsafe fn decode_batches(count: u32, batches: usize, pool: usize, pool_pages: u32) -> Option<Vec<(usize, Option<usize>)>> {
+        const BATCH: usize = 24;
+        const RANGE: usize = 12;
+        const MOST: usize = 1 << 20;
+        let readable = crate::gpu::shader::readable;
+        let n = count as usize;
+        if n == 0 {
+            return Some(Vec::new());
+        }
+        if n > MOST || !readable(batches, n * BATCH) {
+            return None;
+        }
+        // checked whole first, so a bad call records nothing
+        let mut changes: Vec<(usize, Option<usize>)> = Vec::new();
+        for b in 0..n {
+            let p = batches + b * BATCH;
+            let dest = (p as *const u64).read_unaligned() as usize & !(PAGE - 1);
+            let ranges_n = ((p + 8) as *const u32).read_unaligned() as usize;
+            let ranges = ((p + 16) as *const usize).read_unaligned();
+            if ranges_n == 0 {
+                continue;
+            }
+            if ranges_n > MOST || !readable(ranges, ranges_n * RANGE) {
+                return None;
+            }
+            let mut at = dest;
+            for r in 0..ranges_n {
+                let q = (ranges + r * RANGE) as *const u32;
+                let (kind, start, len) = (q.read_unaligned(), q.add(1).read_unaligned() as usize, q.add(2).read_unaligned() as usize);
+                let inside = |k: usize| start.checked_add(k).is_some_and(|e| e <= pool_pages as usize);
+                if changes.len() + len > MOST || at.checked_add(len * PAGE).is_none() {
+                    return None;
+                }
+                match kind {
+                    0 if inside(len) => changes.extend((0..len).map(|k| (at + k * PAGE, Some(pool + (start + k) * PAGE)))),
+                    1 if inside(1) => changes.extend((0..len).map(|k| (at + k * PAGE, Some(pool + start * PAGE)))),
+                    2 => changes.extend((0..len).map(|k| (at + k * PAGE, None))),
+                    3 => {}
+                    _ => return None,
+                }
+                at += len * PAGE;
+            }
+        }
+        Some(changes)
+    }
+
+    /// `apply_batches`'s record of the decoded mappings.
+    unsafe fn record(changes: Vec<(usize, Option<usize>)>) -> Option<Mapped> {
+        // the physical page the title has mapped at each pool page: what the console maps
+        let changes: Vec<(usize, Option<Shown>)> = {
+            let away = super::AWAY.lock().unwrap();
+            let title = |pool: usize| away.as_ref().and_then(|a| a.title_page(pool));
+            changes.into_iter().map(|(va, to)| (va, to.map(|pool| Shown { pool, page: title(pool) }))).collect()
+        };
+        let s = STATE.lock().unwrap();
+        let in_view = |va: usize| s.gpu.range(..=va).next_back().is_some_and(|(&g, &(size, _))| va < g + size);
+        let mut out = Mapped::default();
+        let mut pages = PAGES.lock().unwrap();
+        for (va, to) in changes {
+            if !in_view(va) {
+                out.elsewhere += 1;
+                continue;
+            }
+            match to {
+                Some(s) => {
+                    out.mapped += 1;
+                    out.physical += s.page.is_some() as u64;
+                }
+                None => out.unmapped += 1,
+            }
+            pages.insert(va, to);
+        }
+        Some(out)
+    }
+
+    /// What one `apply_batches` call did, in 64 KiB pages.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct Mapped {
+        pub mapped: u64,
+        /// of those, pages whose pool page had a physical page the title mapped there
+        pub physical: u64,
+        pub unmapped: u64,
+        /// pages outside any GPU view: not recorded
+        pub elsewhere: u64,
     }
 
     /// The CPU-view address behind `va` when `va` lies in a GPU view.
@@ -275,6 +419,21 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
         return q;
     }
     let uma = crate::gpu::uma::get();
+    // physical page aliasing: the title's reservations of 64 KiB pages hold views of its pages,
+    // so it maps pages there and does not commit memory of its own (a retail title never does)
+    if alias::enabled() && !addr.is_null() && t & 0x1000 != 0 && alias::in_space(addr as usize) {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| crate::xlog_warn!("VirtualAlloc: a commit at {addr:p} in a reservation of 64 KiB pages that holds physical pages (XCL_PAGE_ALIAS) – refused"));
+        fnd::SetLastError(fnd::ERROR_INVALID_ADDRESS);
+        return std::ptr::null_mut();
+    }
+    if alias::enabled() && addr.is_null() && t & 0x2000 != 0 && t & 0x1000 == 0 && t & MEM_64K_PAGES == MEM_64K_PAGES {
+        if let Some(q) = alias::reserve_space(size) {
+            mirrors::reserved(q, size, t, p);
+            trace_mem("VirtualAlloc (64K pages, physical page space)", 0, size, t as u64, p, q);
+            return q as *mut c_void;
+        }
+    }
     // committing inside one of the title's reservations in a sparse window
     if !addr.is_null() && t & 0x1000 != 0 && uma.is_some_and(|u| u.is_sparse(addr as usize)) {
         let q = commit_sparse(addr as usize, size, p);
@@ -436,6 +595,14 @@ pub unsafe extern "system" fn VirtualFree(addr: *mut c_void, size: usize, t: u32
     if let Some(ok) = placeholders::free(addr, size, t) {
         return ok;
     }
+    if alias::enabled() {
+        if let Some(ok) = alias::free_space(addr as usize, size, t) {
+            if ok && t & mem::MEM_RELEASE != 0 {
+                mirrors::released(addr as usize);
+            }
+            return ok as BOOL;
+        }
+    }
     // the title's reservations in a sparse window: decommit (and on release give the address
     // space back); their video memory goes with it
     if let Some(u) = crate::gpu::uma::get().filter(|u| u.is_sparse(addr as usize)) {
@@ -474,6 +641,7 @@ pub unsafe extern "system" fn VirtualFree(addr: *mut c_void, size: usize, t: u32
         if release {
             u.sparse_release(a);
             mirrors::released(a);
+            forget_title_mappings(a, n);
         }
         return 1;
     }
@@ -487,9 +655,13 @@ pub unsafe extern "system" fn VirtualFree(addr: *mut c_void, size: usize, t: u32
         return 1;
     }
     let ok = mem::VirtualFree(addr, size, t);
-    if ok != 0 && t & 0x8000 != 0 && GRAPHICS_RESERVATIONS.lock().unwrap().remove(&(addr as usize)).is_some() {
-        GRAPHICS_RESERVATIONS_GEN.fetch_add(1, Ordering::Release);
-        mirrors::released(addr as usize);
+    if ok != 0 && t & 0x8000 != 0 {
+        let released = GRAPHICS_RESERVATIONS.lock().unwrap().remove(&(addr as usize));
+        if let Some(len) = released {
+            GRAPHICS_RESERVATIONS_GEN.fetch_add(1, Ordering::Release);
+            mirrors::released(addr as usize);
+            forget_title_mappings(addr as usize, len);
+        }
     }
     ok
 }
@@ -499,6 +671,7 @@ pub unsafe extern "system" fn VirtualFreeEx(proc_: HANDLE, addr: *mut c_void, si
         let a = addr as usize;
         if crate::gpu::uma::get().is_some_and(|u| u.is_sparse(a) || u.contains(a))
             || (t & 0x8000 != 0 && in_graphics_reservation(a))
+            || alias::in_space(a)
         {
             return VirtualFree(addr, size, t);
         }
@@ -954,12 +1127,51 @@ struct Away {
     /// homes in a sparse window whose pages went away in this call, given back at its end in
     /// runs (`give_back_homes`): one page at a time, a retail game's start took 20 s
     gone: Vec<usize>,
+    /// address → the page the title mapped there last. On the console a page stays mapped at
+    /// every address it was mapped at; here its data is in one place (`page`), so an address it
+    /// moved away from still names it here (the queue's page-mapping method maps the pages of
+    /// such addresses: `mirrors::apply_batches`).
+    title: std::collections::HashMap<usize, usize>,
+    /// pages the title freed while others of their allocation live (`page_home` still knows
+    /// the block): no page is behind such a number any more (numbers are never handed out
+    /// again), so `page_now` answers none for it
+    freed: std::collections::HashSet<usize>,
+}
+
+impl Away {
+    /// The page the title mapped at `at` last, if the title has not freed it.
+    fn title_page(&self, at: usize) -> Option<usize> {
+        self.title.get(&at).copied().filter(|p| !self.freed.contains(p))
+    }
+}
+
+/// The title released `[base, base + len)`: the pages it mapped there are mapped there no more.
+fn forget_title_mappings(base: usize, len: usize) {
+    if let Some(a) = AWAY.lock().unwrap().as_mut() {
+        a.title.retain(|&at, _| at < base || at >= base.saturating_add(len));
+    }
 }
 static AWAY: std::sync::Mutex<Option<Away>> = std::sync::Mutex::new(None);
+
+/// Where page `page`'s data is now: the address it is mapped at away from home, else its home
+/// (`None`: no allocated page has that number).
+fn page_now(page: usize) -> Option<usize> {
+    let (freed, away) = match AWAY.lock().unwrap().as_ref() {
+        Some(a) => (a.freed.contains(&page), a.page.get(&page).copied()),
+        None => (false, None),
+    };
+    if freed {
+        return None;
+    }
+    away.or_else(|| page_home(page))
+}
 
 /// Whether a physical page is mapped at the page holding `va` away from its home – committed
 /// or not yet (`lazy`: a page never used is committed at its first access).
 pub fn physical_page_at(va: usize) -> bool {
+    if alias::enabled() {
+        return alias::physical_page_at(va);
+    }
     AWAY.lock().unwrap().as_ref().is_some_and(|a| a.at.contains_key(&(va & !(PHYS_PAGE - 1))))
 }
 
@@ -970,6 +1182,12 @@ static GPU_VIEW_MAP_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 /// Generation of the physical-page mappings inside GPU views.
 pub fn gpu_view_map_gen() -> u64 {
     GPU_VIEW_MAP_GEN.load(Ordering::Acquire)
+}
+
+/// The queue's page-mapping method mapped pages at `va`: a GPU view's mappings changed if it
+/// lies in one (textures there look again).
+pub fn note_gpu_view_mapping(va: usize) {
+    note_mapping_at(va);
 }
 
 /// Pages are mapped or unmapped at `va`: a GPU view's mappings changed if it lies in one.
@@ -1037,6 +1255,9 @@ unsafe fn resolve_physical_pages(away: Option<&Away>, pages: &[usize], offset: u
 /// number from `AllocateTitlePhysicalPages`). Returns `false` if `offset >= PHYS_PAGE_SIZE`,
 /// `pages` is too short, or any page is not a live allocation.
 pub unsafe fn read_physical_pages(pages: &[usize], offset: usize, dst: &mut [u8]) -> bool {
+    if alias::enabled() {
+        return alias::read(pages, offset, dst);
+    }
     if dst.is_empty() {
         return offset < PHYS_PAGE;
     }
@@ -1056,6 +1277,9 @@ pub unsafe fn read_physical_pages(pages: &[usize], offset: usize, dst: &mut [u8]
 /// Copy `src` into `pages` starting at `offset` within the first page. Validates every page
 /// before writing so the destination gets all bytes or nothing.
 pub unsafe fn write_physical_pages(pages: &[usize], offset: usize, src: &[u8]) -> bool {
+    if alias::enabled() {
+        return alias::write(pages, offset, src);
+    }
     if src.is_empty() {
         return offset < PHYS_PAGE;
     }
@@ -1312,6 +1536,13 @@ pub unsafe extern "system" fn AllocateTitlePhysicalPages(_p: HANDLE, _t: u32, nu
         fnd::SetLastError(fnd::ERROR_NOT_ENOUGH_MEMORY);
         return 0;
     };
+    if alias::enabled() {
+        if alias::allocate(n, arr) {
+            return 1;
+        }
+        fnd::SetLastError(fnd::ERROR_NOT_ENOUGH_MEMORY);
+        return 0;
+    }
     let Some(u) = crate::gpu::uma::get() else {
         fnd::SetLastError(fnd::ERROR_NOT_ENOUGH_MEMORY);
         return 0;
@@ -1331,20 +1562,36 @@ pub unsafe extern "system" fn AllocateTitlePhysicalPages(_p: HANDLE, _t: u32, nu
 }
 
 pub unsafe extern "system" fn FreeTitlePhysicalPages(_p: HANDLE, n: usize, arr: *mut usize) -> BOOL {
+    if alias::enabled() {
+        if arr.is_null() {
+            fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
+            return 0;
+        }
+        alias::free(std::slice::from_raw_parts(arr, n));
+        return 1;
+    }
     let Some(u) = crate::gpu::uma::get() else { return 0 };
     if arr.is_null() {
         fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
         return 0;
     }
     // freed pages mapped elsewhere: that address keeps whatever it holds, the mapping goes
-    if let Some(away) = AWAY.lock().unwrap().as_mut() {
+    {
+        let mut g = AWAY.lock().unwrap();
+        let away = g.get_or_insert_with(Away::default);
         for i in 0..n {
-            if let Some(at) = away.page.remove(&*arr.add(i)) {
+            let page = *arr.add(i);
+            if let Some(at) = away.page.remove(&page) {
                 away.at.remove(&at);
                 note_mapping_at(at);
             }
+            if page_index(page).is_some() {
+                away.freed.insert(page);
+            }
         }
     }
+    // (blocks gone whole: their numbers need no `freed` entries)
+    let mut gone: Vec<(usize, usize)> = Vec::new();
     let mut g = PHYS_BLOCKS.lock().unwrap();
     for i in 0..n {
         let Some(page) = page_index(*arr.add(i)) else { continue };
@@ -1357,6 +1604,7 @@ pub unsafe extern "system" fn FreeTitlePhysicalPages(_p: HANDLE, n: usize, arr: 
         e.1 = e.1.saturating_sub(1);
         if e.1 == 0 {
             g.remove(&first);
+            gone.push((first, count));
             if u.is_sparse(home) {
                 crate::hle::d3d12x::sparse::free(home);
             } else if u.contains(home) {
@@ -1366,15 +1614,36 @@ pub unsafe extern "system" fn FreeTitlePhysicalPages(_p: HANDLE, n: usize, arr: 
             }
         }
     }
+    drop(g);
+    if !gone.is_empty() {
+        if let Some(away) = AWAY.lock().unwrap().as_mut() {
+            away.freed.retain(|&p| page_index(p).is_none_or(|i| !gone.iter().any(|&(f, c)| i >= f && i < f + c)));
+        }
+    }
     1
 }
 
 pub unsafe extern "system" fn MapTitlePhysicalPages(va: *mut c_void, n: usize, _t: u32, _p: u32, arr: *mut usize) -> *mut c_void {
+    if alias::enabled() {
+        return map_aliased(va, n, arr);
+    }
     let mut g = AWAY.lock().unwrap();
     let away = g.get_or_insert_with(Away::default);
     let r = map_pages(away, va, n, arr);
     give_back_homes(away);
     r
+}
+
+/// `MapTitlePhysicalPages` with physical page aliasing (`alias`): the title always names the
+/// address (a retail title never maps a page at its home, which is XCL's own view here).
+unsafe fn map_aliased(va: *mut c_void, n: usize, arr: *mut usize) -> *mut c_void {
+    if va.is_null() || n == 0 {
+        fnd::SetLastError(if va.is_null() { fnd::ERROR_NOT_SUPPORTED } else { fnd::ERROR_INVALID_PARAMETER });
+        return std::ptr::null_mut();
+    }
+    note_mapping_at(va as usize);
+    let pages: Vec<usize> = if arr.is_null() { vec![0; n] } else { std::slice::from_raw_parts(arr, n).to_vec() };
+    if alias::map(va as usize, &pages) { va } else { std::ptr::null_mut() }
 }
 
 /// `MapTitlePhysicalPages` with `AWAY` held; the homes it moves away are given back by the
@@ -1404,6 +1673,9 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
         }
         // (pages this call moved away and back are home again, not given back)
         away.gone.retain(|&h| h < home || h >= home + n * PHYS_PAGE);
+        for (i, &p) in pages.iter().enumerate() {
+            away.title.insert(home + i * PHYS_PAGE, p);
+        }
         for &p in &pages {
             if let Some(&at) = away.page.get(&p) {
                 unmap_away(away, at, &(home..home + n * PHYS_PAGE));
@@ -1425,6 +1697,8 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
     let (mut at_run, mut home_run) = (StateRun::default(), StateRun::default());
     for (i, &p) in pages.iter().enumerate() {
         let at = base + i * PHYS_PAGE;
+        // what was mapped at `at` goes; the new page is written down once it is in place
+        away.title.remove(&at);
         if unmap_away(away, at, &(0..0)) {
             (at_run, home_run) = Default::default();
         }
@@ -1437,6 +1711,7 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
             match move_away(away, old, at, p, in_uma(at)) {
                 Ok(true) => {
                     (at_run, home_run) = Default::default();
+                    away.title.insert(at, p);
                     continue;
                 }
                 // a lazy page is only unmarked: memory is as it was, the runs stay
@@ -1456,6 +1731,7 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
             lazy::mark(at);
             away.at.insert(at, p);
             away.page.insert(p, at);
+            away.title.insert(at, p);
             continue;
         }
         if !in_uma(at) && mem::VirtualAlloc(at as *const c_void, PHYS_PAGE, mem::MEM_COMMIT, mem::PAGE_READWRITE).is_null() {
@@ -1475,6 +1751,7 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
         }
         away.at.insert(at, p);
         away.page.insert(p, at);
+        away.title.insert(at, p);
     }
     va
 }
@@ -1498,6 +1775,9 @@ pub unsafe extern "system" fn XMemMapPhysicalPagesScatter(addresses: *const *mut
     if addresses.is_null() {
         fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
         return 0;
+    }
+    if alias::enabled() {
+        return (0..n).all(|i| !map_aliased(*addresses.add(i), 1, pages.add(i) as *mut usize).is_null()) as BOOL;
     }
     if crate::gpu::uma::get().is_none() {
         fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
@@ -2824,7 +3104,7 @@ mod tests {
             let at = mem::VirtualAlloc(std::ptr::null(), PHYS_PAGE, mem::MEM_RESERVE, mem::PAGE_READWRITE) as usize;
             mem::VirtualFree(at as *mut c_void, 0, mem::MEM_RELEASE);
             let page = 0x7E57_0000usize;
-            let mut away = Away { at: Default::default(), page: Default::default(), gone: Vec::new() };
+            let mut away = Away::default();
             away.at.insert(old, page);
             away.page.insert(page, old);
             assert!(move_away(&mut away, old, at, page, false).is_err());
@@ -3077,6 +3357,146 @@ mod tests {
         mirrors::released(a);
         assert_eq!(mirrors::source(b), None, "released with its CPU view");
         mirrors::released(other);
+    }
+
+    /// A batch of the queue's page-mapping method: the first destination, the number of ranges
+    /// (`kind, start, count` each) and a pointer to them.
+    #[repr(C)]
+    struct Batch {
+        dest: u64,
+        ranges_n: u32,
+        _pad: u32,
+        ranges: usize,
+    }
+    fn batch(dest: usize, r: &[[u32; 3]]) -> Batch {
+        Batch { dest: dest as u64, ranges_n: r.len() as u32, _pad: 0, ranges: r.as_ptr() as usize }
+    }
+
+    /// A GPU-view page given a pool page shows the physical page the title mapped there, where
+    /// XCL keeps it: at the pool page, then – once the title maps it into another address too
+    /// (the CPU view of a retail title's streamed textures) – there.
+    #[test]
+    fn a_gpu_view_page_shows_the_physical_page_where_it_is_kept() {
+        use mirrors::{apply_batches, mapped_source, Mapped, PAGE};
+        let null = std::ptr::null_mut();
+        unsafe {
+            let mut n = 1usize;
+            let mut page = [0usize; 1];
+            assert_eq!(AllocateTitlePhysicalPages(null, 0, &mut n, page.as_mut_ptr()), 1);
+            // used at its home first, so the moves below copy it (no lazy page)
+            let home = MapTitlePhysicalPages(null, 1, 0, 4, page.as_mut_ptr()) as usize;
+            assert_ne!(home, 0);
+            *(home as *mut u32) = 0x600D;
+            // the pool: a reservation of the title's, the page mapped at its page 1
+            let pool = mem::VirtualAlloc(std::ptr::null(), 4 * PAGE, mem::MEM_RESERVE, mem::PAGE_READWRITE) as usize;
+            assert_eq!(MapTitlePhysicalPages((pool + PAGE) as *mut c_void, 1, 0, 4, page.as_mut_ptr()) as usize, pool + PAGE);
+            let (cpu, gpu, size) = (0x7140_0000_0000usize, 0x7146_0000_0000usize, 0x125 * PAGE);
+            mirrors::reserved(cpu, size, 0x2040_2000, mem::PAGE_READWRITE);
+            mirrors::reserved(gpu, size, 0x2040_2000, 0x801);
+            // pool pages 0 (nothing mapped there) and 1 at the GPU view's pages 2 and 3
+            let r = [[0, 0, 2]];
+            assert_eq!(apply_batches(1, [batch(gpu + 2 * PAGE, &r)].as_ptr() as usize, pool, 4), Some(Mapped { mapped: 2, physical: 1, ..Mapped::default() }));
+            assert_eq!(mapped_source(gpu + 2 * PAGE + 8), Some(Some(pool + 8)), "no physical page: the pool page itself");
+            assert_eq!(mapped_source(gpu + 3 * PAGE + 8), Some(Some(pool + PAGE + 8)));
+            assert_eq!(*(pool as *const u8).add(PAGE).cast::<u32>(), 0x600D);
+            // the title maps the page at another address too: XCL moves its data there, and the
+            // GPU view shows it there
+            let other = mem::VirtualAlloc(std::ptr::null(), PAGE, mem::MEM_RESERVE, mem::PAGE_READWRITE) as usize;
+            assert_eq!(MapTitlePhysicalPages(other as *mut c_void, 1, 0, 4, page.as_mut_ptr()) as usize, other);
+            assert_eq!(*(other as *const u32), 0x600D);
+            assert_eq!(mapped_source(gpu + 3 * PAGE + 8), Some(Some(other + 8)));
+            mirrors::released(cpu);
+            assert_eq!(FreeTitlePhysicalPages(null, 1, page.as_mut_ptr()), 1);
+            mem::VirtualFree(other as *mut c_void, 0, mem::MEM_RELEASE);
+            mem::VirtualFree(pool as *mut c_void, 0, mem::MEM_RELEASE);
+        }
+    }
+
+    /// A page the title frees while the rest of its allocation lives is no longer looked for:
+    /// the GPU-view page given its pool page reads the pool page, which keeps its bytes; a later
+    /// call naming that pool page records no physical page (review of #1055).
+    #[test]
+    fn a_freed_page_is_read_at_its_pool_page() {
+        use mirrors::{apply_batches, mapped_source, Mapped, PAGE};
+        let null = std::ptr::null_mut();
+        unsafe {
+            let mut n = 2usize;
+            let mut pages = [0usize; 2];
+            assert_eq!(AllocateTitlePhysicalPages(null, 0, &mut n, pages.as_mut_ptr()), 1);
+            let home = MapTitlePhysicalPages(null, 2, 0, 4, pages.as_mut_ptr()) as usize;
+            assert_ne!(home, 0);
+            *((home + PAGE) as *mut u32) = 0xBEEF;
+            let pool = mem::VirtualAlloc(std::ptr::null(), 4 * PAGE, mem::MEM_RESERVE, mem::PAGE_READWRITE) as usize;
+            assert_eq!(MapTitlePhysicalPages((pool + 2 * PAGE) as *mut c_void, 1, 0, 4, pages.as_mut_ptr().add(1)) as usize, pool + 2 * PAGE);
+            let (cpu, gpu, size) = (0x7150_0000_0000usize, 0x7156_0000_0000usize, 0x126 * PAGE);
+            mirrors::reserved(cpu, size, 0x2040_2000, mem::PAGE_READWRITE);
+            mirrors::reserved(gpu, size, 0x2040_2000, 0x801);
+            let r = [[0u32, 2, 1]];
+            assert_eq!(apply_batches(1, [batch(gpu + PAGE, &r)].as_ptr() as usize, pool, 4), Some(Mapped { mapped: 1, physical: 1, ..Mapped::default() }));
+            assert_eq!(mapped_source(gpu + PAGE), Some(Some(pool + 2 * PAGE)));
+            // page 1 freed alone: its block lives on (page 0), the pool page keeps the bytes
+            assert_eq!(FreeTitlePhysicalPages(null, 1, pages.as_mut_ptr().add(1)), 1);
+            assert!(page_home(pages[1]).is_some(), "the block is still allocated");
+            assert_eq!(mapped_source(gpu + PAGE + 4), Some(Some(pool + 2 * PAGE + 4)), "the pool page, not the page's home");
+            assert_eq!(*((pool + 2 * PAGE) as *const u32), 0xBEEF);
+            assert_eq!(apply_batches(1, [batch(gpu + 2 * PAGE, &r)].as_ptr() as usize, pool, 4), Some(Mapped { mapped: 1, ..Mapped::default() }), "no physical page behind it now");
+            mirrors::released(cpu);
+            assert_eq!(FreeTitlePhysicalPages(null, 1, pages.as_mut_ptr()), 1);
+            assert!(AWAY.lock().unwrap().as_ref().is_some_and(|a| !a.freed.contains(&pages[1])), "the whole block gone: its numbers are forgotten");
+            mem::VirtualFree(pool as *mut c_void, 0, mem::MEM_RELEASE);
+        }
+    }
+
+    /// The queue's page-mapping method (`CopyPageMappingsBatchX`) points pages of a GPU view
+    /// at pool pages or at nothing; a bad call records nothing; releasing the view drops them.
+    #[test]
+    fn page_mappings_point_gpu_view_pages_at_pool_pages() {
+        use mirrors::{apply_batches, mapped_source, Mapped, PAGE};
+        // (a size no other test uses, so the GPU view pairs with this CPU view)
+        let (cpu, gpu, size) = (0x7100_0000_0000usize, 0x7106_0000_0000usize, 0x123 * PAGE);
+        let (pool, pool_pages) = (0x7200_0000_0000usize, 64u32);
+        mirrors::reserved(cpu, size, 0x2040_2000, mem::PAGE_READWRITE);
+        mirrors::reserved(gpu, size, 0x2040_2000, 0x801);
+        assert_eq!(mirrors::source(gpu), Some(cpu));
+        unsafe {
+            // two pool pages from 10 on, one page kept, pool page 5 three times, one unmapped;
+            // then two pages outside any GPU view
+            let r1 = [[0, 10, 2], [3, 0, 1], [1, 5, 3], [2, 0, 1]];
+            let r2 = [[0, 0, 2]];
+            let b = [batch(gpu + 4 * PAGE + 0x1234, &r1), batch(0x7300_0000_0000, &r2)];
+            assert_eq!(apply_batches(2, b.as_ptr() as usize, pool, pool_pages), Some(Mapped { mapped: 5, unmapped: 1, elsewhere: 2, ..Mapped::default() }));
+            assert_eq!(mapped_source(gpu + 4 * PAGE + 0x20), Some(Some(pool + 10 * PAGE + 0x20)));
+            assert_eq!(mapped_source(gpu + 5 * PAGE), Some(Some(pool + 11 * PAGE)));
+            assert_eq!(mapped_source(gpu + 6 * PAGE), None, "kept");
+            for k in 7..10 {
+                assert_eq!(mapped_source(gpu + k * PAGE + 8), Some(Some(pool + 5 * PAGE + 8)));
+            }
+            assert_eq!(mapped_source(gpu + 10 * PAGE), Some(None), "unmapped");
+            assert_eq!(mapped_source(gpu + 11 * PAGE), None, "past the ranges");
+            assert_eq!(mapped_source(gpu + 3 * PAGE), None, "before the destination");
+            assert_eq!(mapped_source(0x7300_0000_0000), None, "outside any GPU view");
+
+            // a later call maps the unmapped page
+            let r = [[1, 1, 1]];
+            assert_eq!(apply_batches(1, [batch(gpu + 10 * PAGE, &r)].as_ptr() as usize, pool, pool_pages), Some(Mapped { mapped: 1, ..Mapped::default() }));
+            assert_eq!(mapped_source(gpu + 10 * PAGE), Some(Some(pool + PAGE)));
+
+            // bad calls record nothing: a range leaving the pool (after a good one), an unknown
+            // kind, ranges that are not readable
+            let leaves = [[0, 0, 1], [0, 63, 2]];
+            assert_eq!(apply_batches(1, [batch(gpu + 20 * PAGE, &leaves)].as_ptr() as usize, pool, pool_pages), None);
+            assert_eq!(mapped_source(gpu + 20 * PAGE), None);
+            let unknown = [[7, 0, 1]];
+            assert_eq!(apply_batches(1, [batch(gpu + 20 * PAGE, &unknown)].as_ptr() as usize, pool, pool_pages), None);
+            let unreadable = Batch { dest: (gpu + 20 * PAGE) as u64, ranges_n: 1, _pad: 0, ranges: 0 };
+            assert_eq!(apply_batches(1, [unreadable].as_ptr() as usize, pool, pool_pages), None);
+            assert_eq!(apply_batches(1, 0, pool, pool_pages), None, "batches not readable");
+            assert_eq!(apply_batches(0, 0, pool, pool_pages), Some(Mapped::default()), "no batches");
+        }
+        mirrors::released(cpu);
+        assert_eq!(mirrors::source(gpu), None);
+        assert_eq!(mapped_source(gpu + 4 * PAGE), None, "released with its GPU view");
+        assert_eq!(mapped_source(gpu + 10 * PAGE), None);
     }
 
     /// GPU-visible title memory that reaches the plain-memory fallback (64 KiB pages, large
