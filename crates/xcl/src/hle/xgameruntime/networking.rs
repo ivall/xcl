@@ -11,7 +11,8 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
-use super::xasync::{begin_with, XAsyncBlock, XAsyncGetResult, XAsyncGetResultSize};
+use super::taskqueue::PORT_COMPLETION;
+use super::xasync::{begin_with, submit_callback, XAsyncBlock, XAsyncGetResult, XAsyncGetResultSize};
 use crate::util::{hresult_from_win32, wide, E_INVALIDARG, HRESULT, S_OK};
 
 /// Default Xbox Live multiplayer UDP port.
@@ -60,6 +61,24 @@ static SEC_INFO_ID: u8 = 0;
 static SEC_INFO_UTF16_ID: u8 = 0;
 static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
 
+/// The one notification a register function sends right away, with the current value.
+struct InitialNotification<T> {
+    cb: usize,
+    ctx: usize,
+    value: T,
+}
+
+/// Queue `call(record)` on `queue`'s completion port; the record is freed by `call`, or here
+/// when the queue does not take it.
+unsafe fn notify_initial<T>(queue: *mut c_void, ctx: *mut c_void, cb: usize, value: T, call: usize, what: &str) {
+    let rec = Box::into_raw(Box::new(InitialNotification { cb, ctx: ctx as usize, value }));
+    let hr = submit_callback(queue, PORT_COMPLETION, rec as *mut c_void, call);
+    if hr < 0 {
+        drop(Box::from_raw(rec));
+        crate::xlog_warn!("XNetworking: the initial {what} callback could not be queued ({:#x})", hr as u32);
+    }
+}
+
 // ---------------------------------------------------------------------------------------
 // UDP multiplayer port
 // ---------------------------------------------------------------------------------------
@@ -86,16 +105,27 @@ pub unsafe extern "system" fn XNetworkingQueryPreferredLocalUdpMultiplayerPortAs
     XAsyncGetResult(b, &UDP_PORT_ID as *const u8 as *const c_void, std::mem::size_of::<u16>(), port as *mut c_void, std::ptr::null_mut())
 }
 
+unsafe extern "system" fn udp_port_changed_call(rec: *mut c_void, canceled: bool) {
+    let r = Box::from_raw(rec as *mut InitialNotification<u16>);
+    if !canceled {
+        let f: unsafe extern "system" fn(*mut c_void, u16) = std::mem::transmute(r.cb);
+        f(r.ctx as *mut c_void, r.value);
+    }
+}
+
+/// The port never changes, but registering "always fires an initial notification callback"
+/// (GDK docs), and a title may wait for it.
 pub unsafe extern "system" fn XNetworkingRegisterPreferredLocalUdpMultiplayerPortChanged(
-    _queue: *mut c_void,
-    _ctx: *mut c_void,
-    _cb: usize,
+    queue: *mut c_void,
+    ctx: *mut c_void,
+    cb: usize,
     token: *mut u64,
 ) -> HRESULT {
-    if token.is_null() {
+    if token.is_null() || cb == 0 {
         return E_INVALIDARG;
     }
     *token = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
+    notify_initial(queue, ctx, cb, DEFAULT_UDP_PORT, udp_port_changed_call as usize, "UDP port");
     S_OK
 }
 
@@ -615,16 +645,29 @@ pub unsafe extern "system" fn XNetworkingGetConnectivityHint(out: *mut XNetworki
     S_OK
 }
 
+unsafe extern "system" fn connectivity_hint_changed_call(rec: *mut c_void, canceled: bool) {
+    let r = Box::from_raw(rec as *mut InitialNotification<XNetworkingConnectivityHint>);
+    if !canceled {
+        let f: unsafe extern "system" fn(*mut c_void, *const XNetworkingConnectivityHint) = std::mem::transmute(r.cb);
+        f(r.ctx as *mut c_void, &r.value);
+    }
+}
+
+/// Registering "sends an initial notification callback" (GDK docs) with the current hint: a
+/// title that waits for it to see `network_initialized` would otherwise wait forever.
 pub unsafe extern "system" fn XNetworkingRegisterConnectivityHintChanged(
-    _queue: *mut c_void,
-    _ctx: *mut c_void,
-    _cb: usize,
+    queue: *mut c_void,
+    ctx: *mut c_void,
+    cb: usize,
     token: *mut u64,
 ) -> HRESULT {
-    if token.is_null() {
+    if token.is_null() || cb == 0 {
         return E_INVALIDARG;
     }
     *token = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
+    let mut hint: XNetworkingConnectivityHint = std::mem::zeroed();
+    XNetworkingGetConnectivityHint(&mut hint);
+    notify_initial(queue, ctx, cb, hint, connectivity_hint_changed_call as usize, "connectivity hint");
     S_OK
 }
 
@@ -694,6 +737,58 @@ mod tests {
             let mut async_port = 0u16;
             assert_eq!(XNetworkingQueryPreferredLocalUdpMultiplayerPortAsyncResult(&mut b, &mut async_port), S_OK);
             assert_eq!(async_port, DEFAULT_UDP_PORT);
+        }
+    }
+
+    /// Registering for the UDP port or connectivity hint changes fires one initial callback
+    /// with the current value, on the queue's completion port.
+    #[test]
+    fn register_fires_an_initial_callback() {
+        use crate::hle::xgameruntime::taskqueue::{XTaskQueueCloseHandle, XTaskQueueCreate, MODE_IMMEDIATE};
+        use std::sync::atomic::AtomicU32;
+        struct Seen {
+            calls: AtomicU32,
+            port: AtomicU32,
+            hint: std::sync::Mutex<Option<XNetworkingConnectivityHint>>,
+        }
+        unsafe extern "system" fn on_port(ctx: *mut c_void, port: u16) {
+            let seen = &*(ctx as *const Seen);
+            seen.port.store(port as u32, Ordering::SeqCst);
+            seen.calls.fetch_add(1, Ordering::SeqCst);
+        }
+        unsafe extern "system" fn on_hint(ctx: *mut c_void, hint: *const XNetworkingConnectivityHint) {
+            let seen = &*(ctx as *const Seen);
+            *seen.hint.lock().unwrap() = Some(*hint);
+            seen.calls.fetch_add(1, Ordering::SeqCst);
+        }
+
+        let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let mut q = std::ptr::null_mut();
+            assert_eq!(XTaskQueueCreate(MODE_IMMEDIATE, MODE_IMMEDIATE, &mut q), S_OK);
+
+            let seen = Seen { calls: AtomicU32::new(0), port: AtomicU32::new(0), hint: std::sync::Mutex::new(None) };
+            let ctx = &seen as *const Seen as *mut c_void;
+            let mut token = 0u64;
+            assert_eq!(XNetworkingRegisterPreferredLocalUdpMultiplayerPortChanged(q, ctx, on_port as usize, &mut token), S_OK);
+            assert_eq!(seen.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(seen.port.load(Ordering::SeqCst), DEFAULT_UDP_PORT as u32);
+            assert!(XNetworkingUnregisterPreferredLocalUdpMultiplayerPortChanged(token, true));
+
+            seen.calls.store(0, Ordering::SeqCst);
+            assert_eq!(XNetworkingRegisterConnectivityHintChanged(q, ctx, on_hint as usize, &mut token), S_OK);
+            assert_eq!(seen.calls.load(Ordering::SeqCst), 1);
+            let hint = seen.hint.lock().unwrap().expect("no connectivity hint callback");
+            assert!(hint.network_initialized);
+            assert!((1..=4).contains(&hint.connectivity_level));
+            assert!(XNetworkingUnregisterConnectivityHintChanged(token, true));
+
+            // the callback is required (`_In_`)
+            assert_eq!(XNetworkingRegisterPreferredLocalUdpMultiplayerPortChanged(q, ctx, 0, &mut token), E_INVALIDARG);
+            assert_eq!(XNetworkingRegisterConnectivityHintChanged(q, ctx, 0, &mut token), E_INVALIDARG);
+            assert_eq!(seen.calls.load(Ordering::SeqCst), 1);
+
+            XTaskQueueCloseHandle(q);
         }
     }
 
