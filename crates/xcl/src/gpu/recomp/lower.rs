@@ -1699,19 +1699,6 @@ impl<I: Ir> Lower<'_, I> {
         if self.track_frexp_denorm && self.partial[b] && super::emit::writes_frexp_f32_denorm(d) {
             return Err("a FREXP denormal mode write where some lanes are elsewhere".into());
         }
-        // instructions whose #1426 semantics are known to differ from the HLSL path and the
-        // console (each reported on #1426): left to the fallback until fixed there
-        const DIFFERS_ON_1426: &[&str] = &[
-            // f32 → f16 of a value below the smallest f16 denormal: 0 instead of rounding to it
-            "V_CVT_F16_F32",
-            // f16 products round toward zero (`LegacyF32ToF16`) where the console rounds to
-            // nearest even (vladbondarenko97's f16 programs; itsSio is fixing it on `main`)
-            "V_MUL_F16",
-            "V_PK_MUL_F16",
-        ];
-        if DIFFERS_ON_1426.contains(&name) {
-            return Err("its #1426 semantics differ from the console's".into());
-        }
         let operand = |input: bool, ty: &str| d.ienc.operands.iter().any(|o| o.input == input && o.output != input && o.ty == ty);
         let mut inputs: Vec<(Var, I::V)> = Vec::new();
         // SGPRs read whole: numbers (EXEC included, which holds a mask here: refused)
