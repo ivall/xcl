@@ -1434,6 +1434,10 @@ impl Module {
     pub fn block_insts(&self, b: Block) -> &[u32] {
         &self.blocks[b.0 as usize]
     }
+    pub(super) fn is_wave_lane_index(&self, v: Value) -> bool {
+        let Value::Inst(i) = v else { return false };
+        matches!(&self.insts[i as usize].op, Op::Call(f, _) if self.funcs[*f as usize].name == "dx.op.waveGetLaneIndex")
+    }
     pub fn inst_info(&self, i: u32) -> InstInfo<'_> {
         match &self.insts[i as usize].op {
             Op::Call(f, args) => InstInfo::Call(&self.funcs[*f as usize].name, args),

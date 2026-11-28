@@ -975,6 +975,11 @@ impl Lw {
         } else {
             self.ballot(c)
         };
+        // In a native compute wave each active lane's own ballot bit is its input.
+        // Keep the words for scalar and cross-lane reads; reuse c only in this block.
+        if !self.split && self.s.stage == super::container::Stage::Compute && self.s.m.is_wave_lane_index(self.lane) {
+            self.exec_cache.insert((self.cur(), lo, hi), c);
+        }
         if self.wave64 {
             self.write64(dst, lo, hi);
         } else {

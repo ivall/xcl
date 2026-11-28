@@ -509,7 +509,7 @@ impl Module {
 
     /// Whether an unused instruction can go. 64-bit values stay: helpers already set
     /// the Int64Ops / Doubles / DoubleExtensions flags for them.
-    fn removable(&self, op: &Op, ty: Ty, wide: &[Ty]) -> bool {
+    fn removable(&self, op: &Op, ty: Ty, wide: &[Ty], removable_ballot: Option<u32>) -> bool {
         if wide.contains(&ty) {
             return false;
         }
@@ -520,6 +520,7 @@ impl Module {
         }
         match op {
             Op::Bin(..) | Op::Cast(..) | Op::Cmp(..) | Op::Select(..) | Op::Extract(..) | Op::Gep(..) | Op::Phi(_) | Op::Load(..) | Op::Alloca(..) => true,
+            Op::Call(f, _) if Some(*f) == removable_ballot => true,
             // only calls whose presence sets no shader flag (the flags are collected while
             // building and must match the code: no wave ops, f64 math, typed / raw loads)
             Op::Call(f, _) => {
@@ -824,11 +825,16 @@ impl Module {
         // dead instructions: live = side effects, terminators and their operands, transitively
         let (i64t, f64t) = self.existing_i64_f64();
         let wide: Vec<Ty> = i64t.into_iter().chain(f64t).collect();
+        // The entry's lane-index call stays live, so removing an unused ballot cannot
+        // remove the last instruction that requires the WaveOps feature flag.
+        let removable_ballot = self.func_ids.get("dx.op.waveActiveBallot").copied().filter(|_| {
+            self.blocks[0].iter().any(|&i| self.is_wave_lane_index(Value::Inst(i)))
+        });
         let mut live = vec![false; self.insts.len()];
         let mut work: Vec<u32> = Vec::new();
         for &b in &order {
             for &i in &self.blocks[b as usize] {
-                if repl[i as usize].is_none() && (skip("dce") || !self.removable(&self.insts[i as usize].op, self.insts[i as usize].ty, &wide)) {
+                if repl[i as usize].is_none() && (skip("dce") || !self.removable(&self.insts[i as usize].op, self.insts[i as usize].ty, &wide, removable_ballot)) {
                     live[i as usize] = true;
                     work.push(i);
                 }

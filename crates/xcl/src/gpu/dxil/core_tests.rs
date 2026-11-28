@@ -14,6 +14,77 @@ fn prog(list: &[(&str, &str, &[(&str, u64)], Option<u32>)]) -> Vec<u8> {
     v
 }
 
+fn check_ballot_own_bit(wave64: bool) {
+    use crate::gpu::recomp::{dxc, runner, CsInterface};
+
+    if dxc::location().is_err() {
+        return runner::skip_test("no DXC");
+    }
+    let lanes = if wave64 { 64 } else { 32 };
+    let cut = lanes - 11;
+    let cs = CsInterface { threads: [lanes, 1, 1], user_sgprs: 0, tgid: [false; 3], tg_size: false, tid_components: 1 };
+    let options = KernelOptions { wave64, split: false, mem_windows: 1, sampler_base: 0 };
+    let mask = ((1u64 << cut) - 1) & 0x5555_5555_5555_5555;
+    let supported = if wave64 { runner::wave64_supported() } else { runner::wave32_supported() };
+    for whole in [false, true] {
+        // Restrict EXEC, then compare against zero. Inactive lanes also have v5 = 0,
+        // but their bits in VCC must stay clear when EXEC is restored.
+        let code = prog(&[
+            ("V_MBCNT_LO_U32_B32", "ENC_VOP3", &[("VDST", 0), ("SRC0", 193), ("SRC1", 128)], None),
+            ("V_MBCNT_HI_U32_B32", "ENC_VOP3", &[("VDST", 0), ("SRC0", 193), ("SRC1", 256)], None),
+            ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 130), ("VSRC1", 0)], None),
+            ("V_CMPX_GT_U32", "ENC_VOPC", &[("SRC0", 128 + u64::from(cut)), ("VSRC1", 0)], None),
+            ("V_AND_B32", "ENC_VOP2", &[("VDST", 5), ("SRC0", 129), ("VSRC1", 0)], None),
+            ("V_CMP_EQ_U32", "ENC_VOPC", &[("SRC0", 128), ("VSRC1", 5)], None),
+            ("S_MOV_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 193)], None),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 6), ("SRC0", if whole { 106 } else { 129 })], None),
+            ("V_CNDMASK_B32", "ENC_VOP2", &[("VDST", 4), ("SRC0", if whole { 107 } else { 128 }), ("VSRC1", 6)], None),
+            ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 2), ("DATA", 4), ("SADDR", 125)], None),
+        ]);
+        let dxil = super::kernel::translate_compute(&code, options, &cs).unwrap().dxil;
+        super::validate::validate(&dxil).unwrap();
+        let ir = super::validate::disassemble(&dxil).unwrap();
+        let ballots = ir.lines().filter(|l| l.contains("call ") && l.contains("@dx.op.waveActiveBallot(")).count();
+        assert_eq!(ballots, usize::from(whole), "wave{lanes}, whole={whole}");
+
+        if supported == Ok(true) {
+            let out = runner::dispatch(&dxil, [1, 1, 1], &[], &[u32::MAX; 64]).unwrap();
+            let (if_set, if_clear) = if whole { (mask as u32, (mask >> 32) as u32) } else { (1, 0) };
+            for lane in 0..lanes {
+                let want = if mask & (1 << lane) != 0 { if_set } else { if_clear };
+                assert_eq!(out[lane as usize], want, "wave{lanes}, lane {lane}, whole={whole}");
+            }
+        }
+    }
+    if supported != Ok(true) {
+        runner::skip_test(if wave64 { "no wave64" } else { "no wave32" });
+    }
+}
+
+#[test]
+fn ballot_own_bit_wave32() {
+    check_ballot_own_bit(false);
+}
+
+#[test]
+fn ballot_own_bit_wave64() {
+    check_ballot_own_bit(true);
+}
+
+#[test]
+fn unused_ballot_as_the_only_wave_op_validates() {
+    use super::{container::Stage, shader::Shader};
+    use crate::gpu::recomp::{dxc, runner};
+
+    if dxc::location().is_err() {
+        return runner::skip_test("no DXC");
+    }
+    let mut s = Shader::new(Stage::Compute, (6, 6));
+    let yes = s.m.i1c(true);
+    s.wave_ballot(yes);
+    super::validate::validate(&s.finish([32, 1, 1], None)).unwrap();
+}
+
 #[test]
 fn straight_line_and_loop_kernels_validate() {
     let code = prog(&[
