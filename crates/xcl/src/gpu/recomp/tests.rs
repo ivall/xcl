@@ -3464,6 +3464,65 @@ fn gpu_dword_addtid_per_lane_addresses() {
     }
 }
 
+/// `v_pack_b32_f16`: op_sel[0]/[1] pick each source's half and the VOP3 abs / neg modifiers
+/// apply to the f16 value picked (its sign bit) — `-|x|` of a half is not `x`'s bits — as for
+/// the `v_cvt_pknorm_*_f16` pair.
+#[test]
+fn pack_b32_f16_applies_the_half_modifiers() {
+    let code = prog(&[
+        ("V_PACK_B32_F16", "ENC_VOP3", &[("VDST", 20), ("SRC0", V + 10), ("SRC1", V + 11)], None),
+        ("V_PACK_B32_F16", "ENC_VOP3", &[("VDST", 21), ("SRC0", V + 10), ("SRC1", V + 11), ("ABS", 1), ("NEG", 1)], None),
+    ]);
+    let t = translate(&code, &Options::default()).unwrap();
+    assert!(t.complete(), "{:?}\n{}", t.unsupported_why, t.hlsl);
+    assert!(t.hlsl.contains("((v10 & 0xFFFFu) | ((v11 & 0xFFFFu) << 16))"), "{}", t.hlsl);
+    assert!(
+        t.hlsl.contains("(((v10 & 0xFFFFu) & 0x7FFFu) ^ 0x8000u) | ((v11 & 0xFFFFu) << 16)"),
+        "abs / neg of src0 must reach the f16 half it packs: {}",
+        t.hlsl
+    );
+}
+
+/// The same on the GPU: the packed halves are the two f16 values with the modifiers applied –
+/// through the HLSL path (or whatever `XCL_DIRECT_DXIL` picks) and through the direct DXIL
+/// translator, which lowers the instruction on its own (`dxil::lower_valu`).
+#[test]
+fn gpu_pack_b32_f16_half_modifiers() {
+    if !gpu_ready() {
+        return;
+    }
+    let p = prog(&[
+        ("V_PACK_B32_F16", "ENC_VOP3", &[("VDST", 20), ("SRC0", V + 10), ("SRC1", V + 11)], None),
+        ("V_PACK_B32_F16", "ENC_VOP3", &[("VDST", 21), ("SRC0", V + 10), ("SRC1", V + 11), ("ABS", 1), ("NEG", 1)], None),
+        ("V_PACK_B32_F16", "ENC_VOP3", &[("VDST", 22), ("SRC0", V + 12), ("SRC1", V + 13), ("OP_SEL", 3), ("ABS", 1), ("NEG", 2)], None),
+        ("V_PACK_B32_F16", "ENC_VOP3", &[("VDST", 23), ("SRC0", V + 14), ("SRC1", V + 15), ("ABS", 2)], None),
+    ]);
+    let h = half_bits;
+    let mut st = KernelState::default();
+    for r in st.vgpr.iter_mut() {
+        r[10] = h(2.0) | h(-3.0) << 16; // low half 2.0, high half -3.0
+        r[11] = h(0.5);
+        r[12] = h(1.5) | h(-4.0) << 16;
+        r[13] = h(-8.0) | h(16.0) << 16;
+        r[14] = h(-2.0);
+        r[15] = h(-6.0);
+    }
+    let direct = runner::direct_kernel_full(&p, true).unwrap();
+    let mem: Vec<u32> = p.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+    let runs = [
+        ("default path", runner::run_program(&p, &st, &[]).unwrap().0),
+        ("direct DXIL", runner::run_with_statics(&direct.dxil, &st, &mem, &[], &[], &direct.static_samplers).unwrap()),
+    ];
+    for (path, r) in &runs {
+        for (l, v) in r.vgpr.iter().enumerate().take(64) {
+            assert_eq!(v[20], h(2.0) | h(0.5) << 16, "{path}, lane {l}: pack the low halves");
+            assert_eq!(v[21], h(-2.0) | h(0.5) << 16, "{path}, lane {l}: -|2.0| packs -2.0");
+            assert_eq!(v[22], h(4.0) | h(-16.0) << 16, "{path}, lane {l}: op_sel high halves, |-4.0| and -(16.0)");
+            assert_eq!(v[23], h(-2.0) | h(6.0) << 16, "{path}, lane {l}: |-6.0| packs 6.0");
+        }
+    }
+}
+
 #[test]
 fn gpu_valu_16_and_64_bit() {
     if !gpu_ready() {

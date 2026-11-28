@@ -489,8 +489,21 @@ impl Lw {
                 self.or(l, h)
             }
             "v_pack_b32_f16" => {
-                let lo = if m.opsel & 1 == 1 { self.lshrc(a, 16) } else { self.andc(a, 0xFFFF) };
-                let hi = if m.opsel & 2 == 2 { self.lshrc(b, 16) } else { self.andc(b, 0xFFFF) };
+                // op_sel[0]/[1] pick each source's half, and abs / neg apply to the f16 value
+                // picked (its sign bit), as in the HLSL path
+                let mut halves = [z; 2];
+                for (i, src) in [a, b].into_iter().enumerate() {
+                    let mut h = if m.opsel >> i & 1 == 1 { self.lshrc(src, 16) } else { self.andc(src, 0xFFFF) };
+                    if m.abs[i] {
+                        h = self.andc(h, 0x7FFF);
+                    }
+                    if m.neg[i] {
+                        let sign = self.c(0x8000);
+                        h = self.xor(h, sign);
+                    }
+                    halves[i] = h;
+                }
+                let [lo, hi] = halves;
                 let hi = self.shlc(hi, 16);
                 self.or(lo, hi)
             }

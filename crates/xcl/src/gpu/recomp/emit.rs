@@ -3927,8 +3927,20 @@ impl Em {
             }
             "v_cvt_pkrtz_f16_f32" => format!("f16_rtz({}) | (f16_rtz({}) << 16)", fs(0), fs(1)),
             "v_pack_b32_f16" => {
-                let lo = if m.opsel & 1 == 1 { format!("({a} >> 16)") } else { format!("({a} & 0xFFFFu)") };
-                let hi = if m.opsel & 2 == 2 { format!("({b} >> 16)") } else { format!("({b} & 0xFFFFu)") };
+                // op_sel[0]/[1] pick each source's half, and abs / neg apply to the f16 value
+                // picked (its sign bit), as for the pknorm conversions
+                let hb = |i: usize, s: &str, high: bool| {
+                    let mut s = if high { format!("({s} >> 16)") } else { format!("({s} & 0xFFFFu)") };
+                    if m.abs[i] {
+                        s = format!("({s} & 0x7FFFu)");
+                    }
+                    if m.neg[i] {
+                        s = format!("({s} ^ 0x8000u)");
+                    }
+                    s
+                };
+                let lo = hb(0, &a, m.opsel & 1 == 1);
+                let hi = hb(1, &b, m.opsel & 2 == 2);
                 format!("{lo} | ({hi} << 16)")
             }
             "v_fma_mix_f32" | "v_fma_mixlo_f16" | "v_fma_mixhi_f16" => {
