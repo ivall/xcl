@@ -422,6 +422,18 @@ pub fn pool_bytes() -> (usize, usize) {
     let pools = s.pools.iter().filter(|p| p.is_some()).count() * POOL_TILES as usize * TILE;
     (pools, pools.saturating_sub(s.free.len() * TILE))
 }
+
+/// Bytes of the pool heaps given back but not released yet (titles' queues may still read
+/// them): memory accounting, #2688.
+pub fn retired_bytes() -> usize {
+    lock_state().as_ref().map_or(0, |s| s.retired.len() * POOL_TILES as usize * TILE)
+}
+
+/// Bytes of the title's pages committed in the sparse windows (their CPU side): memory
+/// accounting, #2688.
+pub fn committed_bytes() -> usize {
+    lock_state().as_ref().map_or(0, |s| s.committed_bytes())
+}
 /// commits before the device existed: the pages committed, as disjoint page ranges (start →
 /// end) merged with their neighbours, so a commit or decommit costs O(log n) and not a scan of
 /// every page committed so far. Like `committed` / `decommitted` with a state, a range counts
@@ -652,6 +664,13 @@ impl State {
         };
         self.free.extend((1..POOL_TILES).rev().map(|t| (h, t)));
         h
+    }
+
+    /// Bytes of the title's pages committed in the windows: the pages of the mapped tiles that
+    /// are not holes. A tile the title decommitted whole is not mapped any more, though its pool
+    /// tile may still be parked (memory accounting, #2688).
+    fn committed_bytes(&self) -> usize {
+        self.mapped.values().map(|e| PAGES_PER_TILE - e.holes.count_ones() as usize).sum::<usize>() * PAGE
     }
 
     /// Pools whose every tile is free again go (64 MB of video memory each – and as much of the
@@ -2177,10 +2196,12 @@ mod tests {
             let tile = s.mapped[&base].pool;
             let v = s.value;
             assert!(v > 0, "a new tile is mapped");
+            assert_eq!(s.committed_bytes(), TILE, "its pages are committed");
 
             // decommitted: parked, still mapped, nothing sent to the GPU
             s.decommit_range(base, TILE);
             assert!(!s.mapped.contains_key(&base));
+            assert_eq!(s.committed_bytes(), 0, "a parked tile's pages are not committed any more");
             assert_eq!(s.parked.get(&base), Some(&tile));
             assert!(!s.free.contains(&tile));
             assert_eq!(s.value, v, "no tile mapping changed");
