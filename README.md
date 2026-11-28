@@ -355,6 +355,10 @@ Fill the reusable DXIL cache ahead of a run with the read-only package wrapper. 
     line with what the title did in that time (presents, submits, draws, dispatches, frame-event
     waits, DirectStorage requests), and a `memory:` line with the process's commit and the video
     memory in use. Where the lines stop changing is where the title stopped.
+    Idle spare command lists and XCL-owned alternate command allocators are reclaimed every
+    two seconds, including while loading stops presenting. Live recordings, unfinished
+    submissions and failed fence signals retain their owners. The `command pools` line reports
+    remaining and retired object counts, not measured memory savings.
   - `XCL_THREAD_DUMP_AT=s1,s2,…`: at each of those seconds after the start, the state of every
     thread of the title goes into `xcl.log`, for a title that stalls.
   - `XCL_TRACE_FAULTS=1` (any value): the first 32 access violations are logged as they are raised

@@ -881,6 +881,7 @@ pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
     unmark_deferring(list);
     console_list::hold_until_reset(old, blocks);
     retire_recording_res(old, res_bufs, res_marks, res_untracked);
+    super::alloc_pool::retirement_done(list as usize);
 }
 
 impl State {
@@ -946,6 +947,7 @@ pub(super) fn inherit_for_split(from: *mut c_void, to: *mut c_void, allocator: u
     unmark_deferring(to);
     console_list::hold_until_reset(old, blocks);
     retire_recording_res(old, res_bufs, res_marks, res_untracked);
+    super::alloc_pool::retirement_done(to as usize);
 }
 
 /// The title changed what descriptor heaps the list has: they are looked at again.
@@ -1044,6 +1046,7 @@ pub(super) fn forget(list: *mut c_void) {
         s.res_retired.extend(batch);
         retire_recording_res(s.allocator, s.res_retired, s.res_marks, s.res_untracked);
     }
+    super::alloc_pool::retirement_done(list as usize);
 }
 
 #[cfg(test)]

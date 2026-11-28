@@ -46,6 +46,8 @@ struct SegmentBook {
     extra_active: Vec<usize>,
     /// Closed extra PC command lists from earlier recordings, kept for reuse on future splits.
     spares: Vec<usize>,
+    /// Published only after submission and recording cleanup; age alone cannot prove that.
+    retired: HashMap<usize, std::time::Instant>,
     /// A PC command list recording in place of `primary`: at the title's Reset the GPU had not
     /// finished primary's last submit, and the PC does not let a list be submitted again before
     /// that (#1452, debug layer id 553). A console does.
@@ -196,16 +198,18 @@ pub(super) unsafe extern "system" fn reset(this: *mut c_void, alloc: usize, pso:
             }
             m.insert(active, this as usize);
             drop(wg);
-            for seg in moved {
+            for &seg in &moved {
                 super::bind::reset(seg as *mut c_void, 0, 0);
                 super::list_x::clear_segment_state(seg);
                 // a spare records again only after its next Reset: it does not hold its
                 // allocator meanwhile
                 super::alloc_pool::park_list(seg);
             }
+            retire_spares(this, &moved);
             // nor does the previous recording a stand-in now replaces: it is not reset here either
             if stand_in.is_some() {
-                super::alloc_pool::park_list(primary as usize);
+                // Its bind state is still alive until a later real Reset or final Release.
+                super::alloc_pool::unpin_list(primary as usize);
             }
         }
         *((this as usize + F_RING_AT) as *mut usize) = 0;
@@ -294,9 +298,60 @@ pub(super) fn can_split(wrapper: *mut c_void, n: usize) -> bool {
 /// (the last one whose submits the GPU has finished).
 pub(super) fn pop_spare(wrapper: *mut c_void) -> Option<*mut c_void> {
     let mut sg = SEGMENTS.lock().unwrap();
-    let spares = &mut sg.as_mut()?.get_mut(&(wrapper as usize))?.spares;
-    let k = spares.iter().rposition(|&p| !super::alloc_pool::in_flight(p))?;
-    Some(spares.remove(k) as *mut c_void)
+    let book = sg.as_mut()?.get_mut(&(wrapper as usize))?;
+    let k = book.spares.iter().rposition(|&p| !super::alloc_pool::in_flight(p))?;
+    let spare = book.spares.remove(k);
+    book.retired.remove(&spare);
+    Some(spare as *mut c_void)
+}
+
+/// Called after cleanup of every spare in this group, never before Kickoff submits them.
+pub(super) fn retire_spares(wrapper: *mut c_void, lists: &[usize]) {
+    let mut sg = SEGMENTS.lock().unwrap();
+    if let Some(b) = sg.as_mut().and_then(|m| m.get_mut(&(wrapper as usize))) {
+        let now = std::time::Instant::now();
+        for &list in lists { if b.spares.contains(&list) { b.retired.insert(list, now); } }
+    }
+    drop(sg);
+    if !lists.is_empty() { super::alloc_pool::start_retirement(); }
+}
+
+fn take_idle_spares(book: &mut SegmentBook, keep: usize, now: std::time::Instant, mut idle: impl FnMut(usize) -> bool) -> Vec<usize> {
+    let mut victims = Vec::new();
+    let mut kept = 0;
+    book.spares.retain(|&list| {
+        if !book.retired.get(&list).is_some_and(|&t| now.saturating_duration_since(t).as_secs() >= 2) || !idle(list) { return true; }
+        kept += 1;
+        if kept <= keep { return true; }
+        book.retired.remove(&list);
+        victims.push(list);
+        false
+    });
+    victims
+}
+
+/// Only completed recordings whose caller has finished cleanup may leave. Removal from the
+/// spare pool owns each victim, so neither reuse nor wrapper release can take it concurrently.
+pub(super) unsafe fn trim_idle_spares(keep: usize) -> (usize, usize) {
+    if !super::alloc_pool::enabled() { return (0, 0); }
+    let (victims, left) = {
+        let mut sg = SEGMENTS.lock().unwrap();
+        let Some(books) = sg.as_mut() else { return (0, 0) };
+        let now = std::time::Instant::now();
+        let mut out = Vec::new();
+        for b in books.values_mut() {
+            out.extend(take_idle_spares(b, keep, now, |list| !super::alloc_pool::in_flight(list)));
+        }
+        (out, books.values().map(|b| b.spares.len()).sum())
+    };
+    let n = victims.len();
+    for list in victims {
+        let raw = list as *mut c_void;
+        super::bind::forget(raw);
+        let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(pc_slot(raw, 2));
+        release(raw);
+    }
+    (left, n)
 }
 
 /// Give back to `wrapper`'s spare pool a closed PC command list that did not become a segment.
@@ -450,8 +505,8 @@ unsafe extern "system" fn release(this: *mut c_void) -> u32 {
         if let Some(b) = book {
             for seg in b.extra_active.into_iter().chain(b.spares.into_iter()).chain(b.first) {
                 let raw = seg as *mut c_void;
-                super::alloc_pool::forget_list(seg);
                 super::bind::forget(raw);
+                super::alloc_pool::forget_list(seg);
                 let rel: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(pc_slot(raw, 2));
                 rel(raw);
             }
@@ -466,6 +521,23 @@ unsafe extern "system" fn release(this: *mut c_void) -> u32 {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn only_finished_aged_spares_leave_the_pool() {
+        use std::time::{Duration, Instant};
+        let now = Instant::now();
+        let old = now - Duration::from_secs(3);
+        let mut book = super::SegmentBook::default();
+        book.spares = vec![1, 2, 3, 4, 5];
+        // 1: Kickoff has published it but not completed submit/cleanup. 2: recent.
+        // 3: GPU pending. 4,5: complete and aged; keep one for reuse.
+        book.retired.extend([(2, now), (3, old), (4, old), (5, old)]);
+        assert_eq!(super::take_idle_spares(&mut book, 1, now, |p| p != 3), [5]);
+        assert_eq!(book.spares, [1, 2, 3, 4]);
+        assert!(!book.retired.contains_key(&5));
+        assert_eq!(super::take_idle_spares(&mut book, 0, now, |p| p != 3), [4]);
+        assert_eq!(book.spares, [1, 2, 3]);
+    }
     use super::*;
 
     /// A stand-in PC object: slot 5 returns `this`, slots 0 / 2 count.

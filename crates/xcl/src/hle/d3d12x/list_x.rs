@@ -3956,13 +3956,14 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
         };
         // (`primary` records on the PC allocator the title's allocator stands for: its Reset below)
         super::bind::inherit_for_split(this, primary, super::alloc_pool::current(alloc));
-        for seg in reclaimed {
+        for &seg in &reclaimed {
             super::bind::reset(seg as *mut c_void, 0, 0);
             clear_segment_state(seg);
             // a spare now: it does not hold its allocator until it records again (after both
             // submits above, so the allocator keeps their marks)
             super::alloc_pool::park_list(seg);
         }
+        if let Some(wrapper) = kickoff_wrapper { super::title_list::retire_spares(wrapper, &reclaimed); }
         if let Some(s) = recording(primary as usize).lock().unwrap().as_mut().and_then(|m| m.get_mut(&(primary as usize))) {
             s.allocator = alloc;
             s.bound_pso = bound_pso;

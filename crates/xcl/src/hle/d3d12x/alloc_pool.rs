@@ -26,6 +26,9 @@ use crate::util::HRESULT;
 struct Backing {
     /// PC lists whose recording is on this allocator
     users: HashSet<usize>,
+    /// Lists detached from this backing whose old binding blocks have not been retired yet.
+    retiring: HashSet<usize>,
+    unfenced: bool,
     /// queue → (fence, value after the last submit of one of them)
     marks: HashMap<usize, (ID3D12Fence, u64)>,
 }
@@ -33,11 +36,11 @@ struct Backing {
 impl Backing {
     /// The GPU has passed every submit of a recording on this allocator.
     unsafe fn idle(&self) -> bool {
-        self.marks.values().all(|(f, v)| super::real::fence_completed(f) >= *v)
+        !self.unfenced && self.marks.values().all(|(f, v)| completed(super::real::fence_completed(f), *v))
     }
 
     unsafe fn free(&self) -> bool {
-        self.users.is_empty() && self.idle()
+        self.users.is_empty() && self.retiring.is_empty() && self.idle()
     }
 }
 
@@ -49,6 +52,8 @@ struct State {
     aside: HashMap<usize, Vec<usize>>,
     backings: HashMap<usize, Backing>,
     of_list: HashMap<usize, usize>,
+    retiring: HashMap<usize, Vec<usize>>,
+    unfenced: HashSet<usize>,
     /// title allocator → the type of the lists on it
     types: HashMap<usize, i32>,
     fences: HashMap<usize, (ID3D12Fence, u64)>,
@@ -72,6 +77,71 @@ unsafe impl Send for State {}
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
 
+fn completed(value: u64, wanted: u64) -> bool {
+    value != u64::MAX && value >= wanted
+}
+
+/// Independent of PresentX: loading can wait minutes for a pipeline without presenting.
+pub(super) fn start_retirement() {
+    #[cfg(not(test))]
+    {
+        static START: std::sync::Once = std::sync::Once::new();
+        START.call_once(|| {
+            let _ = std::thread::Builder::new().name("xcl-command-retire".into()).spawn(|| {
+                let (mut lists, mut allocators, mut tick) = (0usize, 0usize, 0usize);
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    let (parked, retired) = unsafe { super::title_list::trim_idle_spares(2) };
+                    let (owners, aside, idle, freed) = unsafe { trim_idle_aside(1) };
+                    lists += retired;
+                    allocators += freed;
+                    tick += 1;
+                    if tick % 10 == 0 && std::env::var_os("XCL_ACTIVITY").is_some() {
+                        crate::xlog_info!("command pools: {parked} spare lists parked, {lists} retired; {owners} allocator owners, {aside} put aside ({idle} idle), {allocators} retired (objects, not bytes)");
+                    }
+                }
+            });
+        });
+    }
+}
+
+/// Detach only XCL-owned, unused alternate allocators. The title's primary and the current
+/// backing never leave here; no Reset or COM Release runs while STATE is held.
+unsafe fn take_idle_aside(s: &mut State, keep: usize) -> (Vec<usize>, usize) {
+    let mut out = Vec::new();
+    let mut idle = 0;
+    for (&owner, aside) in &mut s.aside {
+        let current = s.cur.get(&owner).copied().unwrap_or(owner);
+        let mut kept = 0;
+        aside.retain(|&raw| {
+            let free = raw != owner && raw != current && s.backings.get(&raw).is_some_and(|b| b.free());
+            idle += usize::from(free);
+            if !free { return true; }
+            kept += 1;
+            if kept <= keep { return true; }
+            s.backings.remove(&raw);
+            out.push(raw);
+            false
+        });
+    }
+    (out, idle)
+}
+
+unsafe fn trim_idle_aside(keep: usize) -> (usize, usize, usize, usize) {
+    let (victims, owners, aside, idle) = {
+        let mut g = STATE.lock().unwrap();
+        let Some(s) = g.as_mut() else { return (0, 0, 0, 0) };
+        let (victims, idle) = take_idle_aside(s, keep);
+        (victims, s.aside.len(), s.aside.values().map(Vec::len).sum(), idle)
+    };
+    let n = victims.len();
+    for raw in victims {
+        super::console_list::allocator_reset(raw as *mut c_void);
+        drop(ID3D12CommandAllocator::from_raw(raw as *mut c_void));
+    }
+    (owners, aside, idle.saturating_sub(n), n)
+}
+
 /// `XCL_ALLOC_SWAP=0` turns it off.
 pub fn enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -83,6 +153,8 @@ fn move_list(s: &mut State, list: usize, backing: usize) {
         if old != backing {
             if let Some(b) = s.backings.get_mut(&old) {
                 b.users.remove(&list);
+                b.retiring.insert(list);
+                s.retiring.entry(list).or_default().push(old);
             }
         }
     }
@@ -95,8 +167,10 @@ pub(super) fn forget_list(list: usize) {
     let mut g = STATE.lock().unwrap();
     let Some(s) = g.as_mut() else { return };
     s.last_submit.remove(&list);
+    s.unfenced.remove(&list);
     s.recordings.remove(&list);
     unpin(s, list);
+    retirement_done_in(s, list);
 }
 
 /// The PC list's recording ended but the list stays (a split segment moved to the spares): its
@@ -112,6 +186,22 @@ fn unpin(s: &mut State, list: usize) {
     if let Some(backing) = s.of_list.remove(&list) {
         if let Some(b) = s.backings.get_mut(&backing) {
             b.users.remove(&list);
+            b.retiring.insert(list);
+            s.retiring.entry(list).or_default().push(backing);
+        }
+    }
+}
+
+/// Binding blocks have reached their fence-gated owner before the old allocator can leave.
+pub(super) fn retirement_done(list: usize) {
+    let mut g = STATE.lock().unwrap();
+    if let Some(s) = g.as_mut() { retirement_done_in(s, list); }
+}
+
+fn retirement_done_in(s: &mut State, list: usize) {
+    if let Some(old) = s.retiring.remove(&list) {
+        for backing in old {
+            if let Some(b) = s.backings.get_mut(&backing) { b.retiring.remove(&list); }
         }
     }
 }
@@ -127,6 +217,7 @@ pub(super) fn park_list(list: usize) {
             b.users.remove(&list);
         }
     }
+    retirement_done_in(s, list);
 }
 
 /// Reset `list` on the title's allocator `alloc`, committing its new recording association
@@ -293,7 +384,15 @@ unsafe fn wait_for_previous_submits_within(lists: &[*mut c_void], limit: std::ti
 /// (`fence_completed`: XCL's own fence, without the title's hook, STATE held)
 pub fn in_flight(list: usize) -> bool {
     let g = STATE.lock().unwrap();
-    g.as_ref().and_then(|s| s.last_submit.get(&list)).is_some_and(|l| unsafe { super::real::fence_completed(&l.fence) } < l.value)
+    g.as_ref().is_some_and(|s| s.unfenced.contains(&list) || s.last_submit.get(&list).is_some_and(|l| !completed(unsafe { super::real::fence_completed(&l.fence) }, l.value)))
+}
+
+fn unfenced_submit(s: &mut State, lists: &[*mut c_void]) {
+    for &raw in lists {
+        let list = raw as usize;
+        s.unfenced.insert(list);
+        if let Some(backing) = s.of_list.get(&list).and_then(|b| s.backings.get_mut(b)) { backing.unfenced = true; }
+    }
 }
 
 /// `lists` were just submitted to `queue`.
@@ -313,6 +412,7 @@ pub unsafe fn executed(queue: *mut c_void, lists: &[*mut c_void]) {
     let mut g = STATE.lock().unwrap();
     let s = g.get_or_insert_with(State::default);
     let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) else {
+        unfenced_submit(s, lists);
         drop(g);
         if !lists.is_empty() {
             super::bind::two_pass_submitted(queue, None, 0, lists);
@@ -323,6 +423,7 @@ pub unsafe fn executed(queue: *mut c_void, lists: &[*mut c_void]) {
     if !s.fences.contains_key(&key) {
         let mut dev: Option<ID3D12Device> = None;
         let Some(f) = q.GetDevice(&mut dev).ok().and(dev).and_then(|d| d.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE).ok()) else {
+            unfenced_submit(s, lists);
             drop(g);
             if !lists.is_empty() {
                 super::bind::two_pass_submitted(queue, None, 0, lists);
@@ -333,14 +434,16 @@ pub unsafe fn executed(queue: *mut c_void, lists: &[*mut c_void]) {
     }
     let (fence, value) = {
         let (f, v) = s.fences.get_mut(&key).unwrap();
-        if q.Signal(&*f, *v + 1).is_err() {
+        let next = v.checked_add(1).filter(|&value| value != u64::MAX);
+        if next.is_none() || q.Signal(&*f, next.unwrap()).is_err() {
+            unfenced_submit(s, lists);
             drop(g);
             if !lists.is_empty() {
                 super::bind::two_pass_submitted(queue, None, 0, lists);
             }
             return;
         }
-        *v += 1;
+        *v = next.unwrap();
         (f.clone(), *v)
     };
     for &l in lists {
@@ -360,6 +463,15 @@ pub unsafe fn executed(queue: *mut c_void, lists: &[*mut c_void]) {
 /// recorded on it are released (`list_x::on_release`), and `forget` gives back only what nothing
 /// holds.
 pub(super) fn unpin_users(alloc: usize) {
+    // Called only when the owning list is gone: its segments go next. Retire their binding
+    // blocks before detaching them; the allocator may otherwise leave on the sweep thread.
+    let users: HashSet<usize> = {
+        let g = STATE.lock().unwrap();
+        let Some(s) = g.as_ref() else { return };
+        s.cur.get(&alloc).into_iter().chain(s.aside.get(&alloc).into_iter().flatten()).chain([&alloc])
+            .filter_map(|b| s.backings.get(b)).flat_map(|b| b.users.iter().chain(&b.retiring)).copied().collect()
+    };
+    for list in users { super::bind::forget(list as *mut c_void); }
     let mut g = STATE.lock().unwrap();
     if let Some(s) = g.as_mut() {
         unpin_users_in(s, alloc);
@@ -436,6 +548,7 @@ pub unsafe fn forget(alloc: usize) {
 /// submits the GPU has passed – not for one put aside because the GPU still runs what was
 /// recorded on it (#1358).
 pub unsafe fn title_reset(alloc: *mut c_void) -> Option<HRESULT> {
+    if enabled() { start_retirement(); }
     title_reset_with(alloc, |raw| super::real::reset_pc_allocator(raw))
 }
 
@@ -463,7 +576,7 @@ unsafe fn done_with(s: &State, a: usize) -> Vec<usize> {
     let cur = s.cur.get(&a).copied().unwrap_or(a);
     std::iter::once(cur)
         .chain(s.aside.get(&a).into_iter().flatten().copied())
-        .filter(|b| s.backings.get(b).is_none_or(|x| x.idle()))
+        .filter(|b| s.backings.get(b).is_none_or(|x| x.retiring.is_empty() && x.idle()))
         .collect()
 }
 
@@ -472,6 +585,19 @@ unsafe fn title_reset_in(s: &mut State, alloc: *mut c_void, mut reset: impl FnMu
     let a = alloc as usize;
     let c = s.cur.get(&a).copied().unwrap_or(a);
     if s.backings.get(&c).is_none_or(|b| b.free()) {
+        // Return to the primary only after its Reset succeeds. Keep the old alternate in
+        // aside for the retirement thread; dropping it here would re-enter STATE.
+        if c != a && s.aside.get(&a).is_some_and(|v| v.contains(&a))
+            && s.backings.get(&a).is_some_and(|b| b.free())
+        {
+            let hr = reset(alloc);
+            if hr < 0 { return Some(hr); }
+            s.aside.get_mut(&a).unwrap().retain(|&b| b != a);
+            s.aside.get_mut(&a).unwrap().push(c);
+            s.cur.remove(&a);
+            s.backings.get_mut(&a).unwrap().marks.clear();
+            return Some(hr);
+        }
         if let Some(b) = s.backings.get_mut(&c) {
             b.marks.clear();
         }
@@ -527,6 +653,52 @@ unsafe fn title_reset_in(s: &mut State, alloc: *mut c_void, mut reset: impl FnMu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn idle_reclaim_waits_for_binding_retirement_and_keeps_live_owners() {
+        let mut s = State::default();
+        s.cur.insert(1, 2);
+        s.aside.insert(1, vec![1, 3, 4, 5, 6]);
+        for b in 1..=6 { s.backings.insert(b, Backing::default()); }
+        move_list(&mut s, 10, 3);
+        move_list(&mut s, 10, 2); // old binding blocks have not reached their owner yet
+        move_list(&mut s, 11, 4); // another recording is still live
+        unfenced_submit(&mut s, &[11usize as *mut c_void]);
+        unpin(&mut s, 11);
+        retirement_done_in(&mut s, 11); // failed Signal still prevents release
+        let (first, idle) = unsafe { take_idle_aside(&mut s, 1) };
+        assert_eq!((first, idle), (vec![6], 2));
+        assert_eq!(s.aside[&1], [1, 3, 4, 5]);
+        retirement_done_in(&mut s, 10);
+        assert_eq!(unsafe { take_idle_aside(&mut s, 0) }.0, [3, 5]);
+        assert_eq!(s.aside[&1], [1, 4], "title primary and unfenced backing stay owned");
+        assert_eq!(s.cur[&1], 2);
+        assert!(s.backings[&2].users.contains(&10));
+    }
+
+    #[test]
+    fn returning_to_primary_keeps_the_alternate_until_reset_succeeds() {
+        let mut s = State::default();
+        s.cur.insert(1, 2);
+        s.aside.insert(1, vec![1]);
+        s.backings.insert(1, Backing::default());
+        s.backings.insert(2, Backing::default());
+        let a = 1usize as *mut c_void;
+        assert_eq!(unsafe { title_reset_in(&mut s, a, |_| crate::util::E_FAIL) }, Some(crate::util::E_FAIL));
+        assert_eq!((s.cur[&1], &s.aside[&1]), (2, &vec![1]));
+        assert_eq!(unsafe { title_reset_in(&mut s, a, |raw| { assert_eq!(raw, a); 0 }) }, Some(0));
+        assert!(!s.cur.contains_key(&1));
+        assert_eq!(s.aside[&1], [2], "old alternate remains owned until the external release pass");
+        assert_eq!(unsafe { take_idle_aside(&mut s, 0) }.0, [2]);
+    }
+
+    #[test]
+    fn device_removal_is_not_allocator_completion() {
+        assert!(!completed(u64::MAX, 7));
+        assert!(!completed(6, 7));
+        assert!(completed(7, 7));
+        assert!(!unsafe { Backing { unfenced: true, ..Default::default() }.idle() });
+    }
 
     /// When a title list goes, the segments that recorded its put-off dispatches on its own
     /// allocator hold neither the PC allocator it stands for now nor the ones put aside: `forget`
