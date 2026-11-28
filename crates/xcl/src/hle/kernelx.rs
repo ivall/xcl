@@ -109,6 +109,10 @@ pub fn exports() -> Vec<(&'static str, usize)> {
 pub const MEM_GRAPHICS: u32 = 0x1000_0000;
 mod placeholders;
 pub mod lazy;
+#[allow(dead_code)] // `replace_with_reservation` and its inverse: not used yet
+pub mod sections;
+pub mod guards;
+pub mod alias;
 pub const MEM_TITLE: u32 = 0x4000_0000;
 const STD_ALLOC_MASK: u32 = 0x1000 | 0x2000 | 0x8_0000 | 0x10_0000 | 0x20_0000 | 0x100_0000;
 const STD_PROTECT_MASK: u32 = 0xFF | 0x100 | 0x200 | 0x400;
@@ -275,6 +279,21 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
         return q;
     }
     let uma = crate::gpu::uma::get();
+    // physical page aliasing: the title's reservations of 64 KiB pages hold views of its pages,
+    // so it maps pages there and does not commit memory of its own (a retail title never does)
+    if alias::enabled() && !addr.is_null() && t & 0x1000 != 0 && alias::in_space(addr as usize) {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| crate::xlog_warn!("VirtualAlloc: a commit at {addr:p} in a reservation of 64 KiB pages that holds physical pages (XCL_PAGE_ALIAS) – refused"));
+        fnd::SetLastError(fnd::ERROR_INVALID_ADDRESS);
+        return std::ptr::null_mut();
+    }
+    if alias::enabled() && addr.is_null() && t & 0x2000 != 0 && t & 0x1000 == 0 && t & MEM_64K_PAGES == MEM_64K_PAGES {
+        if let Some(q) = alias::reserve_space(size) {
+            mirrors::reserved(q, size, t, p);
+            trace_mem("VirtualAlloc (64K pages, physical page space)", 0, size, t as u64, p, q);
+            return q as *mut c_void;
+        }
+    }
     // committing inside one of the title's reservations in a sparse window
     if !addr.is_null() && t & 0x1000 != 0 && uma.is_some_and(|u| u.is_sparse(addr as usize)) {
         let q = commit_sparse(addr as usize, size, p);
@@ -436,6 +455,14 @@ pub unsafe extern "system" fn VirtualFree(addr: *mut c_void, size: usize, t: u32
     if let Some(ok) = placeholders::free(addr, size, t) {
         return ok;
     }
+    if alias::enabled() {
+        if let Some(ok) = alias::free_space(addr as usize, size, t) {
+            if ok && t & mem::MEM_RELEASE != 0 {
+                mirrors::released(addr as usize);
+            }
+            return ok as BOOL;
+        }
+    }
     // the title's reservations in a sparse window: decommit (and on release give the address
     // space back); their video memory goes with it
     if let Some(u) = crate::gpu::uma::get().filter(|u| u.is_sparse(addr as usize)) {
@@ -499,6 +526,7 @@ pub unsafe extern "system" fn VirtualFreeEx(proc_: HANDLE, addr: *mut c_void, si
         let a = addr as usize;
         if crate::gpu::uma::get().is_some_and(|u| u.is_sparse(a) || u.contains(a))
             || (t & 0x8000 != 0 && in_graphics_reservation(a))
+            || alias::in_space(a)
         {
             return VirtualFree(addr, size, t);
         }
@@ -960,6 +988,9 @@ static AWAY: std::sync::Mutex<Option<Away>> = std::sync::Mutex::new(None);
 /// Whether a physical page is mapped at the page holding `va` away from its home – committed
 /// or not yet (`lazy`: a page never used is committed at its first access).
 pub fn physical_page_at(va: usize) -> bool {
+    if alias::enabled() {
+        return alias::physical_page_at(va);
+    }
     AWAY.lock().unwrap().as_ref().is_some_and(|a| a.at.contains_key(&(va & !(PHYS_PAGE - 1))))
 }
 
@@ -1001,6 +1032,9 @@ fn page_home(page: usize) -> Option<usize> {
 
 /// Whether every page of `pages` (at least one) is a physical page allocated now.
 pub fn physical_pages_live(pages: &[usize]) -> bool {
+    if alias::enabled() {
+        return alias::pages_live(pages);
+    }
     !pages.is_empty() && pages.iter().all(|&p| page_home(p).is_some())
 }
 
@@ -1037,6 +1071,9 @@ unsafe fn resolve_physical_pages(away: Option<&Away>, pages: &[usize], offset: u
 /// number from `AllocateTitlePhysicalPages`). Returns `false` if `offset >= PHYS_PAGE_SIZE`,
 /// `pages` is too short, or any page is not a live allocation.
 pub unsafe fn read_physical_pages(pages: &[usize], offset: usize, dst: &mut [u8]) -> bool {
+    if alias::enabled() {
+        return alias::read(pages, offset, dst);
+    }
     if dst.is_empty() {
         return offset < PHYS_PAGE;
     }
@@ -1056,6 +1093,9 @@ pub unsafe fn read_physical_pages(pages: &[usize], offset: usize, dst: &mut [u8]
 /// Copy `src` into `pages` starting at `offset` within the first page. Validates every page
 /// before writing so the destination gets all bytes or nothing.
 pub unsafe fn write_physical_pages(pages: &[usize], offset: usize, src: &[u8]) -> bool {
+    if alias::enabled() {
+        return alias::write(pages, offset, src);
+    }
     if src.is_empty() {
         return offset < PHYS_PAGE;
     }
@@ -1312,6 +1352,13 @@ pub unsafe extern "system" fn AllocateTitlePhysicalPages(_p: HANDLE, _t: u32, nu
         fnd::SetLastError(fnd::ERROR_NOT_ENOUGH_MEMORY);
         return 0;
     };
+    if alias::enabled() {
+        if alias::allocate(n, arr) {
+            return 1;
+        }
+        fnd::SetLastError(fnd::ERROR_NOT_ENOUGH_MEMORY);
+        return 0;
+    }
     let Some(u) = crate::gpu::uma::get() else {
         fnd::SetLastError(fnd::ERROR_NOT_ENOUGH_MEMORY);
         return 0;
@@ -1331,6 +1378,14 @@ pub unsafe extern "system" fn AllocateTitlePhysicalPages(_p: HANDLE, _t: u32, nu
 }
 
 pub unsafe extern "system" fn FreeTitlePhysicalPages(_p: HANDLE, n: usize, arr: *mut usize) -> BOOL {
+    if alias::enabled() {
+        if arr.is_null() {
+            fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
+            return 0;
+        }
+        alias::free(std::slice::from_raw_parts(arr, n));
+        return 1;
+    }
     let Some(u) = crate::gpu::uma::get() else { return 0 };
     if arr.is_null() {
         fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
@@ -1370,11 +1425,26 @@ pub unsafe extern "system" fn FreeTitlePhysicalPages(_p: HANDLE, n: usize, arr: 
 }
 
 pub unsafe extern "system" fn MapTitlePhysicalPages(va: *mut c_void, n: usize, _t: u32, _p: u32, arr: *mut usize) -> *mut c_void {
+    if alias::enabled() {
+        return map_aliased(va, n, arr);
+    }
     let mut g = AWAY.lock().unwrap();
     let away = g.get_or_insert_with(Away::default);
     let r = map_pages(away, va, n, arr);
     give_back_homes(away);
     r
+}
+
+/// `MapTitlePhysicalPages` with physical page aliasing (`alias`): the title always names the
+/// address (a retail title never maps a page at its home, which is XCL's own view here).
+unsafe fn map_aliased(va: *mut c_void, n: usize, arr: *mut usize) -> *mut c_void {
+    if va.is_null() || n == 0 {
+        fnd::SetLastError(if va.is_null() { fnd::ERROR_NOT_SUPPORTED } else { fnd::ERROR_INVALID_PARAMETER });
+        return std::ptr::null_mut();
+    }
+    note_mapping_at(va as usize);
+    let pages: Vec<usize> = if arr.is_null() { vec![0; n] } else { std::slice::from_raw_parts(arr, n).to_vec() };
+    if alias::map(va as usize, &pages) { va } else { std::ptr::null_mut() }
 }
 
 /// `MapTitlePhysicalPages` with `AWAY` held; the homes it moves away are given back by the
@@ -1498,6 +1568,12 @@ pub unsafe extern "system" fn XMemMapPhysicalPagesScatter(addresses: *const *mut
     if addresses.is_null() {
         fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
         return 0;
+    }
+    if alias::enabled() {
+        return (0..n).all(|i| {
+            let page = if pages.is_null() { std::ptr::null_mut() } else { pages.add(i).cast() };
+            !map_aliased(*addresses.add(i), 1, page).is_null()
+        }) as BOOL;
     }
     if crate::gpu::uma::get().is_none() {
         fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
