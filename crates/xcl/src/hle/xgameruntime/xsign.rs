@@ -28,8 +28,10 @@ extern "system" {
         implementation: *const u16,
         flags: u32,
     ) -> i32;
+    fn BCryptCloseAlgorithmProvider(alg: *mut c_void, flags: u32) -> i32;
     fn BCryptGenerateKeyPair(alg: *mut c_void, key: *mut *mut c_void, length: u32, flags: u32) -> i32;
     fn BCryptFinalizeKeyPair(key: *mut c_void, flags: u32) -> i32;
+    fn BCryptDestroyKey(key: *mut c_void) -> i32;
     fn BCryptHash(
         alg: *mut c_void,
         secret: *const u8,
@@ -63,7 +65,18 @@ extern "system" {
 
 struct EphemeralSigner {
     sha256_alg: usize,
+    ecdsa_alg: usize,
     ecdsa_key: usize,
+}
+
+impl Drop for EphemeralSigner {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = BCryptDestroyKey(self.ecdsa_key as *mut c_void);
+            let _ = BCryptCloseAlgorithmProvider(self.ecdsa_alg as *mut c_void, 0);
+            let _ = BCryptCloseAlgorithmProvider(self.sha256_alg as *mut c_void, 0);
+        }
+    }
 }
 
 static SIGNER: OnceLock<Result<EphemeralSigner, HRESULT>> = OnceLock::new();
@@ -87,18 +100,28 @@ fn signer() -> Result<&'static EphemeralSigner, HRESULT> {
             let mut ecdsa_alg = std::ptr::null_mut();
             let st = BCryptOpenAlgorithmProvider(&mut ecdsa_alg, wide("ECDSA_P256").as_ptr(), std::ptr::null(), 0);
             if st < 0 {
+                let _ = BCryptCloseAlgorithmProvider(sha256_alg, 0);
                 return Err(hresult_from_ntstatus(st));
             }
             let mut ecdsa_key = std::ptr::null_mut();
             let st = BCryptGenerateKeyPair(ecdsa_alg, &mut ecdsa_key, 256, 0);
             if st < 0 {
+                let _ = BCryptCloseAlgorithmProvider(ecdsa_alg, 0);
+                let _ = BCryptCloseAlgorithmProvider(sha256_alg, 0);
                 return Err(hresult_from_ntstatus(st));
             }
             let st = BCryptFinalizeKeyPair(ecdsa_key, 0);
             if st < 0 {
+                let _ = BCryptDestroyKey(ecdsa_key);
+                let _ = BCryptCloseAlgorithmProvider(ecdsa_alg, 0);
+                let _ = BCryptCloseAlgorithmProvider(sha256_alg, 0);
                 return Err(hresult_from_ntstatus(st));
             }
-            Ok(EphemeralSigner { sha256_alg: sha256_alg as usize, ecdsa_key: ecdsa_key as usize })
+            Ok(EphemeralSigner {
+                sha256_alg: sha256_alg as usize,
+                ecdsa_alg: ecdsa_alg as usize,
+                ecdsa_key: ecdsa_key as usize,
+            })
         })
         .as_ref()
         .map_err(|&e| e)
@@ -118,18 +141,33 @@ pub fn current_filetime() -> u64 {
         .saturating_add(u64::from(dur.subsec_nanos() / 100))
 }
 
+fn strip_authority_prefix(s: &str) -> Option<&str> {
+    if let Some(rest) = s.strip_prefix("//") {
+        return Some(rest);
+    }
+    let colon = s.find(':')?;
+    let scheme = s.as_bytes().get(..colon)?;
+    if scheme.first().is_some_and(u8::is_ascii_alphabetic)
+        && scheme[1..].iter().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
+    {
+        return s.get(colon..)?.strip_prefix("://");
+    }
+    None
+}
+
 /// Extract the canonical path-and-query component from a URL for XSTS signing.
-/// Strips any `scheme://authority` prefix and `#fragment`, ensuring a leading `/`.
+/// Strips any `scheme://authority` or `//authority` prefix and `#fragment`, ensuring a leading `/`.
 pub fn canonical_path_and_query(url: &str) -> String {
-    let without_scheme = match url.split_once("://") {
-        Some((_, rest)) => rest,
-        None => url,
-    };
-    let without_frag = without_scheme.split('#').next().unwrap_or("");
-    match without_frag.find(['/', '?']) {
-        Some(idx) if without_frag.as_bytes()[idx] == b'/' => without_frag[idx..].to_string(),
-        Some(idx) => format!("/{}", &without_frag[idx..]),
-        None => "/".to_string(),
+    let without_frag = url.split('#').next().unwrap_or("");
+    match strip_authority_prefix(without_frag) {
+        Some(after_authority) => match after_authority.find(['/', '?']) {
+            Some(idx) if after_authority.as_bytes()[idx] == b'/' => after_authority[idx..].to_string(),
+            Some(idx) => format!("/{}", &after_authority[idx..]),
+            None => "/".to_string(),
+        },
+        None if without_frag.is_empty() => "/".to_string(),
+        None if without_frag.starts_with('/') => without_frag.to_string(),
+        None => format!("/{without_frag}"),
     }
 }
 
@@ -287,6 +325,62 @@ mod tests {
         assert_eq!(canonical_path_and_query("wss://rta.xboxlive.com/connect"), "/connect");
         assert_eq!(canonical_path_and_query("https://example.invalid"), "/");
         assert_eq!(canonical_path_and_query("https://example.invalid?k=v"), "/?k=v");
+    }
+
+    #[test]
+    fn canonical_url_preserves_embedded_query_urls_and_strips_fragments_first() {
+        assert_eq!(
+            canonical_path_and_query("/oauth/authorize?redirect_uri=https://title.example/cb#frag"),
+            "/oauth/authorize?redirect_uri=https://title.example/cb",
+        );
+        assert_eq!(
+            canonical_path_and_query("users/me?next=https://title.example/sub"),
+            "/users/me?next=https://title.example/sub",
+        );
+        assert_eq!(canonical_path_and_query("/users/me#https://frag.example/sub"), "/users/me");
+        assert_eq!(
+            canonical_path_and_query("https://social.xboxlive.com/users/me?redirect=https://other.example/sub#https://frag/x"),
+            "/users/me?redirect=https://other.example/sub",
+        );
+        assert_eq!(canonical_path_and_query("//social.xboxlive.com/users/me?a=1#frag"), "/users/me?a=1");
+        assert_eq!(canonical_path_and_query(""), "/");
+        assert_eq!(canonical_path_and_query("?k=v"), "/?k=v");
+
+        let ts = 0x01DB_2222_3333_4444u64;
+        let auth = offline_token();
+        let rel_url = "/oauth/authorize?redirect_uri=https://title.example/cb#frag";
+        let full_url = "https://auth.xboxlive.com/oauth/authorize?redirect_uri=https://title.example/cb";
+        let encoded = sign_request_at(ts, "GET", rel_url, &auth, b"").unwrap();
+        let raw = base64_decode(&encoded);
+        assert_eq!(raw.len(), 76);
+
+        let s = signer().unwrap();
+        let expected_payload = canonical_payload(ts, "GET", full_url, &auth, b"");
+        assert_eq!(canonical_payload(ts, "GET", rel_url, &auth, b""), expected_payload);
+        let mut digest = [0u8; 32];
+        unsafe {
+            assert!(
+                BCryptHash(
+                    s.sha256_alg as *mut c_void,
+                    std::ptr::null(),
+                    0,
+                    expected_payload.as_ptr(),
+                    expected_payload.len() as u32,
+                    digest.as_mut_ptr(),
+                    32,
+                ) >= 0
+            );
+            let st = BCryptVerifySignature(
+                s.ecdsa_key as *mut c_void,
+                std::ptr::null(),
+                digest.as_ptr(),
+                32,
+                raw[12..].as_ptr(),
+                64,
+                0,
+            );
+            assert!(st >= 0, "BCryptVerifySignature failed for embedded query URL: {st:#x}");
+        }
     }
 
     #[test]
