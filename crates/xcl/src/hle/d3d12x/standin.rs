@@ -107,6 +107,14 @@ pub unsafe fn shell(key: Key, make: impl FnOnce() -> Result<usize, HRESULT>) -> 
     Ok((p as *mut c_void, pipeline))
 }
 
+/// Whether `obj` is one of our shells (a title's pipeline that is no driver object).
+///
+/// # Safety
+/// `obj` is 0 or a live COM object.
+pub unsafe fn is_shell(obj: usize) -> bool {
+    obj != 0 && *(obj as *const usize) == vtable()
+}
+
 /// ID3D12PipelineState as the title sees it.
 #[repr(C)]
 struct Shell {

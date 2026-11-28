@@ -2175,6 +2175,41 @@ unsafe extern "system" fn pso_release(this: *mut c_void) -> u32 {
     n
 }
 
+/// What the library may store for the title's `pipeline`: the pipeline itself, never a stand-in.
+/// A stand-in's shell is no driver object, and the driver pipeline behind a stand-in is a dummy
+/// shared by many; either one stored under the title's name would be what a later
+/// `LoadGraphicsPipeline` / `Serialize` gives back. None: the real pipeline is not built (or
+/// failed); nothing is stored then, and the title may store it again once it is built.
+unsafe fn pipeline_to_store(pipeline: *mut c_void) -> Option<*mut c_void> {
+    use super::pso_async::Built;
+    match super::pso_async::built(pipeline as usize) {
+        Built::Real(real) => Some(real as *mut c_void),
+        Built::NotYet => None,
+        Built::Other if super::standin::is_shell(pipeline as usize) => None,
+        Built::Other => Some(pipeline),
+    }
+}
+
+/// `forward` is the driver's StorePipeline, called with the pipeline `pipeline_to_store` gives.
+unsafe fn store_pipeline(pipeline: *mut c_void, forward: impl FnOnce(*mut c_void) -> HRESULT) -> HRESULT {
+    match pipeline_to_store(pipeline) {
+        Some(p) => forward(p),
+        None => {
+            static N: AtomicU64 = AtomicU64::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 3 {
+                crate::xlog_warn!("D3D12.X: StorePipeline of a pipeline not built yet ({pipeline:p}) – not stored");
+            }
+            E_INVALIDARG
+        }
+    }
+}
+
+/// ID3D12PipelineLibrary::StorePipeline: the driver gets the title's pipeline, not its stand-in.
+unsafe extern "system" fn lib_store_pipeline(this: *mut c_void, name: *const u16, pipeline: *mut c_void) -> HRESULT {
+    let f: unsafe extern "system" fn(*mut c_void, *const u16, *mut c_void) -> HRESULT = std::mem::transmute(orig_fn(this, slot_of(this, "StorePipeline")));
+    store_pipeline(pipeline, |p| f(this, name, p))
+}
+
 /// A pipeline state is gone: drop what XCL keeps by its address (a later pipeline may get the
 /// same address and must not inherit its root signature or compute pass).
 /// compute pipelines that run a translated console shader
@@ -3471,6 +3506,7 @@ fn overrides(kind: Kind) -> Vec<(&'static str, usize)> {
             ("WriteToSubresource", res_write_to_subresource as usize),
         ]),
         Kind::PipelineState => v.push(("Release", pso_release as usize)),
+        Kind::PipelineLibrary => v.push(("StorePipeline", lib_store_pipeline as usize)),
         Kind::DescriptorHeap => v.push(("Release", heap_release as usize)),
         Kind::Heap => v.push(("Release", mem_heap_release as usize)),
         Kind::Fence => v.extend_from_slice(&[("GetCompletedValue", fence_completed as usize), ("Signal", fence_signal as usize)]),
@@ -12399,3 +12435,119 @@ mod heap_release_order_tests {
     }
 }
 
+#[cfg(test)]
+mod store_pipeline_tests {
+    use super::*;
+    use super::super::pso_async;
+    use super::super::standin;
+    use std::sync::atomic::AtomicU32;
+
+    /// A COM object that counts its references; `Release` frees nothing.
+    #[repr(C)]
+    struct Fake {
+        vtable: *const usize,
+        refs: AtomicU32,
+    }
+
+    unsafe extern "system" fn qi(_: *mut c_void, _: *const GUID, _: *mut *mut c_void) -> HRESULT {
+        E_INVALIDARG
+    }
+    unsafe extern "system" fn up(this: *mut c_void) -> u32 {
+        (*(this as *const Fake)).refs.fetch_add(1, Ordering::AcqRel) + 1
+    }
+    unsafe extern "system" fn down(this: *mut c_void) -> u32 {
+        (*(this as *const Fake)).refs.fetch_sub(1, Ordering::AcqRel) - 1
+    }
+
+    fn fake() -> usize {
+        let v: &'static [usize; 3] = Box::leak(Box::new([qi as usize, up as usize, down as usize]));
+        Box::leak(Box::new(Fake { vtable: v.as_ptr(), refs: AtomicU32::new(1) })) as *mut Fake as usize
+    }
+
+    /// A title's stand-in over a fake driver pipeline (`state` keeps each test's own).
+    unsafe fn shell(state: u8, dummy: usize) -> usize {
+        let key = standin::Key { device: 1, root_signature: 0, kind: 0, state: vec![0x5d, state] };
+        let (s, d) = standin::shell(key, || Ok(dummy)).unwrap();
+        assert_eq!(d, dummy);
+        s as usize
+    }
+
+    /// What the driver's StorePipeline got (None: it was not called) and what the title got back.
+    unsafe fn stored(title: usize) -> (Option<usize>, HRESULT) {
+        let mut got = None;
+        let hr = store_pipeline(title as *mut c_void, |p| {
+            got = Some(p as usize);
+            S_OK
+        });
+        (got, hr)
+    }
+
+    unsafe fn release_title(obj: usize) {
+        let f: unsafe extern "system" fn(usize) -> u32 = std::mem::transmute(*(*(obj as *const *const usize)).add(2));
+        f(obj);
+    }
+
+    #[test]
+    fn a_pipeline_that_is_no_stand_in_goes_to_the_driver_unchanged() {
+        let other = fake();
+        assert_eq!(unsafe { stored(other) }, (Some(other), S_OK));
+        assert_eq!(unsafe { stored(0) }, (Some(0), S_OK), "the driver judges a null pipeline");
+    }
+
+    #[test]
+    fn a_built_stand_in_gives_the_driver_its_real_pipeline() {
+        unsafe {
+            let (dummy, real) = (fake(), fake());
+            let s = shell(1, dummy);
+            pso_async::submit(s, false, Box::new(move || real));
+            pso_async::shared(s, dummy);
+            let start = std::time::Instant::now();
+            while pso_async::is_pending(s) && start.elapsed() < std::time::Duration::from_secs(10) {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            let (got, hr) = stored(s);
+            assert_eq!((got, hr), (Some(real), S_OK), "never the shell ({s:#x}) or the dummy ({dummy:#x})");
+            release_title(s);
+        }
+    }
+
+    #[test]
+    fn a_stand_in_not_built_yet_is_not_stored() {
+        unsafe {
+            let (dummy, real) = (fake(), fake());
+            let s = shell(2, dummy);
+            // (lazy: nothing builds it until a bind asks)
+            pso_async::submit_lazy(s, false, Box::new(move || real), 0);
+            pso_async::shared(s, dummy);
+            assert_eq!(stored(s), (None, E_INVALIDARG));
+            assert!(pso_async::is_pending(s), "asking did not send it to the workers");
+            release_title(s);
+        }
+    }
+
+    #[test]
+    fn a_stand_in_whose_build_failed_is_not_stored() {
+        unsafe {
+            let dummy = fake();
+            let s = shell(3, dummy);
+            pso_async::submit(s, false, Box::new(|| 0));
+            pso_async::shared(s, dummy);
+            let start = std::time::Instant::now();
+            while pso_async::is_pending(s) && start.elapsed() < std::time::Duration::from_secs(10) {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            assert_eq!(stored(s), (None, E_INVALIDARG));
+            release_title(s);
+        }
+    }
+
+    #[test]
+    fn a_shell_nobody_built_is_never_handed_to_the_driver() {
+        unsafe {
+            let dummy = fake();
+            let s = shell(4, dummy);
+            assert_eq!(stored(s), (None, E_INVALIDARG));
+            release_title(s);
+        }
+    }
+}
