@@ -292,7 +292,6 @@ fn uses_fallback(d: &Decoded) -> (Regs, Regs) {
         }
     }
     for o in d.ienc.operands {
-        let n = (o.size as u64).div_ceil(32).max(1);
         let regs = match (o.field, o.ty) {
             (_, "OPR_VCC") => VCC,
             (_, "OPR_EXEC" | "OPR_SDST_EXEC") => EXEC,
@@ -305,6 +304,7 @@ fn uses_fallback(d: &Decoded) -> (Regs, Regs) {
                 if f == "SRC0" && d.variant != Variant::Plain {
                     continue;
                 }
+                let n = rdna2::sgpr_operand_dwords(d, o);
                 scalar_code(rdna2::field_value(d.enc, &d.words, f).unwrap_or(0) * rdna2::register_scale(f), n)
             }
         };
@@ -773,6 +773,28 @@ mod tests {
     fn asm(lines: &[I]) -> Vec<Decoded> {
         let bytes: Vec<u8> = lines.iter().flat_map(|(n, e, f)| rdna2::encode(n, e, f, None).unwrap()).collect();
         program(&bytes)
+    }
+
+    #[test]
+    fn mimg_r128_descriptor_reads() {
+        for (op, r128, end) in [
+            ("IMAGE_LOAD", 0, 12),
+            ("IMAGE_LOAD", 1, 8),
+            // With R128 clear, the trackers still use the four SGPRs declared in the BVH tables.
+            ("IMAGE_BVH_INTERSECT_RAY", 0, 8),
+            ("IMAGE_BVH64_INTERSECT_RAY", 0, 8),
+        ] {
+            let bytes = rdna2::encode(op, "ENC_MIMG", &[("SRSRC", 1), ("R128", r128)], None).unwrap();
+            let d = rdna2::decode(&bytes, 0).unwrap();
+            let expected: Vec<_> = (4..end).collect();
+            let (reads, writes) = rdna2::sgpr_uses(&d);
+            let (whole, overwritten) = uses(&d);
+            let whole_reads: Vec<_> = (0..128).filter(|&r| whole & (1 << r) != 0).collect();
+            assert_eq!(reads, expected, "{op} R128={r128}");
+            assert_eq!(whole_reads, expected, "{op} R128={r128}");
+            assert!(writes.is_empty());
+            assert_eq!(overwritten, 0);
+        }
     }
 
     #[test]

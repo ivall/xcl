@@ -454,6 +454,15 @@ pub fn register_scale(field: &str) -> u64 {
     }
 }
 
+/// MIMG's R128 bit selects a four-SGPR resource descriptor. Otherwise use the operand table.
+pub(crate) fn sgpr_operand_dwords(d: &Decoded, o: &Operand) -> u64 {
+    if o.field == Some("SRSRC") && d.enc.name == "ENC_MIMG" && field_value(d.enc, &d.words, "R128") == Some(1) {
+        4
+    } else {
+        (o.size as u64).div_ceil(32).max(1)
+    }
+}
+
 /// Assemble one instruction (spec name such as "V_ADD_F32", encoding name such as
 /// "ENC_VOP2" or "VOP3_SDST_ENC"), setting the given fields; for tests and tools.
 pub fn encode(name: &str, enc: &str, fields: &[(&str, u64)], literal: Option<u32>) -> Result<Vec<u8>, String> {
@@ -538,7 +547,7 @@ pub fn sgpr_uses(d: &Decoded) -> (Vec<u64>, Vec<u64>) {
         if v > 127 || v == 125 {
             continue;
         }
-        let n = (o.size as u64).div_ceil(32).max(1);
+        let n = sgpr_operand_dwords(d, o);
         let dst = if o.output { &mut w } else { &mut r };
         dst.extend(v..(v + n).min(128));
     }

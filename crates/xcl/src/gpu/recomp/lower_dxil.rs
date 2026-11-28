@@ -464,6 +464,36 @@ mod tests {
         true
     }
 
+    #[test]
+    fn mimg_r128_leaves_the_mask_outside_the_descriptor() {
+        use crate::gpu::rdna2;
+
+        let cs = super::super::CsInterface {
+            threads: [32, 1, 1],
+            user_sgprs: 12,
+            tgid: [false; 3],
+            tg_size: false,
+            tid_components: 1,
+        };
+        let prefix: &[I] = &[
+            ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 144), ("VSRC1", 0)]),
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 8), ("SSRC0", 106)]),
+        ];
+        let program = |r128| {
+            let mut code: Vec<u8> = prefix.iter().flat_map(encode_line).collect();
+            code.extend(rdna2::encode("IMAGE_LOAD", "ENC_MIMG", &[
+                ("SRSRC", 1), ("VADDR", 0), ("VDATA", 1), ("DIM", 0),
+                ("DMASK", 1), ("UNORM", 1), ("R128", r128),
+            ], None).unwrap());
+            code.extend(encode_line(&ENDPGM));
+            code
+        };
+
+        let err = super::compute_code(&program(0), &cs, false).unwrap_err();
+        assert!(err.contains("unsupported IMAGE_LOAD (s8: a mask read as a number)"), "{err}");
+        super::compute_code(&program(1), &cs, false).unwrap();
+    }
+
     /// A rounding mode #1426's lowering cannot honour refuses the program, as #1426 and the HLSL
     /// path do, instead of the per-lane form computing with the default mode (Kalmarv, #1745):
     /// f32 toward zero by `s_setreg`, f64 by `s_round_mode` and by `s_setreg`.
