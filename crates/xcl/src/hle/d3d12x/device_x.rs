@@ -1042,10 +1042,24 @@ fn allocation_of(parts: impl IntoIterator<Item = (u64, u64)>, mut placed: impl F
 /// each resource's {offset, alignment, size} goes to the last argument when there is one.
 pub(super) unsafe extern "system" fn get_resource_allocation_info2_x(a: *mut c_void, b: *mut c_void, mask: u32, n: u32, descs: *const [u8; 0x48], infos: *mut [u64; 3]) -> *mut [u64; 2] {
     real::note_newer_device_method(108);
+    allocation_info_each::<0x48>(a, b, mask, n, descs as *const u8, infos)
+}
+
+/// device #95 GetResourceAllocationInfo1 (PC #56): as #108, with D3D12_RESOURCE_DESCs (0x38
+/// bytes each) rather than DESC1s.
+pub(super) unsafe extern "system" fn get_resource_allocation_info1_x(a: *mut c_void, b: *mut c_void, mask: u32, n: u32, descs: *const [u8; 0x38], infos: *mut [u64; 3]) -> *mut [u64; 2] {
+    real::note_newer_device_method(95);
+    allocation_info_each::<0x38>(a, b, mask, n, descs as *const u8, infos)
+}
+
+/// #95 / #108: each description (`STRIDE` bytes apart, the console resource desc first) asked
+/// of #25 on its own, and where each goes in the whole written to `infos` ({offset, alignment,
+/// size}).
+unsafe fn allocation_info_each<const STRIDE: usize>(a: *mut c_void, b: *mut c_void, mask: u32, n: u32, descs: *const u8, infos: *mut [u64; 3]) -> *mut [u64; 2] {
     let ret = if real::this_first(a, b) { b } else { a } as *mut [u64; 2];
     let parts = (0..n as usize).map(|k| {
         let mut r = [0u64; 2];
-        let d = if descs.is_null() { std::ptr::null() } else { descs.add(k) as *const [u8; 0x38] };
+        let d = if descs.is_null() { std::ptr::null() } else { descs.add(k * STRIDE) as *const [u8; 0x38] };
         let (x, y) = if real::this_first(a, b) { (a, &mut r as *mut _ as *mut c_void) } else { (&mut r as *mut _ as *mut c_void, b) };
         get_resource_allocation_info_x(x, y, mask, 1, d);
         (r[0], r[1])
@@ -1274,6 +1288,25 @@ pub(super) fn layout_state(layout: u32) -> u32 {
         10 => 0x1000, // resolve dest
         _ => 0,
     }
+}
+
+/// device #112 GetCopyableFootprints1 (PC #72): #38 with a D3D12_RESOURCE_DESC1, whose first 0x38
+/// bytes are the console resource desc (the sampler-feedback mip region after them does not
+/// change the footprints)
+#[allow(clippy::too_many_arguments)]
+pub(super) unsafe extern "system" fn get_copyable_footprints1_x(
+    this: *mut c_void,
+    desc: *const u8,
+    first: u32,
+    num: u32,
+    base: u64,
+    layouts: *mut c_void,
+    rows: *mut u32,
+    row_sizes: *mut u64,
+    total: *mut u64,
+) {
+    real::note_newer_device_method(112);
+    get_copyable_footprints_x(this, desc, first, num, base, layouts, rows, row_sizes, total)
 }
 
 /// device #38 GetCopyableFootprints: a console resource desc the PC rejects (total stays
@@ -1765,6 +1798,56 @@ mod tests {
         if let Some(m) = UAV_FORMAT_SUPPORT.lock().unwrap().as_mut() {
             m.remove(&((luid_a.LowPart, luid_a.HighPart), 24));
             m.remove(&((luid_b.LowPart, luid_b.HighPart), 24));
+        }
+    }
+
+    /// #95 (D3D12_RESOURCE_DESCs, 0x38 bytes apart) and #108 (DESC1s, 0x48) ask #25 for each
+    /// description and lay the results out one after another. (The helper is called directly:
+    /// the slots also note the newer layout, a global the queue tests set.)
+    #[test]
+    fn newer_allocation_info_reads_each_description_at_its_stride() {
+        use windows::Win32::Foundation::LUID;
+        #[repr(C)]
+        struct FakeDev { vt: *const usize, luid: LUID, widths: Vec<u64> }
+        unsafe extern "system" fn check_feature(_: *mut c_void, _: D3D12_FEATURE, _: *mut c_void, _: u32) -> HRESULT { S_OK }
+        unsafe extern "system" fn adapter_luid(this: *mut c_void, out: *mut LUID) { *out = (*(this as *const FakeDev)).luid; }
+        unsafe extern "system" fn info(this: *mut c_void, ret: *mut [u64; 2], _: u32, _: u32, desc: *const [u8; 0x38]) -> *mut [u64; 2] {
+            let w = u64::from_le_bytes(desc.read_unaligned()[0x10..0x18].try_into().unwrap());
+            (*(this as *mut FakeDev)).widths.push(w);
+            *ret = [w, 0x10000];
+            ret
+        }
+        let mut orig_vt = [0usize; 44];
+        (orig_vt[13], orig_vt[25], orig_vt[43]) = (check_feature as usize, info as usize, adapter_luid as usize);
+        let mut ext_buf = [0usize; 45];
+        ext_buf[0] = orig_vt.as_ptr() as usize;
+        ext_buf[1..].copy_from_slice(&orig_vt);
+        let luid = LUID { LowPart: 0xD120_0095, HighPart: 0x5A17_0095 };
+        let mut dev = FakeDev { vt: unsafe { ext_buf.as_ptr().add(1) }, luid, widths: Vec::new() };
+        let this = &mut dev as *mut FakeDev as *mut c_void;
+        // two buffers, 0x1000 and 0x3000 bytes, at each stride
+        fn descs<const S: usize>() -> [[u8; S]; 2] {
+            let mut d = [[0u8; S]; 2];
+            for (k, w) in [0x1000u64, 0x3000].into_iter().enumerate() {
+                d[k][0] = 1;
+                d[k][0x10..0x18].copy_from_slice(&w.to_le_bytes());
+                (d[k][0x18], d[k][0x1C], d[k][0x1E], d[k][0x24]) = (1, 1, 1, 1);
+            }
+            d
+        }
+        let want = ([0x20000u64, 0x10000], vec![[0u64, 0x10000, 0x1000], [0x10000, 0x10000, 0x3000]]);
+        unsafe {
+            let d1 = descs::<0x38>();
+            let (mut ret, mut infos) = ([0u64; 2], vec![[0u64; 3]; 2]);
+            allocation_info_each::<0x38>(&mut ret as *mut _ as *mut c_void, this, 0, 2, d1.as_ptr() as *const u8, infos.as_mut_ptr());
+            assert_eq!((ret, infos, std::mem::take(&mut dev.widths)), (want.0, want.1.clone(), vec![0x1000, 0x3000]), "#95: descs 0x38 apart");
+            let d2 = descs::<0x48>();
+            let (mut ret, mut infos) = ([0u64; 2], vec![[0u64; 3]; 2]);
+            allocation_info_each::<0x48>(&mut ret as *mut _ as *mut c_void, this, 0, 2, d2.as_ptr() as *const u8, infos.as_mut_ptr());
+            assert_eq!((ret, infos, std::mem::take(&mut dev.widths)), (want.0, want.1, vec![0x1000, 0x3000]), "#108: descs 0x48 apart");
+        }
+        if let Some(m) = UAV_FORMAT_SUPPORT.lock().unwrap().as_mut() {
+            m.retain(|k, _| k.0 != (luid.LowPart, luid.HighPart));
         }
     }
 

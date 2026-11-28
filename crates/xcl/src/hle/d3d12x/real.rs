@@ -1388,8 +1388,17 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
                 (80, super::frame::wait_frame_event_x as usize),
                 (81, super::frame::frame_statistics_x as usize),
                 (86, x::create_pipeline_state_x as usize),
+                (92, dev_create_committed_resource1_x as usize),
+                (93, dev_create_heap1_x as usize),
+                (94, dev_create_reserved_resource1_x as usize),
+                (95, x::get_resource_allocation_info1_x as usize),
                 (108, x::get_resource_allocation_info2_x as usize),
+                (109, dev_create_committed_resource2_x as usize),
+                (110, dev_create_placed_resource1_x as usize),
+                (112, x::get_copyable_footprints1_x as usize),
                 (127, dev_create_committed_resource_layout_x as usize),
+                (128, dev_create_placed_resource2_x as usize),
+                (129, dev_create_reserved_resource2_x as usize),
                 (133, x::create_placed_resource_layout_x as usize),
             ]
         }
@@ -3252,6 +3261,57 @@ unsafe extern "system" fn dev_create_committed_resource_layout_x(
         return create_display_target(this, props, desc, state, clear, riid, ppv);
     }
     dev_create_committed_resource_x(this, props, flags as usize, desc, state, clear, riid, ppv)
+}
+
+// The console device's *1 / *2 variants of the resource and heap methods (PC order, `console_remap`):
+// the console description goes to the console method of the base form; a protected session and
+// castable formats have no console meaning here and are dropped, a barrier layout becomes the
+// resource state it starts in (as #127 / #133).
+
+/// device #92 CreateCommittedResource1 (PC #53)
+#[allow(clippy::too_many_arguments)]
+unsafe extern "system" fn dev_create_committed_resource1_x(this: *mut c_void, props: usize, flags: usize, desc: usize, state: usize, clear: usize, _session: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    note_newer_device_method(92);
+    dev_create_committed_resource_x(this, props, flags, desc, state, clear, riid, ppv)
+}
+
+/// device #109 CreateCommittedResource2 (PC #69): a D3D12_RESOURCE_DESC1, the console desc first
+#[allow(clippy::too_many_arguments)]
+unsafe extern "system" fn dev_create_committed_resource2_x(this: *mut c_void, props: usize, flags: usize, desc: usize, state: usize, clear: usize, _session: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    note_newer_device_method(109);
+    dev_create_committed_resource_x(this, props, flags, desc, state, clear, riid, ppv)
+}
+
+/// device #93 CreateHeap1 (PC #54)
+unsafe extern "system" fn dev_create_heap1_x(this: *mut c_void, desc: usize, _session: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    note_newer_device_method(93);
+    dev_create_heap(this, desc, riid, ppv)
+}
+
+/// device #94 CreateReservedResource1 (PC #55)
+unsafe extern "system" fn dev_create_reserved_resource1_x(this: *mut c_void, desc: usize, state: usize, clear: usize, _session: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    note_newer_device_method(94);
+    dev_create_reserved_resource(this, desc, state, clear, riid, ppv)
+}
+
+/// device #129 CreateReservedResource2 (PC #78)
+#[allow(clippy::too_many_arguments)]
+unsafe extern "system" fn dev_create_reserved_resource2_x(this: *mut c_void, desc: usize, layout: u32, clear: usize, _session: usize, _castable: u32, _formats: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    note_newer_device_method(129);
+    dev_create_reserved_resource(this, desc, super::device_x::layout_state(layout) as usize, clear, riid, ppv)
+}
+
+/// device #110 CreatePlacedResource1 (PC #70): a D3D12_RESOURCE_DESC1, the console desc first
+unsafe extern "system" fn dev_create_placed_resource1_x(this: *mut c_void, heap: usize, offset: usize, desc: usize, state: usize, clear: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    note_newer_device_method(110);
+    dev_create_placed_resource_x(this, heap, offset, desc, state, clear, riid, ppv)
+}
+
+/// device #128 CreatePlacedResource2 (PC #77)
+#[allow(clippy::too_many_arguments)]
+unsafe extern "system" fn dev_create_placed_resource2_x(this: *mut c_void, heap: usize, offset: usize, desc: usize, layout: u32, clear: usize, _castable: u32, _formats: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    note_newer_device_method(128);
+    dev_create_placed_resource_x(this, heap, offset, desc, super::device_x::layout_state(layout) as usize, clear, riid, ppv)
 }
 
 /// A display target: its console memory comes from the title's allocation hook, as the console
