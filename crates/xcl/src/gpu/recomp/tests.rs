@@ -9416,6 +9416,35 @@ fn gpu_sdwa_f16_inline_constants() {
 }
 
 #[test]
+fn gpu_sat_pk_u8_i16_preserves_other_half() {
+    for wave64 in gpu_waves() {
+        let p = prog(&[
+            // VOP1: writes low 16 bits, preserves upper 16 bits of v10
+            ("V_SAT_PK_U8_I16", "ENC_VOP1", &[("VDST", 10), ("SRC0", V + 0)], None),
+            // VOP3 with OP_SEL[3]=1 (8): writes high 16 bits, preserves lower 16 bits of v11
+            ("V_SAT_PK_U8_I16", "ENC_VOP3", &[("VDST", 11), ("SRC0", V + 1), ("OP_SEL", 8)], None),
+            // VOP3 clamping: lo = -5i16 -> 0, hi = 300i16 -> 255, preserving upper 16 bits of v12
+            ("V_SAT_PK_U8_I16", "ENC_VOP3", &[("VDST", 12), ("SRC0", V + 2)], None),
+        ]);
+        let mut st = KernelState::default();
+        for r in st.vgpr.iter_mut() {
+            r[0] = (0x0002u32 << 16) | 0x0001;          // (+1, +2) -> 0x0201
+            r[1] = (0x00ABu32 << 16) | 0x00CD;          // (+0xCD, +0xAB) -> 0xABCD
+            r[2] = (300u32 << 16) | ((-5i16) as u16 as u32); // (-5, +300) -> 0xFF00
+            r[10] = 0xDEAD_BEEF;
+            r[11] = 0x1234_5678;
+            r[12] = 0xCAFE_BABE;
+        }
+        let (r, lanes) = run_wave(&p, &st, wave64);
+        for (l, v) in r.vgpr.iter().take(lanes).enumerate() {
+            assert_eq!(v[10], 0xDEAD_0201, "wave{lanes} lane {l} VOP1 v_sat_pk_u8_i16 preserves upper half");
+            assert_eq!(v[11], 0xABCD_5678, "wave{lanes} lane {l} VOP3 OP_SEL[3]=1 v_sat_pk_u8_i16 preserves lower half");
+            assert_eq!(v[12], 0xCAFE_FF00, "wave{lanes} lane {l} v_sat_pk_u8_i16 saturates signed i16 to [0, 255]");
+        }
+    }
+}
+
+#[test]
 fn fspx_compute_user_sgprs_from_rsrc2() {
     use crate::gpu::xbox::tests::container;
 

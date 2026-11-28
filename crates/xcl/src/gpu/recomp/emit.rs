@@ -4095,7 +4095,16 @@ impl Em {
                 }
             }
             "v_mul_hi_i32_i24" => format!("(uint)(((int64_t)i24({a}) * (int64_t)i24({b})) >> 32)"),
-            "v_sat_pk_u8_i16" => format!("(uint)clamp(((int)({a} << 16)) >> 16, 0, 255) | ((uint)clamp((int){a} >> 16, 0, 255) << 8)"),
+            "v_sat_pk_u8_i16" => {
+                let h = format!("((uint)clamp(((int)({a} << 16)) >> 16, 0, 255) | ((uint)clamp((int){a} >> 16, 0, 255) << 8))");
+                if m.opsel >> 3 & 1 == 1 {
+                    format!("({cur} & 0xFFFFu) | ({h} << 16)")
+                } else if d.variant == Variant::Sdwa {
+                    h
+                } else {
+                    format!("({cur} & 0xFFFF0000u) | {h}")
+                }
+            }
             "v_div_fmas_f32" => fr(format!("mad({}, {}, {})", fs(0), fs(1), fs(2))),
             "v_div_fixup_f32" => fr(format!("div_fixup({}, {}, {})", fs(0), fs(1), fs(2))),
             "v_cvt_pk_u8_f32" => format!(
