@@ -1913,29 +1913,10 @@ impl Lw {
         self.selc(wz, 0, r)
     }
     pub fn bfe_u(&mut self, v: Value, o: Value, w: Value) -> Value {
-        let o = self.andc(o, 31);
-        let w = self.andc(w, 31);
-        let x = self.bin(BinOp::LShr, v, o);
-        let k = self.c(32);
-        let s = self.sub(k, w);
-        let s = self.andc(s, 31);
-        let all = self.c(u32::MAX);
-        let m = self.bin(BinOp::LShr, all, s);
-        let r = self.and(x, m);
-        let wz = self.cmpc(Pred::Eq, w, 0);
-        self.selc(wz, 0, r)
+        self.s.tertiary(Tertiary::Ubfe, w, o, v)
     }
     pub fn bfe_i(&mut self, v: Value, o: Value, w: Value) -> Value {
-        let o = self.andc(o, 31);
-        let w = self.andc(w, 31);
-        let k = self.c(32);
-        let s = self.sub(k, w);
-        let s = self.andc(s, 31);
-        let x = self.bin(BinOp::AShr, v, o);
-        let y = self.bin(BinOp::Shl, x, s);
-        let y = self.bin(BinOp::AShr, y, s);
-        let wz = self.cmpc(Pred::Eq, w, 0);
-        self.selc(wz, 0, y)
+        self.s.tertiary(Tertiary::Ibfe, w, o, v)
     }
     pub fn wqm(&mut self, m: Value) -> Value {
         let a = self.lshrc(m, 1);

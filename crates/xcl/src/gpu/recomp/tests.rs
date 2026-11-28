@@ -9244,6 +9244,66 @@ fn gpu_signed_bfe_arithmetic_shift() {
 }
 
 #[test]
+fn gpu_v_bfe_edge_cases() {
+    const CASES: [(u32, u32, u32); 24] = [
+        (0x1234_5678, 0, 0),
+        (0xFFFF_FFFF, 4, 0),
+        (0xFFFF_FFFF, 0, 32),
+        (0xA5A5_5A5A, 7, 32),
+        (0x8000_0001, 0, 0x104),
+        (0xA5A5_5A5A, 32, 8),
+        (0xA5A5_5A5A, 0x104, 8),
+        (0xA5A5_5A5A, 0x104, 0x104),
+        (0x8000_0000, 0, 1),
+        (0x8000_0001, 0, 1),
+        (0x8000_0000, 31, 1),
+        (0x7FFF_FFFF, 31, 1),
+        (0x8000_0000, 0, 31),
+        (0x7FFF_FFFF, 0, 31),
+        (0x4000_0000, 0, 31),
+        (0x0000_8000, 0, 16),
+        (0x1234_5678, 16, 16),
+        (0x8000_0000, 16, 16),
+        (0x8000_0000, 16, 20),
+        (0x7FFF_0000, 16, 20),
+        (0xA5A5_5A5A, 28, 12),
+        (0x5A5A_A5A5, 28, 12),
+        (0x0000_0000, 15, 17),
+        (0xFFFF_FFFF, 31, 31),
+    ];
+    let bfe_ref = |v: u32, o: u32, w: u32, signed: bool| -> u32 {
+        let (o, w) = (o & 31, w & 31);
+        if w == 0 {
+            0
+        } else if o + w < 32 {
+            let s = v << (32 - o - w);
+            if signed { ((s as i32) >> (32 - w)) as u32 } else { s >> (32 - w) }
+        } else if signed {
+            ((v as i32) >> o) as u32
+        } else {
+            v >> o
+        }
+    };
+    let p = prog(&[
+        ("V_BFE_U32", "ENC_VOP3", &[("VDST", 3), ("SRC0", V), ("SRC1", V + 1), ("SRC2", V + 2)], None),
+        ("V_BFE_I32", "ENC_VOP3", &[("VDST", 4), ("SRC0", V), ("SRC1", V + 1), ("SRC2", V + 2)], None),
+    ]);
+    for wave64 in gpu_waves() {
+        let mut st = KernelState::default();
+        for (l, r) in st.vgpr.iter_mut().enumerate() {
+            let (v, o, w) = CASES[l % CASES.len()];
+            (r[0], r[1], r[2]) = (v, o, w);
+        }
+        let (r, lanes) = run_wave(&p, &st, wave64);
+        for (l, reg) in r.vgpr.iter().take(lanes).enumerate() {
+            let (v, o, w) = CASES[l % CASES.len()];
+            assert_eq!(reg[3], bfe_ref(v, o, w, false), "wave{lanes} lane {l} v_bfe_u32({v:#x}, {o:#x}, {w:#x})");
+            assert_eq!(reg[4], bfe_ref(v, o, w, true), "wave{lanes} lane {l} v_bfe_i32({v:#x}, {o:#x}, {w:#x})");
+        }
+    }
+}
+
+#[test]
 fn gpu_cmp_class_f16_preserves_snan() {
     for wave64 in gpu_waves() {
         let p = prog(&[

@@ -887,3 +887,22 @@ fn raw_loads_in_root_windows_respect_exec_and_bounds() {
         }
     }
 }
+
+#[test]
+fn bfe_lowers_to_dxil_intrinsics() {
+    use crate::gpu::recomp::{dxc, runner};
+    const V: u64 = 256;
+    let code = prog(&[
+        ("V_BFE_U32", "ENC_VOP3", &[("VDST", 3), ("SRC0", V), ("SRC1", V + 1), ("SRC2", V + 2)], None),
+        ("V_BFE_I32", "ENC_VOP3", &[("VDST", 4), ("SRC0", V), ("SRC1", V + 1), ("SRC2", V + 2)], None),
+    ]);
+    let ko = KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 };
+    let dxil = translate(&code, ko).unwrap_or_else(|e| panic!("direct translation: {e}"));
+    super::validate::validate(&dxil).unwrap_or_else(|e| panic!("validator: {e}"));
+    if dxc::location().is_err() {
+        return runner::skip_test("no DXC");
+    }
+    let dis = super::validate::disassemble(&dxil).unwrap();
+    assert!(dis.contains("dx.op.tertiary.i32(i32 52,"), "expected Ubfe intrinsic:\n{dis}");
+    assert!(dis.contains("dx.op.tertiary.i32(i32 51,"), "expected Ibfe intrinsic:\n{dis}");
+}
