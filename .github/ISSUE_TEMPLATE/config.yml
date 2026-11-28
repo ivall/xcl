@@ -1,5 +1,8 @@
-blank_issues_enabled: true
+blank_issues_enabled: false
 contact_links:
   - name: GPU test results
     url: https://github.com/ivall/xcl/issues/42
     about: Results of the test suite on your GPU go to issue #42, not a new issue.
+  - name: How can I help?
+    url: https://github.com/ivall/xcl/blob/main/CONTRIBUTING.md
+    about: What a pull request needs, how to split work, and how to run the tests.

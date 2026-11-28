@@ -1,0 +1,29 @@
+name: An improvement or a missing feature
+description: Something XCL could do better or does not do yet – not a game that runs wrong (use the game report for that).
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Search the open issues and pull requests first: if one covers it, comment there instead.
+
+        Do not attach or link game files, dumps or anything from a game package. XCL works only on unpacked games you own and does not help with DRM.
+  - type: textarea
+    id: what
+    attributes:
+      label: What and why
+      description: What should change, and what it makes possible or faster. Name the area (D3D12.X, Recompiler, XAudio2, VFS, …) if you know it.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence
+      description: Where it shows – a file and line, a measurement, a `report.json` field, a game that needs it. Say what you measured and on which hardware.
+    validations:
+      required: true
+  - type: textarea
+    id: plan
+    attributes:
+      label: Plan
+      description: If you want to work on it, how you would split it into pull requests (CONTRIBUTING.md, "Pull requests – small and single-purpose").
