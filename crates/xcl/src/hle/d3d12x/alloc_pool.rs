@@ -30,10 +30,16 @@ struct Backing {
     marks: HashMap<usize, (ID3D12Fence, u64)>,
 }
 
+/// Removal reports UINT64_MAX. It ends a wait, but does not prove a recording can be reused.
+pub(super) unsafe fn submit_completed(fence: &ID3D12Fence, target: u64) -> bool {
+    let value = super::real::fence_completed(fence);
+    value != u64::MAX && value >= target
+}
+
 impl Backing {
     /// The GPU has passed every submit of a recording on this allocator.
     unsafe fn idle(&self) -> bool {
-        self.marks.values().all(|(f, v)| super::real::fence_completed(f) >= *v)
+        self.marks.values().all(|(f, v)| submit_completed(f, *v))
     }
 
     unsafe fn free(&self) -> bool {
@@ -293,7 +299,7 @@ unsafe fn wait_for_previous_submits_within(lists: &[*mut c_void], limit: std::ti
 /// (`fence_completed`: XCL's own fence, without the title's hook, STATE held)
 pub fn in_flight(list: usize) -> bool {
     let g = STATE.lock().unwrap();
-    g.as_ref().and_then(|s| s.last_submit.get(&list)).is_some_and(|l| unsafe { super::real::fence_completed(&l.fence) } < l.value)
+    g.as_ref().and_then(|s| s.last_submit.get(&list)).is_some_and(|l| unsafe { !submit_completed(&l.fence, l.value) })
 }
 
 /// `lists` were just submitted to `queue`.
@@ -601,11 +607,13 @@ mod tests {
             f.releases.set(f.releases.get() + 1);
             0
         }
+        unsafe extern "system" fn add_ref(_: *mut c_void) -> u32 { 2 }
         extern "system" fn unexpected_call() { std::process::abort(); }
 
         const SLOT: usize = size_of::<usize>();
         let mut vtable = [unexpected_call as usize; size_of::<ID3D12Fence_Vtbl>() / SLOT];
         vtable[offset_of!(ID3D12Fence_Vtbl, GetCompletedValue) / SLOT] = completed as usize;
+        vtable[offset_of!(ID3D12Fence_Vtbl, base__.base__.base__.base__.AddRef) / SLOT] = add_ref as usize;
         vtable[offset_of!(ID3D12Fence_Vtbl, base__.base__.base__.base__.Release) / SLOT] = release as usize;
         let mut fence = Fence { vtable: vtable.as_ptr(), value: Cell::new(0), releases: Cell::new(0) };
         let mut ids = Box::new([0u8; 3]);
@@ -615,10 +623,10 @@ mod tests {
         created_on(second, alloc, D3D12_COMMAND_LIST_TYPE_DIRECT.0);
         {
             let mut g = STATE.lock().unwrap();
-            let b = g.as_mut().unwrap().backings.get_mut(&alloc).unwrap();
-            // The map owns one synthetic fence reference, dropped by forget below.
+            let s = g.as_mut().unwrap();
             let f = unsafe { ID3D12Fence::from_raw(std::ptr::from_mut(&mut fence).cast()) };
-            b.marks.insert(1, (f, 7));
+            s.last_submit.insert(second, LastSubmit { queue: 1, fence: f.clone(), value: 7, recording: 1 });
+            s.backings.get_mut(&alloc).unwrap().marks.insert(1, (f, 7));
         }
 
         super::super::list_x::on_release(first);
@@ -629,6 +637,14 @@ mod tests {
                 && s.backings[&alloc].users == HashSet::from([second])
                 && !unsafe { s.backings[&alloc].free() }
         };
+        fence.value.set(8);
+        let list_reusable_after_completion = !in_flight(second);
+        fence.value.set(u64::MAX);
+        let list_held_on_removal = in_flight(second);
+        let wait_on_removal = unsafe {
+            wait_for_previous_submits_within(&[second as *mut c_void], std::time::Duration::from_secs(2))
+        };
+        fence.value.set(0);
         super::super::list_x::on_release(second);
         super::super::list_x::on_release(first); // duplicate cleanup is harmless
         let pending_still_held = {
@@ -637,14 +653,20 @@ mod tests {
             !s.of_list.contains_key(&second) && s.backings[&alloc].users.is_empty()
                 && s.backings[&alloc].marks.len() == 1 && !unsafe { s.backings[&alloc].free() }
         };
+        fence.value.set(u64::MAX);
+        let reusable_on_removal = unsafe { STATE.lock().unwrap().as_ref().unwrap().backings[&alloc].free() };
         fence.value.set(7);
         let reusable = unsafe { STATE.lock().unwrap().as_ref().unwrap().backings[&alloc].free() };
         // Clean up the synthetic COM pointer before assertions, including on the old code.
         unsafe { forget(alloc) };
         assert!(first_removed, "another live recording must remain while the released list goes");
+        assert!(list_reusable_after_completion, "a value past the target completes the list");
+        assert!(list_held_on_removal, "device removal must not make the list reusable");
+        assert_eq!(wait_on_removal, (0, 0), "a removed fence cannot progress: do not wait for it");
+        assert!(!reusable_on_removal, "device removal must not retire the allocator");
         assert!(pending_still_held, "final list Release must retain the submitted-work fence");
         assert!(reusable, "a released list cannot keep a completed backing busy");
-        assert_eq!(fence.releases.get(), 1);
+        assert_eq!(fence.releases.get(), 2);
     }
 
     /// What an ended recording left in unified memory stays while the GPU has not passed the
