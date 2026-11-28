@@ -2015,18 +2015,24 @@ const ZERO_HASHES: [u64; CHUNKS] = [ZERO_HASH; CHUNKS];
 #[inline(always)]
 fn read_chunk_words(c: &[u8]) -> [u64; 8] {
     debug_assert_eq!(c.len(), CHUNK);
-    let p = c.as_ptr() as *const [u8; 8];
-    unsafe {
-        [
-            u64::from_le_bytes(p.add(0).read_unaligned()),
-            u64::from_le_bytes(p.add(1).read_unaligned()),
-            u64::from_le_bytes(p.add(2).read_unaligned()),
-            u64::from_le_bytes(p.add(3).read_unaligned()),
-            u64::from_le_bytes(p.add(4).read_unaligned()),
-            u64::from_le_bytes(p.add(5).read_unaligned()),
-            u64::from_le_bytes(p.add(6).read_unaligned()),
-            u64::from_le_bytes(p.add(7).read_unaligned()),
-        ]
+    let p = c.as_ptr();
+    if (p as usize) & 7 == 0 {
+        // Fast path for 8-byte aligned chunks (which covers all page-aligned chunks).
+        unsafe { *(p as *const [u64; 8]) }
+    } else {
+        let b = p as *const [u8; 8];
+        unsafe {
+            [
+                u64::from_le_bytes(b.add(0).read_unaligned()),
+                u64::from_le_bytes(b.add(1).read_unaligned()),
+                u64::from_le_bytes(b.add(2).read_unaligned()),
+                u64::from_le_bytes(b.add(3).read_unaligned()),
+                u64::from_le_bytes(b.add(4).read_unaligned()),
+                u64::from_le_bytes(b.add(5).read_unaligned()),
+                u64::from_le_bytes(b.add(6).read_unaligned()),
+                u64::from_le_bytes(b.add(7).read_unaligned()),
+            ]
+        }
     }
 }
 
@@ -2125,7 +2131,11 @@ fn scan_page(
 ) {
     if let Some(sent) = slot.as_deref() {
         for (k, c) in page.chunks_exact(CHUNK).enumerate() {
-            let h = chunk_hash(c);
+            let w = read_chunk_words(c);
+            if sent[k] == ZERO_HASH && (w[0] | w[1] | w[2] | w[3] | w[4] | w[5] | w[6] | w[7]) == 0 {
+                continue;
+            }
+            let h = hash_words(w);
             if h == sent[k] {
                 continue;
             }
@@ -2147,7 +2157,11 @@ fn scan_page(
         }
         push_run(out, pg + k * CHUNK, CHUNK);
         for (k2, c2) in chunks {
-            let h2 = chunk_hash(c2);
+            let w2 = read_chunk_words(c2);
+            if (w2[0] | w2[1] | w2[2] | w2[3] | w2[4] | w2[5] | w2[6] | w2[7]) == 0 {
+                continue;
+            }
+            let h2 = hash_words(w2);
             if h2 == ZERO_HASH {
                 continue;
             }
