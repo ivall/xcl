@@ -68,7 +68,7 @@ def main(argv=None):
         cmd = [str(args.xcl), "shaders", str(args.rpf), "--direct", "--sample", "0", "--json"]
         if args.threads:
             cmd += ["--threads", str(args.threads)]
-        proc = subprocess.run(cmd, capture_output=True, text=True)
+        proc = subprocess.run(cmd, capture_output=True, encoding="utf-8")
         try:
             run = sweep_json(proc.stdout)
         except ValueError as e:
