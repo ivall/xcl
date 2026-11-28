@@ -717,6 +717,7 @@ struct XApu {
     data: usize,
     ready: usize,
     frames_per_output: u32,
+    deinterleaved: bool,
 }
 
 unsafe fn xapu_connect_with<FA, FE>(
@@ -775,7 +776,7 @@ where
         return E_OUTOFMEMORY;
     }
     channels.resize_with(n_streams, || XApuStream { channels: 2, decoder: None, active: false });
-    let x = Box::new(XApu { results: Mutex::new(VecDeque::new()), channels: Mutex::new(channels), data, ready, frames_per_output: i.frames_per_output });
+    let x = Box::new(XApu { results: Mutex::new(VecDeque::new()), channels: Mutex::new(channels), data, ready, frames_per_output: i.frames_per_output, deinterleaved: i.options & 4 != 0 });
     std::ptr::write_unaligned(output, XApuConnectOutput { data: data as *mut c_void, ready: ready as *mut c_void });
     *handle = Box::into_raw(x) as *mut c_void;
     let (process, streams) = (i.process, i.streams);
@@ -881,6 +882,22 @@ pub unsafe extern "system" fn XApuDisconnect(handle: *mut c_void) -> HRESULT {
     S_OK
 }
 
+/// Write the valid frames in the selected channel layout, preserving support for unaligned buffers.
+unsafe fn write_xapu_output(output: *mut u8, samples: &[f32], frames: usize, channels: usize, deinterleaved: bool) {
+    if !deinterleaved || channels == 1 {
+        std::ptr::copy_nonoverlapping(samples.as_ptr() as *const u8, output, samples.len() * 4);
+        return;
+    }
+    for channel in 0..channels {
+        for frame in 0..frames {
+            let at = (channel * frames + frame) * 4;
+            std::ptr::write_unaligned(output.add(at) as *mut f32, samples[frame * channels + channel]);
+        }
+    }
+    let written = frames * channels;
+    std::ptr::write_bytes(output.add(written * 4), 0, (samples.len() - written) * 4);
+}
+
 /// XApuEnqueueCommand(handle, &command, &results waiting): done at once – a Process command
 /// decodes its Opus packet into the output buffer (silence of the length asked for where there is
 /// nothing to decode)
@@ -942,7 +959,7 @@ pub unsafe extern "system" fn XApuEnqueueCommand(handle: *mut c_void, command: *
                         frames = n as u32;
                     }
                 }
-                std::ptr::copy_nonoverlapping(out.as_ptr() as *const u8, p.output as *mut u8, out.len() * 4);
+                write_xapu_output(p.output as *mut u8, &out, frames as usize, channels as usize, x.deinterleaved);
             }
             // output ready, more input wanted
             r.state = 1 | 2;
@@ -1093,6 +1110,36 @@ pub fn exports() -> Vec<(&'static str, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn xapu_connect_keeps_the_output_layout_option() {
+        for options in [0, 4] {
+            let input = XApuConnectInput { process: 1, streams: 1, commands_per_stream: 1, data_bytes: 0, frames_per_output: 4, options };
+            let mut output = XApuConnectOutput { data: std::ptr::null_mut(), ready: std::ptr::null_mut() };
+            let mut handle = std::ptr::null_mut();
+            unsafe {
+                assert_eq!(XApuConnect(&input, &mut output, &mut handle), S_OK);
+                assert_eq!((*(handle as *const XApu)).deinterleaved, options == 4);
+                assert_eq!(XApuDisconnect(handle), S_OK);
+            }
+        }
+    }
+
+    #[test]
+    fn xapu_output_layout_preserves_frames_and_unaligned_buffers() {
+        let samples = [1.0f32, 10.0, 2.0, 20.0, 3.0, 30.0];
+        let read = |bytes: &[u8]| bytes[1..].chunks_exact(4).map(|b| f32::from_ne_bytes(b.try_into().unwrap())).collect::<Vec<_>>();
+        let mut output = [0xffu8; 25];
+        unsafe { write_xapu_output(output.as_mut_ptr().add(1), &samples, 3, 2, true) };
+        assert_eq!(output[0], 0xff);
+        assert_eq!(read(&output), [1.0, 2.0, 3.0, 10.0, 20.0, 30.0]);
+        unsafe { write_xapu_output(output.as_mut_ptr().add(1), &samples, 2, 2, true) };
+        assert_eq!(read(&output), [1.0, 2.0, 10.0, 20.0, 0.0, 0.0]);
+        unsafe { write_xapu_output(output.as_mut_ptr().add(1), &samples, 3, 2, false) };
+        assert_eq!(read(&output), samples);
+        unsafe { write_xapu_output(output.as_mut_ptr().add(1), &samples, 6, 1, true) };
+        assert_eq!(read(&output), samples);
+    }
 
     #[test]
     fn the_dsp_connects_and_takes_commands() {
