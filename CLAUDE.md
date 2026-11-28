@@ -14,3 +14,4 @@ Specific to Claude Code:
 - Fill in the **AI use** section of the PR description with Claude Code and your exact model name.
 - For a runtime change, run `scripts/smoke.ps1` on main and on the PR's head commit and paste both
   `xcl-smoke` blocks; do not write or edit them by hand.
+- Optional local tooling: the [atlas](https://github.com/bloodfeast/atlas) MCP server indexes repository docs/code and persists handoff notes across session compacts without modifying repository files (#1085).
