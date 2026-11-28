@@ -450,6 +450,14 @@ impl Lw {
                 let x = self.un(op::ROUND_NI, x);
                 self.cvt_i32(x)
             }
+            // bits 3:0 as a signed 4-bit number, in sixteenths (-0.5 .. 0.4375); bits 31:4 ignored
+            "v_cvt_off_f32_i4" => {
+                let x = self.shlc(a, 28);
+                let x = self.ashrc(x, 28);
+                let x = self.sitof(x);
+                let s = self.fc(0.0625);
+                fr!(self.fmul(x, s))
+            }
             "v_cvt_f32_ubyte0" | "v_cvt_f32_ubyte1" | "v_cvt_f32_ubyte2" | "v_cvt_f32_ubyte3" => {
                 let k = (name.as_bytes()[name.len() - 1] - b'0') as u32;
                 let x = self.lshrc(a, 8 * k);
@@ -609,6 +617,25 @@ impl Lw {
             "v_mul_legacy_f32" => {
                 let (x, y) = (fs!(0), fs!(1));
                 fr!(self.mul_legacy(x, y))
+            }
+            // as RDNA2 runs it (`mullit` in the HLSL prelude): -MAX_FLOAT when c is not above +0
+            // (or NaN) or b is -MAX_FLOAT, -inf or NaN; else a * b with 0 * anything = +0
+            "v_mullit_f32" => {
+                let (x, y, w) = (fs!(0), fs!(1), fs!(2));
+                let (yb, wb) = (self.bits(y), self.bits(w));
+                let w1 = self.addc(wb, u32::MAX);
+                let c_not_pos = self.cmpc(Pred::UGe, w1, 0x7F80_0000);
+                let y_max = self.cmpc(Pred::Eq, yb, 0xFF7F_FFFF);
+                let y_inf = self.cmpc(Pred::Eq, yb, 0xFF80_0000);
+                let ya = self.andc(yb, 0x7FFF_FFFF);
+                let y_nan = self.cmpc(Pred::UGt, ya, 0x7F80_0000);
+                let m = self.lor(c_not_pos, y_max);
+                let m = self.lor(m, y_inf);
+                let m = self.lor(m, y_nan);
+                let p = self.mul_legacy(x, y);
+                let k = self.c(0xFF7F_FFFF);
+                let k = self.f(k);
+                fr!(self.sel(m, k, p))
             }
             "v_min_f32" => {
                 let (x, y) = (fs!(0), fs!(1));

@@ -1238,6 +1238,155 @@ fn gpu_valu_float_and_int() {
     }
 }
 
+/// `v_mullit_f32` and `v_cvt_off_f32_i4` against values read from RDNA2 hardware (gfx1036,
+/// native wave64): (S0, S1, S2, result) and (S0, result). Rows with a NaN S0 (its payload bits differ
+/// between hosts) or a denormal operand or result (flushed in the kernel's float mode) are left out.
+const MULLIT_RDNA2: [[u32; 4]; 41] = [
+    [0x40200000, 0x00000000, 0x3f800000, 0x00000000],
+    [0x40200000, 0x0da24260, 0x3f800000, 0x0e4ad2f8],
+    [0x40200000, 0x3f800000, 0x3f800000, 0x40200000],
+    [0x40200000, 0x40200000, 0x3f800000, 0x40c80000],
+    [0x40200000, 0x40400000, 0x3f800000, 0x40f00000],
+    [0x40200000, 0x7149f2ca, 0x3f800000, 0x71fc6f7c],
+    [0x40200000, 0x7f7fffff, 0x3f800000, 0x7f800000],
+    [0x40200000, 0x7f800000, 0x3f800000, 0x7f800000],
+    [0x40200000, 0x7fa00000, 0x3f800000, 0xff7fffff],
+    [0x40200000, 0x7fc00000, 0x3f800000, 0xff7fffff],
+    [0x40200000, 0x80000000, 0x3f800000, 0x00000000],
+    [0x40200000, 0xbf000000, 0x3f800000, 0xbfa00000],
+    [0x40200000, 0xbf800000, 0x3f800000, 0xc0200000],
+    [0x40200000, 0xc0400000, 0x3f800000, 0xc0f00000],
+    [0x40200000, 0xff7fffff, 0x3f800000, 0xff7fffff],
+    [0x40200000, 0xff800000, 0x3f800000, 0xff7fffff],
+    [0x40200000, 0x40400000, 0x00000000, 0xff7fffff],
+    [0x40200000, 0x40400000, 0x0da24260, 0x40f00000],
+    [0x40200000, 0x40400000, 0x7f800000, 0x40f00000],
+    [0x40200000, 0x40400000, 0x7fc00000, 0xff7fffff],
+    [0x40200000, 0x40400000, 0x80000000, 0xff7fffff],
+    [0x40200000, 0x40400000, 0xbf800000, 0xff7fffff],
+    [0x40200000, 0x40400000, 0xff800000, 0xff7fffff],
+    [0x00000000, 0x40400000, 0x3f800000, 0x00000000],
+    [0x0da24260, 0x40400000, 0x3f800000, 0x0e736390],
+    [0x3f800000, 0x40400000, 0x3f800000, 0x40400000],
+    [0x40400000, 0x40400000, 0x3f800000, 0x41100000],
+    [0x7149f2ca, 0x40400000, 0x3f800000, 0x72177618],
+    [0x7f7fffff, 0x40400000, 0x3f800000, 0x7f800000],
+    [0x7f800000, 0x40400000, 0x3f800000, 0x7f800000],
+    [0x80000000, 0x40400000, 0x3f800000, 0x00000000],
+    [0xbf000000, 0x40400000, 0x3f800000, 0xbfc00000],
+    [0xbf800000, 0x40400000, 0x3f800000, 0xc0400000],
+    [0xc0400000, 0x40400000, 0x3f800000, 0xc1100000],
+    [0xff7fffff, 0x40400000, 0x3f800000, 0xff800000],
+    [0xff800000, 0x40400000, 0x3f800000, 0xff800000],
+    [0x00000000, 0x7f800000, 0x3f800000, 0x00000000],
+    [0x00000000, 0xbf800000, 0x3f800000, 0x00000000],
+    [0x00000000, 0x80000000, 0x3f800000, 0x00000000],
+    [0x00000000, 0xff800000, 0x3f800000, 0xff7fffff],
+    [0x7f800000, 0xbf800000, 0x3f800000, 0xff800000],
+];
+const CVT_OFF_RDNA2: [[u32; 2]; 64] = [
+    [0x00000000, 0x00000000],
+    [0x00000001, 0x3d800000],
+    [0x00000002, 0x3e000000],
+    [0x00000003, 0x3e400000],
+    [0x00000004, 0x3e800000],
+    [0x00000005, 0x3ea00000],
+    [0x00000006, 0x3ec00000],
+    [0x00000007, 0x3ee00000],
+    [0x00000008, 0xbf000000],
+    [0x00000009, 0xbee00000],
+    [0x0000000a, 0xbec00000],
+    [0x0000000b, 0xbea00000],
+    [0x0000000c, 0xbe800000],
+    [0x0000000d, 0xbe400000],
+    [0x0000000e, 0xbe000000],
+    [0x0000000f, 0xbd800000],
+    [0x00000010, 0x00000000],
+    [0x00000011, 0x3d800000],
+    [0x00000012, 0x3e000000],
+    [0x00000013, 0x3e400000],
+    [0x00000014, 0x3e800000],
+    [0x00000015, 0x3ea00000],
+    [0x00000016, 0x3ec00000],
+    [0x00000017, 0x3ee00000],
+    [0x00000018, 0xbf000000],
+    [0x00000019, 0xbee00000],
+    [0x0000001a, 0xbec00000],
+    [0x0000001b, 0xbea00000],
+    [0x0000001c, 0xbe800000],
+    [0x0000001d, 0xbe400000],
+    [0x0000001e, 0xbe000000],
+    [0x0000001f, 0xbd800000],
+    [0x0abcd020, 0x00000000],
+    [0x0abcd021, 0x3d800000],
+    [0x0abcd022, 0x3e000000],
+    [0x0abcd023, 0x3e400000],
+    [0x0abcd024, 0x3e800000],
+    [0x0abcd025, 0x3ea00000],
+    [0x0abcd026, 0x3ec00000],
+    [0x0abcd027, 0x3ee00000],
+    [0x0abcd028, 0xbf000000],
+    [0x0abcd029, 0xbee00000],
+    [0x0abcd02a, 0xbec00000],
+    [0x0abcd02b, 0xbea00000],
+    [0x0abcd02c, 0xbe800000],
+    [0x0abcd02d, 0xbe400000],
+    [0x0abcd02e, 0xbe000000],
+    [0x0abcd02f, 0xbd800000],
+    [0x0abcd030, 0x00000000],
+    [0x0abcd031, 0x3d800000],
+    [0x0abcd032, 0x3e000000],
+    [0x0abcd033, 0x3e400000],
+    [0x0abcd034, 0x3e800000],
+    [0x0abcd035, 0x3ea00000],
+    [0x0abcd036, 0x3ec00000],
+    [0x0abcd037, 0x3ee00000],
+    [0x0abcd038, 0xbf000000],
+    [0x0abcd039, 0xbee00000],
+    [0x0abcd03a, 0xbec00000],
+    [0x0abcd03b, 0xbea00000],
+    [0x0abcd03c, 0xbe800000],
+    [0x0abcd03d, 0xbe400000],
+    [0x0abcd03e, 0xbe000000],
+    [0x0abcd03f, 0xbd800000],
+];
+
+#[test]
+fn gpu_mullit_and_cvt_off_match_rdna2() {
+    if !gpu_ready() {
+        return;
+    }
+    let code = prog(&[
+        ("V_MULLIT_F32", "ENC_VOP3", &[("VDST", 10), ("SRC0", V + 1), ("SRC1", V + 2), ("SRC2", V + 3)], None),
+        ("V_CVT_OFF_F32_I4", "ENC_VOP1", &[("VDST", 11), ("SRC0", V + 4)], None),
+    ]);
+    let wave64 = true;
+    let mut st = KernelState::default();
+    for (l, r) in st.vgpr.iter_mut().take(64).enumerate() {
+        let m = MULLIT_RDNA2[l % MULLIT_RDNA2.len()];
+        (r[1], r[2], r[3]) = (m[0], m[1], m[2]);
+        r[4] = CVT_OFF_RDNA2[l][0];
+    }
+    for direct in [false, true] {
+        let dxil = if direct {
+            let o = crate::gpu::dxil::kernel::KernelOptions { wave64, split: !gpu_waves().contains(&true), mem_windows: 1, sampler_base: 0 };
+            crate::gpu::dxil::kernel::translate(&code, o).unwrap_or_else(|e| panic!("direct DXIL: {e}"))
+        } else {
+            let t = translate(&code, &Options { wave64, split_wave64: !gpu_waves().contains(&true), ..Default::default() }).unwrap();
+            assert!(t.complete(), "{:?}
+{}", t.unsupported_why, t.hlsl);
+            super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}
+{}", t.hlsl))
+        };
+        let r = runner::run(&dxil, &st, &[]).unwrap();
+        for l in 0..64 {
+            let m = MULLIT_RDNA2[l % MULLIT_RDNA2.len()];
+            assert_eq!(r.vgpr[l][10], m[3], "direct={direct} lane {l}: v_mullit_f32({:#010x}, {:#010x}, {:#010x})", m[0], m[1], m[2]);
+            assert_eq!(r.vgpr[l][11], CVT_OFF_RDNA2[l][1], "direct={direct} lane {l}: v_cvt_off_f32_i4({:#010x})", CVT_OFF_RDNA2[l][0]);
+        }
+    }
+}
+
 /// Output modifiers each instruction kind applies: omod on f64 (clamp stays in double
 /// precision) and on the f64 → f32 / f32 → f16 conversions, and the integer clamp (saturation) of the
 /// unsigned adds, the packed 16-bit adds and the integer dot products.

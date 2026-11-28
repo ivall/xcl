@@ -3905,6 +3905,8 @@ impl Em {
             "v_cvt_i32_f32" => format!("(uint)cvt_i32({})", fs(0)),
             "v_cvt_rpi_i32_f32" => format!("(uint)cvt_i32(floor({} + 0.5f))", fs(0)),
             "v_cvt_flr_i32_f32" => format!("(uint)cvt_i32(floor({}))", fs(0)),
+            // bits 3:0 as a signed 4-bit number, in sixteenths (-0.5 .. 0.4375); bits 31:4 ignored
+            "v_cvt_off_f32_i4" => fr(format!("(float)((int)({a} << 28) >> 28) * 0.0625f")),
             "v_cvt_f32_ubyte0" => fr(format!("(float)({a} & 0xFFu)")),
             "v_cvt_f32_ubyte1" => fr(format!("(float)(({a} >> 8) & 0xFFu)")),
             "v_cvt_f32_ubyte2" => fr(format!("(float)(({a} >> 16) & 0xFFu)")),
@@ -3987,6 +3989,7 @@ impl Em {
             "v_subrev_f32" => fr(format!("{} - {}", fs(1), fs(0))),
             "v_mul_f32" => fr(format!("{} * {}", fs(0), fs(1))),
             "v_mul_legacy_f32" => fr(format!("mul_legacy({}, {})", fs(0), fs(1))),
+            "v_mullit_f32" => fr(format!("mullit({}, {}, {})", fs(0), fs(1), fs(2))),
             "v_min_f32" => fr(format!("min({}, {})", fs(0), fs(1))),
             "v_max_f32" => fr(format!("max({}, {})", fs(0), fs(1))),
             "v_fmac_f32" => fr(format!("mad({}, {}, asfloat({cur}))", fs(0), fs(1))),
@@ -6659,6 +6662,8 @@ uint lanemask_lt_lo() { return lane_id >= 32u ? 0xFFFFFFFFu : (lane_id == 0u ? 0
 uint lanemask_lt_hi() { return lane_id <= 32u ? 0u : (0xFFFFFFFFu >> (64u - lane_id)); }
 uint wqm(uint m) { uint q = m | (m >> 1); q = q | (q >> 2); q &= 0x11111111u; return q * 15u; }
 float mul_legacy(float a, float b) { return select(or(a == 0.0f, b == 0.0f), 0.0f, a * b); }
+// v_mullit_f32 as RDNA2 runs it: -MAX_FLOAT when c is not above +0 (or NaN) or b is -MAX_FLOAT, -inf or NaN; else a * b with 0 * anything = +0
+float mullit(float a, float b, float c) { uint ub = asuint(b); bool m = (asuint(c) - 1u) >= 0x7F800000u || ub == 0xFF7FFFFFu || ub == 0xFF800000u || (ub & 0x7FFFFFFFu) > 0x7F800000u; return select(m, asfloat(0xFF7FFFFFu), mul_legacy(a, b)); }
 uint absd8(uint a, uint b, uint k) { uint x = (a >> k) & 0xFFu; uint y = (b >> k) & 0xFFu; return max(x, y) - min(x, y); }
 uint absd16(uint a, uint b, uint k) { uint x = (a >> k) & 0xFFFFu; uint y = (b >> k) & 0xFFFFu; return max(x, y) - min(x, y); }
 uint sad_u8(uint a, uint b) { return absd8(a, b, 0u) + absd8(a, b, 8u) + absd8(a, b, 16u) + absd8(a, b, 24u); }
