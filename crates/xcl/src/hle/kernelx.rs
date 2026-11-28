@@ -812,16 +812,29 @@ pub unsafe extern "system" fn XMemVirtualQuery(process: HANDLE, address: *const 
 /// these (Fortnite: flags 0x10000001). Only those two are written: the structure's size
 /// differs between GDK versions (Fortnite's exe passes 0x78 bytes, its EOSSDK – older – has
 /// at most 0x50 bytes before its stack cookie, which zeroing 0x78 bytes destroyed: the DLL's
-/// static initializer failed its cookie check, 0xC0000409).
+/// static initializer failed its cookie check, 0xC0000409). So nothing is written at or past
+/// +0x50; +0x10..+0x4F are written (every caller has them): tools pool 0, stack and page
+/// count 0, the fast-memory (GPU-optimal bandwidth) pair = the title's limit and use (one pool
+/// here), kernel pool 0.
 pub unsafe extern "system" fn XMemGetWorkingSetStatistics(_flags: u32, stats: *mut u8) -> BOOL {
     if stats.is_null() {
         fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
         return 0;
     }
     let limit = crate::state::config().title_memory_budget_mb() * 1024 * 1024;
-    (stats as *mut u64).write_unaligned(limit);
-    (stats.add(8) as *mut u64).write_unaligned(process_private_bytes().min(limit));
+    write_working_set_tail(stats, limit, process_private_bytes().min(limit));
     1
+}
+
+/// +0 / +8 title limit / used and +0x10..+0x4F of XMEM_WORKING_SET_STATISTICS; never +0x50 on.
+unsafe fn write_working_set_tail(stats: *mut u8, limit: u64, used: u64) {
+    (stats as *mut u64).write_unaligned(limit);
+    (stats.add(8) as *mut u64).write_unaligned(used);
+    (stats.add(0x10) as *mut [u64; 2]).write_unaligned([0, 0]); // tools limit / used
+    (stats.add(0x20) as *mut u64).write_unaligned(0); // stack used, allocated page count
+    (stats.add(0x28) as *mut [u64; 2]).write_unaligned([limit, used]); // fast memory
+    (stats.add(0x38) as *mut [u64; 2]).write_unaligned([0, 0]); // fast memory of the tools
+    (stats.add(0x48) as *mut u64).write_unaligned(0); // kernel pool used / limit
 }
 
 /// `BOOL XMemTransferMemory(direction, size)`: moving budget between the title and the tools
@@ -2125,6 +2138,21 @@ pub unsafe extern "system" fn DisableThreadLibraryCalls(h: usize) -> BOOL {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn working_set_statistics_fill_the_fields_up_to_0x50_only() {
+        // a 0x50-byte buffer (the older caller's) and a guard dword after it, all 0xCC
+        let mut buf = [0xCCu8; 0x58];
+        unsafe { super::write_working_set_tail(buf.as_mut_ptr(), 0x1000, 0x400) };
+        let q = |o: usize| u64::from_le_bytes(buf[o..o + 8].try_into().unwrap());
+        assert_eq!((q(0), q(8), q(0x10), q(0x18), q(0x20)), (0x1000, 0x400, 0, 0, 0));
+        assert_eq!((q(0x28), q(0x30), q(0x38), q(0x40), q(0x48)), (0x1000, 0x400, 0, 0, 0));
+        assert!(buf[0x50..].iter().all(|&b| b == 0xCC), "nothing at or past +0x50");
+        // a larger structure's tail is not ours either
+        let mut big = [0xCCu8; 0x78];
+        unsafe { super::write_working_set_tail(big.as_mut_ptr(), 8, 4) };
+        assert!(big[0x50..].iter().all(|&b| b == 0xCC));
+    }
+
     use super::*;
 
     fn real_sleep(ms: u32) {
