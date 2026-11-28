@@ -1335,6 +1335,64 @@ fn gpu_clamp_and_omod_per_instruction() {
     }
 }
 
+/// Integer → float conversions: i32 / u32 → f32 round to nearest even (2^24 + 1, a tie at
+/// 2^24 + 3, the ends of both ranges), the four v_cvt_f32_ubyteN, and the exact conversions to f64
+/// (i32, u32, and f32 with infinities and NaN), against Rust's `as` (also nearest even).
+#[test]
+fn gpu_int_to_float_conversions() {
+    if !gpu_ready() {
+        return;
+    }
+    let xs: [u32; 16] = [
+        0, 1, 0xFFFF_FFFF, 0x7FFF_FFFF, 0x8000_0000, 0x0100_0001, 0x0100_0003, 0xFFFF_FF7F, 0x1234_5678, 0x3F80_0000,
+        0x7F80_0000, 0xFF80_0000, 0x7FC0_0000, 0xDEAD_BEEF, 0xFF7F_FFFF, 0x8765_4321,
+    ];
+    let one = |n: &str, d: u64| ins(n, "ENC_VOP1", &[("VDST", d), ("SRC0", V + 1)], None);
+    let code = program_of(&[
+        one("V_CVT_F32_I32", 10),
+        one("V_CVT_F32_U32", 11),
+        one("V_CVT_F32_UBYTE0", 12),
+        one("V_CVT_F32_UBYTE1", 13),
+        one("V_CVT_F32_UBYTE2", 14),
+        one("V_CVT_F32_UBYTE3", 15),
+        one("V_CVT_F64_I32", 16),
+        one("V_CVT_F64_U32", 18),
+        one("V_CVT_F64_F32", 20),
+    ]);
+    let mut st = KernelState::default();
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        r[1] = xs[l % xs.len()];
+    }
+    let r = runner::run_code(&code, &st, &[]).unwrap();
+    let mut bad = Vec::new();
+    for (l, v) in r.vgpr.iter().enumerate().take(xs.len()) {
+        let x = xs[l];
+        let d = |i: usize| v[i] as u64 | (v[i + 1] as u64) << 32;
+        let f = f32::from_bits(x) as f64;
+        let checks = [
+            ("v_cvt_f32_i32", v[10] as u64, (x as i32 as f32).to_bits() as u64),
+            ("v_cvt_f32_u32", v[11] as u64, (x as f32).to_bits() as u64),
+            ("v_cvt_f32_ubyte0", v[12] as u64, ((x & 0xFF) as f32).to_bits() as u64),
+            ("v_cvt_f32_ubyte1", v[13] as u64, ((x >> 8 & 0xFF) as f32).to_bits() as u64),
+            ("v_cvt_f32_ubyte2", v[14] as u64, ((x >> 16 & 0xFF) as f32).to_bits() as u64),
+            ("v_cvt_f32_ubyte3", v[15] as u64, ((x >> 24) as f32).to_bits() as u64),
+            ("v_cvt_f64_i32", d(16), (x as i32 as f64).to_bits()),
+            ("v_cvt_f64_u32", d(18), (x as f64).to_bits()),
+            ("v_cvt_f64_f32", d(20), f.to_bits()),
+        ];
+        for (n, got, want) in checks {
+            if n == "v_cvt_f64_f32" && f32::from_bits(x).is_subnormal() {
+                continue; // flushed or kept by the f32 denormal mode (this driver flushes it)
+            }
+            let nan = n == "v_cvt_f64_f32" && f.is_nan();
+            if if nan { !f64::from_bits(got).is_nan() } else { got != want } {
+                bad.push(format!("{n}({x:#010x}) = {got:#x}, want {want:#x}"));
+            }
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
 #[test]
 fn gpu_bench_really_runs() {
     if !gpu_ready() {
