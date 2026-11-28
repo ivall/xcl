@@ -453,7 +453,7 @@ unsafe extern "system" fn hk_disk_free_w(n: *const u16, spc: *mut u32, bps: *mut
 unsafe extern "system" fn hk_disk_free_a(n: *const u8, spc: *mut u32, bps: *mut u32, nfree: *mut u32, ntotal: *mut u32) -> i32 {
     let orig = orig!(O_DISK_FREE_A as FnDiskFreeA);
     let Some(_g) = Guard::enter() else { return orig(n, spc, bps, nfree, ntotal) };
-    let Some(path) = from_ansi_ptr(n) else { return orig(n, spc, bps, nfree, ntotal) };
+    let Some(path) = from_file_ansi_ptr(n) else { return orig(n, spc, bps, nfree, ntotal) };
     let (r, real) = match read_target(&path) {
         None => (orig(n, spc, bps, nfree, ntotal), None),
         Some(Ok(p)) => (orig!(O_DISK_FREE_W as FnDiskFreeW)(wide(&p).as_ptr(), spc, bps, nfree, ntotal), Some(p)),
@@ -1329,6 +1329,91 @@ mod tests {
             assert_eq!(err, 9123);
             assert_eq!((available, total, free), (123, 1024, 2048));
         }
+    }
+
+    /// What one byte is in one code page, exactly as the hooks decode it (no best-fit
+    /// validation: the lossy fallback is what the hooked decode falls back to as well).
+    fn decode_byte_with(code_page: u32, byte: u8) -> Option<String> {
+        use windows_sys::Win32::Globalization::MultiByteToWideChar;
+        unsafe {
+            let n = MultiByteToWideChar(code_page, 0, &byte, 1, std::ptr::null_mut(), 0);
+            if n != 1 {
+                return None;
+            }
+            let mut buf = [0u16; 1];
+            (MultiByteToWideChar(code_page, 0, &byte, 1, buf.as_mut_ptr(), 1) == 1).then(|| String::from_utf16_lossy(&buf))
+        }
+    }
+
+    /// A byte a file API in OEM mode must not decode as ANSI: an alphabetic character in
+    /// CP_OEMCP that CP_ACP decodes as something else (case variants aside – the PC's
+    /// case-insensitive file system would still find the directory) or not at all. #2932's
+    /// byte is 0x82 (é in cp437, U+201A in cp1252); the scan keeps the test meaningful on
+    /// machines with other code pages. None when the ANSI and OEM code pages decode alike
+    /// and no byte can show the difference.
+    fn oem_byte_ansi_decodes_differently() -> Option<(u8, char)> {
+        use windows_sys::Win32::Globalization::{CP_ACP, CP_OEMCP};
+        (0x80u8..=0xff).find_map(|byte| {
+            let oem = decode_byte_with(CP_OEMCP, byte)?;
+            let mut chars = oem.chars();
+            let letter = chars.next()?;
+            if chars.next().is_some() || !letter.is_alphabetic() {
+                return None;
+            }
+            match decode_byte_with(CP_ACP, byte) {
+                Some(ansi) if ansi == oem || ansi.to_lowercase() == oem.to_lowercase() => None,
+                _ => Some((byte, letter)),
+            }
+        })
+    }
+
+    /// GetDiskFreeSpaceA with the file APIs in OEM mode decodes its path as CP_OEMCP, like
+    /// GetDiskFreeSpaceExA does: a title that called SetFileApisToOEM passes console paths in
+    /// OEM bytes, and the ANSI decode of them misreads letters like é (cp437 0x82 becomes
+    /// U+201A in cp1252), so the mounted path fails with ERROR_FILE_NOT_FOUND (#2932).
+    #[test]
+    fn disk_free_a_in_oem_file_api_mode_decodes_oem_paths() {
+        use windows_sys::Win32::Storage::FileSystem::{
+            AreFileApisANSI, GetDiskFreeSpaceA, GetDiskFreeSpaceW, SetFileApisToANSI, SetFileApisToOEM,
+        };
+
+        let Some((byte, letter)) = oem_byte_ansi_decodes_differently() else {
+            println!("SKIPPED disk_free_a_in_oem_file_api_mode_decodes_oem_paths: the ANSI and OEM code pages decode alike here");
+            return;
+        };
+        let f = HookFixture::new("disk_free_oem");
+        std::fs::create_dir(f.game().join("data").join(format!("caf{letter}"))).unwrap();
+        // The process-wide VFS can be set up once per test binary: this is the one test that
+        // calls a hk_* entry point, so it is the one that sets it up.
+        let mounts = vec![
+            ("G:".to_string(), f.game().to_string_lossy().to_string()),
+            ("T:".to_string(), f.temp().to_string_lossy().to_string()),
+        ];
+        vfs::init(vfs::Vfs::new(&f.game(), &f.dir.join("xcldata"), mounts));
+        // The unhooked OS entries stand in for the hooked-out originals.
+        O_DISK_FREE_A.store(GetDiskFreeSpaceA as usize, Ordering::SeqCst);
+        O_DISK_FREE_W.store(GetDiskFreeSpaceW as usize, Ordering::SeqCst);
+
+        // The reference answer, through the wide hook.
+        let console_path = format!(r"G:\data\caf{letter}");
+        let (mut spc_w, mut bps_w, mut free_w, mut total_w) = (0, 0, 0, 0);
+        let ok_w = unsafe { hk_disk_free_w(wide(&console_path).as_ptr(), &mut spc_w, &mut bps_w, &mut free_w, &mut total_w) };
+        assert_ne!(ok_w, 0, "the wide reference query failed");
+
+        // The same path as the title passes it in OEM bytes, in OEM file API mode.
+        let mut oem_path = r"G:\data\caf".as_bytes().to_vec();
+        oem_path.push(byte);
+        oem_path.push(0);
+        let was_ansi = unsafe { AreFileApisANSI() } != 0;
+        unsafe { SetFileApisToOEM() };
+        let (mut spc, mut bps, mut free, mut total) = (0, 0, 0, 0);
+        let ok = unsafe { hk_disk_free_a(oem_path.as_ptr(), &mut spc, &mut bps, &mut free, &mut total) };
+        let error = unsafe { GetLastError() };
+        if was_ansi {
+            unsafe { SetFileApisToANSI() };
+        }
+        assert_ne!(ok, 0, "the OEM path of 'caf{letter}' (byte {byte:#04x}) failed with error {error}");
+        assert_eq!((spc, bps, total), (spc_w, bps_w, total_w));
     }
 
     #[test]
