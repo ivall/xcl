@@ -1237,7 +1237,7 @@ pub fn install() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, GENERIC_WRITE};
     use windows_sys::Win32::Storage::FileSystem::{
         CopyFile2, CopyFileExW, CopyFileW, CreateFileW, MoveFileExW, COPYFILE2_EXTENDED_PARAMETERS,
@@ -1329,6 +1329,55 @@ mod tests {
             assert_eq!(err, 9123);
             assert_eq!((available, total, free), (123, 1024, 2048));
         }
+    }
+
+    #[test]
+    fn create_always_rejects_unoverlaid_game_directory() {
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
+
+        let cases = [(0, vfs::ERROR_ACCESS_DENIED), (FILE_FLAG_BACKUP_SEMANTICS, vfs::ERROR_FILE_EXISTS)];
+        let outcomes = cases.map(|(flags, expected)| {
+            let f = HookFixture::new("create_always_directory");
+            let original = f.game().join("data");
+            let original_w = wide(&original.to_string_lossy());
+            let overlay = f.dir.join("xcldata").join("overlay");
+            let open = |path, disposition| unsafe {
+                CreateFileW(path, GENERIC_WRITE, 7, std::ptr::null(), disposition, flags, std::ptr::null_mut())
+            };
+
+            if !crate::util::under_wine() {
+                let handle = open(original_w.as_ptr(), CREATE_ALWAYS);
+                let error = unsafe { GetLastError() };
+                if handle != INVALID_HANDLE_VALUE {
+                    unsafe { CloseHandle(handle) };
+                }
+                assert_eq!(handle, INVALID_HANDLE_VALUE, "native CreateFileW with flags {flags:#x}");
+                assert_eq!(error, expected, "native CreateFileW with flags {flags:#x}");
+            }
+
+            assert!(!overlay.exists());
+            let decision = f.vfs.open_decision(r"G:\data", GENERIC_WRITE, CREATE_ALWAYS, flags);
+            let handle = apply_open_decision(
+                decision,
+                CREATE_ALWAYS,
+                || panic!("game paths must go through the VFS"),
+                open,
+            );
+            let error = unsafe { GetLastError() };
+            let rejected = handle == INVALID_HANDLE_VALUE;
+            if !rejected {
+                unsafe { CloseHandle(handle) };
+            }
+
+            assert_eq!(std::fs::read(original.join("hello.txt")).unwrap(), b"original");
+            assert_eq!(std::fs::read(original.join("gone.txt")).unwrap(), b"bye");
+            assert_eq!(f.read_vfs(r"G:\data\hello.txt").as_deref(), Some(&b"original"[..]));
+
+            let resolves_to_original = f.vfs.read_path_rel("data").is_some_and(|p| Path::new(&p) == original);
+            (rejected.then_some(error), overlay.exists(), f.vfs.is_dir("data"), resolves_to_original)
+        });
+
+        assert_eq!(outcomes, cases.map(|(_, error)| (Some(error), false, true, true)));
     }
 
     #[test]

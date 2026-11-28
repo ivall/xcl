@@ -582,10 +582,26 @@ impl Vfs {
                     }
                 }
                 let keep = matches!(disposition, OPEN_EXISTING | OPEN_ALWAYS);
-                let replaces_original = disposition == CREATE_ALWAYS
-                    && !ov_entry
-                    && in_orig
-                    && Path::new(&self.original_path(&rel)).is_file();
+                let replaces_original = if disposition == CREATE_ALWAYS && !ov_entry && in_orig {
+                    let original = self.original_path(&rel);
+                    let original = Path::new(&original);
+                    let is_dir = if flags & FILE_FLAG_OPEN_REPARSE_POINT != 0 {
+                        original.symlink_metadata().is_ok_and(|m| m.is_dir())
+                    } else {
+                        original.is_dir()
+                    };
+                    if is_dir {
+                        let err = if flags & FILE_FLAG_BACKUP_SEMANTICS != 0 {
+                            ERROR_FILE_EXISTS
+                        } else {
+                            ERROR_ACCESS_DENIED
+                        };
+                        return Decision::Fail(err);
+                    }
+                    original.is_file()
+                } else {
+                    false
+                };
                 match self.prepare_write(&rel, keep) {
                     Ok(p) if disposition == TRUNCATE_EXISTING && !ov_entry => Decision::UseWithDisposition(p, CREATE_ALWAYS),
                     Ok(p) if replaces_original => Decision::CreateOverOriginal(p),
