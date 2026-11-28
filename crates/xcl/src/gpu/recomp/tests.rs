@@ -5309,14 +5309,24 @@ fn gpu_compute_mode_dispatch_abi() {
     assert!(t.complete(), "{:?}", t.unsupported_why);
     let hlsl_dxil = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}"));
     let split = opt.wave64 && (opt.split_wave64 || runner::split_wave64());
-    let direct_dxil = crate::gpu::dxil::kernel::translate_compute(
+    let direct = crate::gpu::dxil::kernel::translate_compute(
         &p,
         crate::gpu::dxil::kernel::KernelOptions { wave64: opt.wave64, split, mem_windows: opt.mem_windows, sampler_base: opt.static_sampler_base },
         &cs,
-    )
-    .unwrap_or_else(|e| panic!("direct DXIL: {e}"))
-    .dxil;
-    let dxil = if direct_enabled(&opt) { direct_dxil.clone() } else { hlsl_dxil.clone() };
+    );
+    // Split wave64 LDS is refused by the direct path on purpose and runs through HLSL
+    // (dbe6b30b "Recompiler: route split wave64 LDS through HLSL").
+    let direct_dxil = if split {
+        let e = direct.err().expect("direct DXIL translated split wave64 LDS");
+        assert!(e.contains("split wave64 LDS access needs the HLSL path"), "{e}");
+        None
+    } else {
+        Some(direct.unwrap_or_else(|e| panic!("direct DXIL: {e}")).dxil)
+    };
+    let dxil = match &direct_dxil {
+        Some(direct) if direct_enabled(&opt) => direct.clone(),
+        _ => hlsl_dxil.clone(),
+    };
     let (w, h, base) = (32usize, 24usize, 0x100usize);
     let mut io = vec![0u32; 128];
     io[0] = base as u32;
@@ -5334,7 +5344,8 @@ fn gpu_compute_mode_dispatch_abi() {
 
     // DispatchX thread limits seed EXEC in both backends. The hardware groups still contain
     // 32x24 threads, but only the 20x17 console dispatch rectangle may reach memory.
-    for (backend, dxil) in [("HLSL", hlsl_dxil), ("direct DXIL", direct_dxil)] {
+    for (backend, dxil) in [("HLSL", Some(hlsl_dxil)), ("direct DXIL", direct_dxil)] {
+        let Some(dxil) = dxil else { continue };
         let mut limited_io = io.clone();
         limited_io[super::IO_THREAD_LIMIT[0]] = 20;
         limited_io[super::IO_THREAD_LIMIT[1]] = 17;
@@ -6094,9 +6105,19 @@ fn gpu_float_cas_uses_ieee_equality() {
     let t = translate(&code, &runner::options(Mode::Kernel)).unwrap();
     assert!(t.complete(), "{:?}", t.unsupported);
     let hlsl_dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).map_err(|x| format!("{x}\n--- HLSL ---\n{}", t.hlsl)).unwrap();
-    let direct_dxil = runner::direct_kernel_full(&code, true).unwrap().dxil;
+    // Split wave64 LDS is refused by the direct path on purpose and runs through HLSL
+    // (dbe6b30b "Recompiler: route split wave64 LDS through HLSL").
+    let direct = runner::direct_kernel_full(&code, true);
+    let direct_dxil = if runner::split_wave64() {
+        let e = direct.err().expect("direct DXIL translated split wave64 LDS");
+        assert!(e.contains("split wave64 LDS access needs the HLSL path"), "{e}");
+        None
+    } else {
+        Some(direct.unwrap().dxil)
+    };
 
-    for (backend, dxil) in [("hlsl", hlsl_dxil), ("direct_dxil", direct_dxil)] {
+    for (backend, dxil) in [("hlsl", Some(hlsl_dxil)), ("direct_dxil", direct_dxil)] {
+        let Some(dxil) = dxil else { continue };
         let r = runner::run_with_statics(&dxil, &st, &mem, &tex, &[], &[]).unwrap_or_else(|e| panic!("{backend}: {e}"));
         let old64 = |v: &[u32], at: usize| v[at] as u64 | (v[at + 1] as u64) << 32;
         let cell64 = |a: usize| r.mem[a / 4] as u64 | (r.mem[a / 4 + 1] as u64) << 32;
