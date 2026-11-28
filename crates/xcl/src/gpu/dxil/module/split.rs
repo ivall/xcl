@@ -874,7 +874,7 @@ mod tests {
         assert!(chain.pieces.len() >= 3);
         let has_memory_binding: Vec<_> = chain.pieces.iter().map(|piece| {
             crate::gpu::dxil::validate::disassemble(piece).unwrap()
-                .contains("ResBind { i32 0, i32 2, i32 2, i8 1 }")
+                .contains("ResBind { i32 2, i32 2, i32 0, i8 1 }")
         }).collect();
         assert!(has_memory_binding.iter().any(|&present| present));
         assert!(has_memory_binding.iter().any(|&present| !present),
