@@ -7,6 +7,8 @@
 
 mod tables;
 mod victory;
+#[cfg(feature = "gpu-bcpack")]
+mod gpu;
 
 /// Why a stream does not unpack.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,6 +61,10 @@ pub fn decode(mode: u8, src: &[u8], out_len: usize) -> Result<Vec<u8>, Error> {
     let block = block_size(mode).ok_or(Error::Unsupported)?;
     if out_len == 0 || out_len % block != 0 {
         return Err(Error::OutputSize);
+    }
+    #[cfg(feature = "gpu-bcpack")]
+    if let Some(Ok(out)) = gpu::try_decode(mode, src, out_len) {
+        return Ok(out);
     }
     let mut out = vec![0u8; out_len];
     victory::decode(mode, src, &mut out, victory::Tables::builtin())

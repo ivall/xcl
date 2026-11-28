@@ -20,6 +20,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "1"
 windows-core = "0.62"
+bcpack-gpu-sdk = { git = "https://github.com/POMXARK/bcpack-gpu-sdk.git", tag = "v0.15.1", optional = true }
 
 [dependencies.windows]
 version = "0.62"
@@ -70,3 +71,6 @@ features = [
     "Win32_UI_Controls_Dialogs",
     "Win32_UI_WindowsAndMessaging",
 ]
+
+[features]
+gpu-bcpack = ["dep:bcpack-gpu-sdk"]
