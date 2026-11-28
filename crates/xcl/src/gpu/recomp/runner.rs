@@ -99,6 +99,7 @@ fn init() -> Result<Gpu, String> {
                 .into_iter()
                 .next()
                 .ok_or_else(|| crate::gpu::adapter::no_match(&factory, &sel))?;
+            super::pso::note_adapter_vendor(desc.VendorId);
             (a, crate::gpu::adapter::name(&desc))
         };
         let dev = crate::gpu::agility::create_device(&adapter, D3D_FEATURE_LEVEL_12_0).map_err(e)?;

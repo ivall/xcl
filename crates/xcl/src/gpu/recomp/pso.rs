@@ -118,6 +118,37 @@ pub fn heap_windows() -> bool {
     *ENV.get_or_init(|| std::env::var("XCL_HEAP_WINDOWS").is_ok_and(|v| v.trim() == "1")) && !crate::hle::d3d12x::console_heap::window_views_failed()
 }
 
+/// The PCI vendor id of AMD's adapters (`DXGI_ADAPTER_DESC1::VendorId`).
+const VENDOR_AMD: u32 = 0x1002;
+
+/// The vendor of the adapter this process translates for; 0 until `note_adapter_vendor`.
+static ADAPTER_VENDOR: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Who creates the D3D12 device says which vendor's adapter it is on, before anything is
+/// translated for it (`region_budgets`).
+pub fn note_adapter_vendor(vendor: u32) {
+    ADAPTER_VENDOR.store(vendor, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether compute programs get a loop budget per loop region (`Options::region_budgets`).
+/// Not on an AMD adapter: its shader compiler crashed on retail compute programs with region
+/// budgets (`amdxc64.dll`, an RX 6800, #2874 / #2947), so there they keep the single budget,
+/// as before region budgets and as the graphics stages do. `XCL_REGION_BUDGETS=1` gives them
+/// to an AMD adapter too, `=0` takes them from every adapter. Compute shaders are cached by
+/// it, in memory (`ShaderKey`) and on disk (`translated::budget_identity`).
+pub fn region_budgets() -> bool {
+    static ENV: OnceLock<Option<String>> = OnceLock::new();
+    region_budgets_for(ENV.get_or_init(|| std::env::var("XCL_REGION_BUDGETS").ok()).as_deref(), ADAPTER_VENDOR.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+fn region_budgets_for(switch: Option<&str>, vendor: u32) -> bool {
+    match switch.map(str::trim) {
+        Some("1") => true,
+        Some("0") => false,
+        _ => vendor != VENDOR_AMD,
+    }
+}
+
 /// A static sampler of a translated program: (S#, comparison) – see `Translation`.
 pub type StaticSampler = ([u32; 4], bool);
 
@@ -163,6 +194,7 @@ pub fn console_to_dxil_in(blob: &[u8], stage: Stage, sampler_base: u32, split_wa
         sampler_base,
         windows,
         split_wave64,
+        region_budgets: stage != Stage::Compute || region_budgets(),
         cache_dir: dxc::cache_dir(),
     };
     // with `XCL_DIRECT_DXIL` the disk entries live under their own identity (backend tag,
@@ -217,6 +249,17 @@ mod translated {
                 _ => Backend::Hlsl,
             }
         }
+    }
+
+    /// `ident` for a `stage` program when compute programs keep the single loop budget
+    /// (`pso::region_budgets` false: an AMD adapter, or `XCL_REGION_BUDGETS=0`): those are other
+    /// translations, under an identity of their own, so a cache directory that an AMD and
+    /// another adapter both fill gives neither the other's. Zero (no disk cache) stays zero.
+    pub(super) fn budget_identity(ident: u64, stage: Stage, region_budgets: bool) -> u64 {
+        if ident == 0 || region_budgets || stage != Stage::Compute {
+            return ident;
+        }
+        identity_for(&ident.to_string(), "xcl-single-loop-budget")
     }
 
     /// The direct translator's version: `TRANSLATOR_VERSION` and the hash of its sources (build.rs).
@@ -486,7 +529,7 @@ mod translated {
         split: bool,
         translate: impl FnOnce() -> Result<(Compiled, bool), String>,
     ) -> Result<Compiled, String> {
-        cached_rerouted(dir, identity(), direct_output(), blob, stage, sampler_base, windows, split, translate)
+        cached_rerouted(dir, budget_identity(identity(), stage, super::region_budgets()), direct_output(), blob, stage, sampler_base, windows, split, translate)
     }
 
     /// What the direct translator's output depends on besides the HLSL path's identity: its
@@ -732,6 +775,8 @@ struct ShaderKey {
     sampler_base: u32,
     windows: u32,
     split_wave64: bool,
+    /// a compute program's: with loop region budgets (`region_budgets`); true for the others
+    region_budgets: bool,
     cache_dir: PathBuf,
 }
 
@@ -972,7 +1017,7 @@ fn direct_compute(blob: &[u8], sampler_base: u32, windows: u32, split_wave64: bo
             }
         }
     }
-    let k = crate::gpu::dxil::kernel::translate_compute_on(code, o, &cs, split_wave64)?;
+    let k = crate::gpu::dxil::kernel::translate_compute_on(code, o, &cs, split_wave64, region_budgets())?;
     dump_direct(blob, &k.dxil);
     Ok(Compiled { dispatch_chain: k.dispatch_chain, dxil: k.dxil, samplers: k.static_samplers })
 }
@@ -1018,7 +1063,7 @@ pub(crate) fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32, 
             return Err("an FSPX (driver) container in a graphics slot".into());
         }
         let cs = super::CsInterface::from_rsrc2(f.threads, f.rsrc2);
-        let t = translate(f.code, &Options { mode: Mode::Compute(cs), wave64: super::detect_wave64(f.code), split_wave64, static_sampler_base: sampler_base, mem_windows: windows, ..Default::default() })?;
+        let t = translate(f.code, &Options { mode: Mode::Compute(cs), wave64: super::detect_wave64(f.code), split_wave64, static_sampler_base: sampler_base, mem_windows: windows, region_budgets: region_budgets(), ..Default::default() })?;
         if !t.complete() {
             let missing: Vec<&String> = t.unsupported.keys().collect();
             return Err(format!("incomplete translation, missing: {missing:?}"));
@@ -1047,7 +1092,7 @@ pub(crate) fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32, 
     };
     let p = f.programs.first().ok_or("FSSM without a program")?;
     let code = &f.data[p.offset..p.offset + p.len];
-    let t = translate(code, &Options { mode, wave64: super::fssm_wave64(f, code), split_wave64, static_sampler_base: sampler_base, mem_windows: windows, ..Default::default() })?;
+    let t = translate(code, &Options { mode, wave64: super::fssm_wave64(f, code), split_wave64, static_sampler_base: sampler_base, mem_windows: windows, region_budgets: region_budgets(), ..Default::default() })?;
     if !t.complete() {
         let missing: Vec<&String> = t.unsupported.keys().collect();
         return Err(format!("incomplete translation, missing: {missing:?}"));
@@ -1152,6 +1197,7 @@ fn console_mesh_with(
             sampler_base: 0,
             windows,
             split_wave64: split,
+            region_budgets: true,
             cache_dir: cache_dir.to_path_buf(),
         };
         let from_disk = || translated::cached(cache_dir, blob, Stage::Mesh, 0, windows, split, || compile_one().map(|c| (c, false)));
@@ -1659,6 +1705,7 @@ mod shader_cache_tests {
             sampler_base: 0,
             windows: 1,
             split_wave64: false,
+            region_budgets: true,
             cache_dir: "cache".into(),
         }
     }
@@ -1805,6 +1852,10 @@ mod shader_cache_tests {
             },
             ShaderKey {
                 windows: 2,
+                ..original.clone()
+            },
+            ShaderKey {
+                region_budgets: false,
                 ..original.clone()
             },
             ShaderKey {
@@ -1984,6 +2035,35 @@ mod shader_cache_tests {
         assert_eq!(pub_second.ms, pub_first.ms);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Compute programs keep the single loop budget on an AMD adapter (#2947) unless
+    /// `XCL_REGION_BUDGETS` says otherwise, and their disk entries are then others.
+    #[test]
+    fn region_budgets_are_off_on_amd_and_change_the_compute_identity() {
+        for vendor in [0, 0x10de, 0x8086] {
+            assert!(region_budgets_for(None, vendor));
+            assert!(!region_budgets_for(Some("0"), vendor));
+        }
+        assert!(!region_budgets_for(None, VENDOR_AMD));
+        assert!(region_budgets_for(Some("1"), VENDOR_AMD));
+        assert!(region_budgets_for(Some(" 1 "), VENDOR_AMD));
+        assert!(!region_budgets_for(Some("on"), VENDOR_AMD), "anything else leaves it to the adapter");
+        assert!(region_budgets_for(Some(""), 0x10de));
+
+        use translated::budget_identity;
+        let ident = translated::identity_for("source", "toolchain");
+        let single = budget_identity(ident, Stage::Compute, false);
+        assert_ne!(single, ident);
+        assert_ne!(single, 0);
+        assert_eq!(budget_identity(ident, Stage::Compute, true), ident, "with region budgets the entries are the ones of before");
+        for stage in [Stage::Vertex, Stage::Pixel, Stage::Mesh] {
+            assert_eq!(budget_identity(ident, stage, false), ident, "{stage:?} has no region budgets to lose");
+        }
+        assert_eq!(budget_identity(0, Stage::Compute, false), 0, "no disk cache stays none");
+        // the entries of the two live in different files
+        let dir = std::path::Path::new("cache");
+        assert_ne!(translated::file(dir, single, b"a", Stage::Compute, 0, 1, false), translated::file(dir, ident, b"a", Stage::Compute, 0, 1, false));
     }
 
     #[test]

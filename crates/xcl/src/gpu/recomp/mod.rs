@@ -528,11 +528,15 @@ pub struct Options {
     /// structured control flow when the program allows it (false, or `XCL_RECOMP_NO_STRUCTURED`:
     /// always the guarded block chain)
     pub structured: bool,
+    /// a compute program's loop regions get their own budgets ([`budget_regions`]). false: it
+    /// keeps the one budget of the other stages (`pso::region_budgets`: an AMD adapter, whose
+    /// shader compiler crashed on compute programs with region budgets, #2947)
+    pub region_budgets: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, split_wave64: false, static_sampler_base: 0, mem_windows: 1, heap_windows: false, structured: true }
+        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, split_wave64: false, static_sampler_base: 0, mem_windows: 1, heap_windows: false, structured: true, region_budgets: true }
     }
 }
 
@@ -565,6 +569,8 @@ struct Ctx<'a> {
     starts: &'a BTreeSet<u64>,
     leaders: &'a [u64],
     loops: &'a [(u64, u64)],
+    /// [`budget_regions`]
+    regions: &'a [(u64, u64)],
     /// every branch: (address of the branch, target)
     edges: &'a [(u64, u64)],
     /// split wave64 geometry mode: the ES's s_setpc ends the ES phase and `gs_start` is the GS
@@ -647,6 +653,55 @@ impl Conts {
 /// leaves at its next iteration and the program runs to its end.
 const LOOP_GUARD: &str = "if (xcl_budget == 0u) break; xcl_budget--;";
 
+/// A program with two or more loop regions gives each this many budgets of iterations
+/// ([`loop_guard`]): a title's own spin capped at one budget (0x10000 tries) must fit, also
+/// when it sits in an outer loop whose head spends from the same count.
+pub(crate) const LOOP_BUDGETS_PER_REGION: u32 = 2;
+/// ... and all of its regions together at most this many.
+pub(crate) const LOOP_BUDGETS_IN_ALL: u32 = 4;
+
+/// The iterations a region and all the regions of a program get in HLSL when the loop budget
+/// is `budget` ([`LOOP_BUDGETS_PER_REGION`], [`LOOP_BUDGETS_IN_ALL`]; saturating). A switch for
+/// the budget (`XCL_LOOP_BUDGET`, #1284) scales the region budgets by passing its value here:
+/// without that they would stay at 2 and 4 times 65 536 whatever it says. (The direct
+/// translator has its own `dxil::lower::LOOP_BUDGET`, which no switch changes.)
+pub(crate) fn region_budget_limits(budget: u32) -> (u32, u32) {
+    (budget.saturating_mul(LOOP_BUDGETS_PER_REGION), budget.saturating_mul(LOOP_BUDGETS_IN_ALL))
+}
+
+/// The outermost of [`loop_ranges`]: the program's loop regions, in order. Control only moves
+/// forward from one to the next (a jump back into an earlier one would make them one range).
+/// Empty for a program with fewer than two, whose guards stay [`LOOP_GUARD`].
+pub(crate) fn budget_regions(loops: &[(u64, u64)]) -> Vec<(u64, u64)> {
+    let outer: Vec<(u64, u64)> = loops.iter().copied().filter(|&(a, b)| !loops.iter().any(|&(c, d)| (c, d) != (a, b) && c <= a && b <= d)).collect();
+    if outer.len() < 2 {
+        Vec::new()
+    } else {
+        outer
+    }
+}
+
+/// The region ([`budget_regions`]) of the loop headed at `head`, numbered from 1.
+pub(crate) fn budget_region(regions: &[(u64, u64)], head: u64) -> Option<u32> {
+    regions.iter().position(|&(a, b)| a <= head && head < b).map(|k| k as u32 + 1)
+}
+
+/// The guard of the loop headed at `head`. In a program with loop regions, each region starts
+/// with [`LOOP_BUDGETS_PER_REGION`] budgets, and `xcl_btotal` keeps all of them to
+/// [`LOOP_BUDGETS_IN_ALL`]: a title's own spin that gives up after 0x10000 tries, the budget,
+/// otherwise left every loop after it without an iteration (a retail FSR pass then published a
+/// flag made from a register its main loop never set, and the pass waiting on that flag spun
+/// 260 ms a frame).
+fn loop_guard(regions: &[(u64, u64)], head: u64) -> String {
+    match budget_region(regions, head) {
+        Some(r) => format!(
+            "if (xcl_bown != {r}u) {{ xcl_bown = {r}u; xcl_budget = {}u; }} if (xcl_budget == 0u || xcl_btotal == 0u) break; xcl_budget--; xcl_btotal--;",
+            region_budget_limits(1 << 16).0
+        ),
+        None => LOOP_GUARD.to_string(),
+    }
+}
+
 /// Structured code longer than this many bytes per byte of program falls back to the `pc` form.
 /// Each guard of the structured form lists every pending skip flag, so it grows with the
 /// square of the flags: one retail program made 455 B per byte (148 MB, 14 MB as `pc` blocks),
@@ -656,7 +711,7 @@ const STRUCTURED_BYTES_PER_CODE_BYTE: usize = 128;
 /// The loops the translator emits: ranges spanned by backward jumps (far jumps included),
 /// partly overlapping ones merged until they nest, sorted. `x64_masks` uses them for the
 /// exits through `LOOP_GUARD`.
-pub(super) fn loop_ranges(insts: &[Decoded]) -> Vec<(u64, u64)> {
+pub(crate) fn loop_ranges(insts: &[Decoded]) -> Vec<(u64, u64)> {
     let mut loops: Vec<(u64, u64)> = Vec::new();
     for d in insts {
         if let Some(t) = rdna2::branch_target(d) {
@@ -1098,7 +1153,7 @@ fn emit_structured(
         }
         let raised: BTreeSet<u64> = match it {
             Item::Loop { a, b, latch, entry } => {
-                body.push_str(&format!("{ipad}[loop] for (;;) {{\n{ipad}    {LOOP_GUARD}\n"));
+                body.push_str(&format!("{ipad}[loop] for (;;) {{\n{ipad}    {}\n", loop_guard(c.regions, a)));
                 let (lcont, lin) = if entry.is_none() { (cont.enter(Some(a)), &inner) } else { (cont.enter(None), &none) };
                 let mut r = emit_structured(c, em, body, entry.unwrap_or(a), latch, None, nest + 1, &lcont, lin, d + 1, blocks, flags);
                 for &t in &r {
@@ -1219,7 +1274,7 @@ fn emit_range(c: &Ctx, em: &mut emit::Em, body: &mut String, lo: u64, hi: u64, d
         let start = c.leaders[i];
         let inner = c.loops.iter().filter(|&&(a, b)| a == start && b <= hi && (a, b) != (lo, hi)).max_by_key(|x| x.1).copied();
         if let Some((a, b)) = inner {
-            body.push_str(&format!("{pad}[loop] while (pc >= {a}u && pc < {b}u) {{\n{pad}    {LOOP_GUARD}\n"));
+            body.push_str(&format!("{pad}[loop] while (pc >= {a}u && pc < {b}u) {{\n{pad}    {}\n", loop_guard(c.regions, a)));
             emit_range(c, em, body, a, b, depth + 1, blocks, flags);
             body.push_str(&format!("{pad}}}\n"));
             i = c.leaders.partition_point(|&l| l < b);
@@ -1597,13 +1652,20 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
         // (optimising one big dispatcher loop took minutes on large retail programs).
         let leaders: Vec<u64> = leaders.into_iter().filter(|l| starts.contains(l)).collect();
         let loops = loop_ranges(&insts);
+        // Per-region loop budgets target compute spin-wait passes (PR #2793); keep graphics/mesh
+        // stages on the single-budget CFG, and compute programs where `region_budgets` is off.
+        let regions = if matches!(opt.mode, Mode::Kernel) || (matches!(opt.mode, Mode::Compute(_)) && opt.region_budgets) {
+            budget_regions(&loops)
+        } else {
+            Vec::new()
+        };
         let edges: Vec<(u64, u64)> = insts.iter().filter_map(|d| rdna2::branch_target(d).map(|t| (d.pc, t))).collect();
         let phase_split = gs_jump.is_some_and(|t| t.is_some()) && opt.split_wave64 && opt.wave64;
-        let ctx = Ctx { insts: &insts, starts: &starts, leaders: &leaders, loops: &loops, edges: &edges, phase_split, memo: Default::default() };
+        let ctx = Ctx { insts: &insts, starts: &starts, leaders: &leaders, loops: &loops, regions: &regions, edges: &edges, phase_split, memo: Default::default() };
         let mut flags = BTreeSet::new();
         let mut code = String::new();
         let nested = nested_loop_ranges(&insts);
-        let sctx = Ctx { insts: &insts, starts: &starts, leaders: &leaders, loops: &nested, edges: &edges, phase_split, memo: Default::default() };
+        let sctx = Ctx { insts: &insts, starts: &starts, leaders: &leaders, loops: &nested, regions: &regions, edges: &edges, phase_split, memo: Default::default() };
         if gs_jump.is_none() && opt.structured && std::env::var_os("XCL_RECOMP_NO_STRUCTURED").is_none() && structurable(&sctx, 0, u64::MAX).is_some() {
             // structured control flow: plain if / loops, no block dispatch on `pc` (much
             // smaller for DXC and the driver on big programs)
@@ -1618,6 +1680,9 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
                 code.push_str("    uint pc = 0;\n");
             }
             emit_range(&ctx, &mut em, &mut code, 0, u64::MAX, 1, &mut blocks, &mut flags);
+        }
+        if !regions.is_empty() {
+            body.push_str(&format!("    uint xcl_bown = 0u;\n    uint xcl_btotal = {}u;\n", region_budget_limits(1 << 16).1));
         }
         for &t in &flags {
             body.push_str(&format!("    bool {} = false;\n", skip_flag(t)));

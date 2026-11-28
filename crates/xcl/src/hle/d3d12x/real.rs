@@ -536,6 +536,7 @@ pub(super) fn init_with_remap(allow_driver_remap: bool) -> Result<String, String
             for (adapter, desc) in list {
                 if let Ok(dev) = crate::gpu::agility::create_device(&adapter, D3D_FEATURE_LEVEL_12_0) {
                     device = Some(dev);
+                    crate::gpu::recomp::pso::note_adapter_vendor(desc.VendorId);
                     name = format!("{} ({} MiB VRAM)", crate::gpu::adapter::name(&desc), desc.DedicatedVideoMemory >> 20);
                     break;
                 }

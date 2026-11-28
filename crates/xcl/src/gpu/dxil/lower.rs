@@ -34,6 +34,10 @@ pub const VAR_XDEAD: u32 = VAR_BUDGET + 4;
 pub const VAR_IMG_WRITE: u32 = VAR_BUDGET + 8;
 /// loop iterations a lane may run (the recompiler's `xcl_budget`)
 pub const LOOP_BUDGET: u32 = 1 << 16;
+/// the loop region whose budget [`VAR_BUDGET`] holds (the recompiler's `xcl_bown`, `budget_region`)
+pub const VAR_BUDGET_OWNER: u32 = VAR_BUDGET + 7;
+/// iterations left to all the regions together (the recompiler's `xcl_btotal`)
+pub const VAR_BUDGET_TOTAL: u32 = VAR_BUDGET + 24;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dst {
@@ -115,10 +119,13 @@ impl Init {
         if var == VAR_BUDGET {
             return s.m.i32c(LOOP_BUDGET);
         }
+        if var == VAR_BUDGET_TOTAL {
+            return s.m.i32c(LOOP_BUDGET * crate::gpu::recomp::LOOP_BUDGETS_IN_ALL);
+        }
         if var == super::lower_round::VAR_F32_MODE {
             return s.m.i32c(super::lower_round::MODE_INIT);
         }
-        if var == VAR_FP16_RM || var == VAR_WIN || var == VAR_XK || var == VAR_XDEAD || (VAR_IMG_WRITE..VAR_IMG_WRITE + 16).contains(&var) {
+        if var == VAR_FP16_RM || var == VAR_BUDGET_OWNER || var == VAR_WIN || var == VAR_XK || var == VAR_XDEAD || (VAR_IMG_WRITE..VAR_IMG_WRITE + 16).contains(&var) {
             return s.m.i32c(0);
         }
         if var >= super::lower_mem::VAR_TMP {
@@ -264,6 +271,9 @@ pub struct Lw {
     /// when it is never read whole. Set by a caller that reads back only each lane's own bit
     /// (the per-lane form's bridge), so no exchange meets the other half.
     pub local_masks: bool,
+    /// the program's loop regions get their own budgets (`recomp::budget_regions`): kernels,
+    /// and compute programs unless the adapter's are kept on one (`kernel::translate_compute_on`)
+    pub region_budgets: bool,
 }
 
 impl Lw {

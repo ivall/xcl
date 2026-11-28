@@ -1426,6 +1426,160 @@ fn gpu_scalar_loop_and_scc() {
     assert_eq!((r.sgpr[41], r.sgpr[42], r.sgpr[43]), (48, 33, u32::MAX), "flbit_i64 high-then-low scan");
 }
 
+/// A spin of `spin` tries (a retail FSR pass polls a flag up to 0x10000 times, the loop budget),
+/// inside an outer loop that runs once when `nested` (as in that pass), then a loop of `n`
+/// iterations, then `s2 = 7`.
+fn spin_then_loop(spin: u32, n: u32, nested: bool) -> Vec<u8> {
+    let i = |nm: &str, e: &str, f: &[(&str, u64)], lit: Option<u32>| encode(nm, e, f, lit).unwrap_or_else(|x| panic!("{nm}: {x}"));
+    let mut v = i("S_MOV_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 128)], None); // s0 = 0
+    if nested {
+        v.extend(i("S_ADD_U32", "ENC_SOP2", &[("SDST", 3), ("SSRC0", 3), ("SSRC1", 129)], None)); // outer: s3 += 1
+    }
+    v.extend(i("S_ADD_U32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 0), ("SSRC1", 129)], None)); // spin: s0 += 1
+    v.extend(i("S_CMP_LG_U32", "ENC_SOPC", &[("SSRC0", 0), ("SSRC1", 255)], Some(spin)));
+    v.extend(i("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0xFFFC)], None)); // → spin
+    if nested {
+        v.extend(i("S_CMP_LG_U32", "ENC_SOPC", &[("SSRC0", 3), ("SSRC1", 129)], None)); // until s3 == 1
+        v.extend(i("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0xFFF9)], None)); // → outer
+    }
+    v.extend(i("S_MOV_B32", "ENC_SOP1", &[("SDST", 1), ("SSRC0", 128)], None)); // s1 = 0
+    v.extend(i("S_ADD_U32", "ENC_SOP2", &[("SDST", 1), ("SSRC0", 1), ("SSRC1", 129)], None)); // loop: s1 += 1
+    v.extend(i("S_CMP_LG_U32", "ENC_SOPC", &[("SSRC0", 1), ("SSRC1", 255)], Some(n)));
+    v.extend(i("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0xFFFC)], None)); // → loop
+    v.extend(i("S_MOV_B32", "ENC_SOP1", &[("SDST", 2), ("SSRC0", 135)], None)); // s2 = 7
+    v.extend(i("S_ENDPGM", "ENC_SOPP", &[], None));
+    v
+}
+
+/// A program's own spin that gives up at the loop budget, or just before it, must not leave the
+/// loops after it short of iterations: the FSR pass then published a flag built from a register
+/// its main loop never set, and the pass waiting on it spun for 260 ms a frame. Both HLSL forms.
+#[test]
+fn gpu_a_loop_after_a_spin_to_the_budget_still_runs() {
+    if !gpu_ready() {
+        return;
+    }
+    for (spin, n, nested) in [(0x10000, 3, false), (0xFFF0, 1000, false), (0x10000, 3, true)] {
+        let code = spin_then_loop(spin, n, nested);
+        for structured in [true, false] {
+            let opt = Options { structured, ..runner::options(Mode::Kernel) };
+            let t = translate(&code, &opt).unwrap();
+            let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap();
+            let r = runner::run(&dxil, &KernelState::default(), &[]).unwrap();
+            let what = format!("spin {spin:#x}, loop {n}, nested {nested}, structured {structured}");
+            assert_eq!(r.sgpr[0], spin, "{what}: the spin ran to its own end");
+            assert_eq!((r.sgpr[1], r.sgpr[2]), (n, 7), "{what}: the loop after it ran all its iterations");
+        }
+    }
+}
+
+/// Loops that never end still stop: four budgets in all, then every loop leaves. (The direct
+/// translator ends the program where a budget runs out, so this is the HLSL path's.)
+#[test]
+fn gpu_endless_loops_in_many_regions_stop_after_four_budgets() {
+    if !gpu_ready() {
+        return;
+    }
+    // six regions, each `s0 += 1` until s0 == 0 (2^32 tries); s1 counts the regions reached
+    let mut list: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = Vec::new();
+    for _ in 0..6 {
+        list.push(("S_ADD_U32", "ENC_SOP2", &[("SDST", 1), ("SSRC0", 1), ("SSRC1", 129)], None));
+        list.push(("S_ADD_U32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 0), ("SSRC1", 129)], None));
+        list.push(("S_CMP_LG_U32", "ENC_SOPC", &[("SSRC0", 0), ("SSRC1", 128)], None));
+        list.push(("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0xFFFD)], None));
+    }
+    let t = translate(&prog(&list), &runner::options(Mode::Kernel)).unwrap();
+    let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap();
+    let r = runner::run(&dxil, &KernelState::default(), &[]).unwrap();
+    assert_eq!(r.sgpr[1], 6, "every region was reached");
+    assert_eq!(r.sgpr[0], super::LOOP_BUDGETS_IN_ALL << 16, "four budgets of iterations in all");
+}
+
+/// Per-region loop budgets (`xcl_bown` / `xcl_btotal`) are compute-only: Compute and Kernel
+/// modes emit them for multi-region loops, while Pixel and Mesh stages keep the single-budget
+/// CFG (avoiding multi-PHI mesh loop headers that crash AMD LLPC).
+#[test]
+fn per_region_loop_budgets_are_compute_only() {
+    let mut list: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = Vec::new();
+    for _ in 0..2 {
+        list.push(("S_ADD_U32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 0), ("SSRC1", 129)], None));
+        list.push(("S_CMP_LT_U32", "ENC_SOPC", &[("SSRC0", 0), ("SSRC1", 130)], None));
+        list.push(("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0xFFFD)], None));
+    }
+    let code = prog(&list);
+
+    let cs = super::CsInterface { threads: [64, 1, 1], ..Default::default() };
+    let ps = super::PsInterface::default();
+    let ms = super::MsInterface { threads: 64, max_vertices: 64, max_primitives: 64, ..Default::default() };
+
+    for mode in [Mode::Kernel, Mode::Compute(cs.clone())] {
+        let t = translate(&code, &Options { mode, ..Default::default() }).unwrap();
+        assert!(t.hlsl.contains("xcl_bown") && t.hlsl.contains("xcl_btotal"), "compute/kernel should emit per-region budgets");
+    }
+    for mode in [Mode::Pixel(ps), Mode::Mesh(ms.clone())] {
+        let t = translate(&code, &Options { mode, ..Default::default() }).unwrap();
+        assert!(!t.hlsl.contains("xcl_bown") && !t.hlsl.contains("xcl_btotal"), "pixel/mesh must not emit per-region budgets");
+    }
+
+    // Direct DXIL compute & mesh both translate cleanly for a multi-region loop program.
+    let o = crate::gpu::dxil::kernel::KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 };
+    assert!(!crate::gpu::dxil::kernel::translate_compute(&code, o, &cs).unwrap().dxil.is_empty());
+    assert!(!crate::gpu::dxil::kernel::translate_mesh(&code, o, &ms).unwrap().dxil.is_empty());
+}
+
+/// `regions` loops one after the other, each `s0 += 1` while s0 < 2.
+fn loops_in_a_row(regions: usize) -> Vec<u8> {
+    let mut list: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = Vec::new();
+    for _ in 0..regions {
+        list.push(("S_ADD_U32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 0), ("SSRC1", 129)], None));
+        list.push(("S_CMP_LT_U32", "ENC_SOPC", &[("SSRC0", 0), ("SSRC1", 130)], None));
+        list.push(("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0xFFFD)], None));
+    }
+    prog(&list)
+}
+
+/// With `Options::region_budgets` off (`pso::region_budgets`: an AMD adapter, whose compiler
+/// crashed on compute programs with region budgets, #2947) a compute program keeps the single
+/// budget, in HLSL and in both direct forms; a kernel keeps its regions either way.
+#[test]
+fn a_compute_program_without_region_budgets_keeps_the_single_budget() {
+    let code = loops_in_a_row(2);
+    let cs = super::CsInterface { threads: [64, 1, 1], ..Default::default() };
+    let hlsl = |mode: Mode, region_budgets: bool| translate(&code, &Options { mode, region_budgets, ..Default::default() }).unwrap().hlsl;
+
+    let with = hlsl(Mode::Compute(cs.clone()), true);
+    assert!(with.contains("xcl_bown") && with.contains("xcl_btotal"), "region budgets by default");
+    assert_eq!(with.matches(super::LOOP_GUARD).count(), 0);
+    let without = hlsl(Mode::Compute(cs.clone()), false);
+    assert!(!without.contains("xcl_bown") && !without.contains("xcl_btotal"), "no region budgets when they are off");
+    assert_eq!(without.matches(super::LOOP_GUARD).count(), 2, "both loops spend the single budget");
+    assert!(hlsl(Mode::Kernel, false).contains("xcl_bown"), "kernels are not compute programs");
+
+    let o = crate::gpu::dxil::kernel::KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 };
+    let one = loops_in_a_row(1);
+    for compact in [false, true] {
+        let direct = |code: &[u8], region_budgets: bool| crate::gpu::dxil::kernel::translate_compute_as(code, o, &cs, compact, region_budgets).unwrap().dxil;
+        let (with, without) = (direct(&code, true), direct(&code, false));
+        assert!(without.len() < with.len(), "compact {compact}: {} B without the region guards, {} B with them", without.len(), with.len());
+        assert_eq!(direct(&one, true), direct(&one, false), "compact {compact}: one region has no region budget to lose");
+    }
+}
+
+/// A region gets two loop budgets and all of them four, of whatever the loop budget is
+/// (`region_budget_limits`; `XCL_LOOP_BUDGET` of #1284 is to pass its value there), and the
+/// default's HLSL is the text of before.
+#[test]
+fn region_budgets_are_two_and_four_loop_budgets() {
+    use super::region_budget_limits as f;
+    assert_eq!(f(1 << 16), (131_072, 262_144));
+    assert_eq!(f(4096), (8192, 16_384));
+    assert_eq!(f(1), (2, 4));
+    assert_eq!(f(0x6000_0000), (0xC000_0000, u32::MAX));
+    assert_eq!(f(u32::MAX), (u32::MAX, u32::MAX));
+    let hlsl = translate(&loops_in_a_row(2), &Options::default()).unwrap().hlsl;
+    assert!(hlsl.contains("xcl_budget = 131072u; }") && hlsl.contains("uint xcl_btotal = 262144u;\n"), "{hlsl}");
+}
+
 #[test]
 fn gpu_divergence_through_exec() {
     if !gpu_ready() {
