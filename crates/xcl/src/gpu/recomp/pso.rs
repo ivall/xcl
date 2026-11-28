@@ -906,6 +906,7 @@ impl ShaderCache {
         let bytes = blob.len()
             + key.cache_dir.capacity()
             + shader.dxil.capacity()
+            + shader.dispatch_chain.as_ref().map_or(0, |chain| chain.pieces.iter().map(Vec::capacity).sum())
             + shader.samplers.capacity() * std::mem::size_of::<StaticSampler>();
         if bytes > self.limit {
             return;
@@ -2022,6 +2023,22 @@ mod shader_cache_tests {
         }
         assert_eq!(cache.entries.len(), SHADER_CACHE_MAX_ENTRIES);
         assert!(cache.get(&key(0), b"a").is_none());
+    }
+
+    #[test]
+    fn shader_cache_charges_split_piece_capacity_on_insert() {
+        let mut split = compiled(7);
+        split.dispatch_chain = Some(Arc::new(crate::gpu::dxil::kernel::DispatchChain {
+            dwords_per_group: 8,
+            pieces: vec![vec![0u8; 4096], vec![0u8; 2048]],
+        }));
+        let split = Arc::new(split);
+        let entry = ShaderEntry { key: key(1), blob: b"split".to_vec(), shader: split.clone(), gen: 0 };
+        let piece_bytes: usize = split.dispatch_chain.as_ref().unwrap().pieces.iter().map(Vec::capacity).sum();
+        let mut cache = ShaderCache::new(entry.bytes() - piece_bytes);
+        cache.insert(key(1), b"split", split);
+        assert!(cache.entries.is_empty(), "a split shader larger than the byte budget is not admitted");
+        assert_eq!(cache.bytes, 0);
     }
 
     #[test]
