@@ -9202,6 +9202,51 @@ fn gpu_fmt_encode_direct_dxil_int_sat_and_f16_rtz() {
     }
 }
 
+/// The 2-bit component of a 2_10_10_10_SNORM format store is ±1 from a magnitude of 0.5 up and 0
+/// below; RDNA2 does not round it to nearest even (AnyPS5#25877, a store sweep of 75 formats on
+/// gfx1036: only this component differs). 12 lanes store x = 0.5, y = 0.25, z = -0.75 and their own w;
+/// the f32 neighbours just below ±0.5 (0x3effffff, 0xbeffffff) store 0, which `floor(|x| + 0.5)`
+/// misses: 0.49999997 + 0.5 rounds to 1.0 in f32.
+#[test]
+fn gpu_buffer_store_two_bit_snorm_rounds_half_away() {
+    if !gpu_ready() {
+        return;
+    }
+    let ident = 4 | 5 << 3 | 6 << 6 | 7 << 9;
+    let code = prog(&[
+        ("BUFFER_STORE_FORMAT_XYZW", "ENC_MUBUF", &[("VDATA", 4), ("VADDR", 1), ("SRSRC", 3), ("SOFFSET", 128), ("OFFEN", 1)], None),
+    ]);
+    // (w, packed word): x, y, z are 10-bit at 0 / 10 / 20, w 2-bit at 30
+    let cases: [(f32, u32); 12] = [
+        (0.5, 0x6812_0100),
+        (-0.5, 0xE812_0100),
+        (0.49, 0x2812_0100),
+        (-0.75, 0xE812_0100),
+        (1.0, 0x6812_0100),
+        (-1.0, 0xE812_0100),
+        (0.499_999_9, 0x2812_0100),
+        (0.500_000_1, 0x6812_0100),
+        (f32::from_bits(0x3EFF_FFFF), 0x2812_0100),
+        (f32::from_bits(0xBEFF_FFFF), 0x2812_0100),
+        (f32::from_bits(0x3F00_0000), 0x6812_0100),
+        (f32::from_bits(0xBF00_0000), 0xE812_0100),
+    ];
+    let mut st = KernelState::default();
+    st.sgpr[12..16].copy_from_slice(&[0x100, 0, 0x100, ident | 51 << 12]); // 2_10_10_10_SNORM
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        r[1] = 4 * (l % cases.len()) as u32;
+        r[4] = f(0.5);
+        r[5] = f(0.25);
+        r[6] = f(-0.75);
+        r[7] = f(cases[l % cases.len()].0);
+    }
+    let mem = vec![0u32; 512];
+    let r = runner::run_code(&code, &st, &mem).unwrap();
+    for (k, &(w, want)) in cases.iter().enumerate() {
+        assert_eq!(r.mem[0x100 / 4 + k], want, "w = {w}: {:#010x}, want {want:#010x}", r.mem[0x100 / 4 + k]);
+    }
+}
+
 #[test]
 fn gpu_signed_bfe_arithmetic_shift() {
     for wave64 in gpu_waves() {

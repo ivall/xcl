@@ -6241,7 +6241,10 @@ uint fmt_encode(uint x, uint info, uint c) {
     float maxu = w >= 32u ? 4294967295.0f : (float)((1u << w) - 1u);
     float maxs = w >= 32u ? 2147483647.0f : (float)((1u << (w - 1u)) - 1u);
     if (ty == 0u) return (uint)round(saturate(f) * maxu);
-    if (ty == 1u) return (uint)(int)round((isnan(f) ? 0.0f : clamp(f, -1.0f, 1.0f)) * maxs);
+    // SNORM to nearest even, but a 2-bit component (+-1 / 0) rounds a half away from zero
+    // (RDNA2: 0.5 stores 1, -0.5 stores -1). Its magnitude is at most 1, so compare it with 0.5 directly:
+    // floor(abs(sn) + 0.5f) would store 1 for 0.49999997 (the f32 sum rounds to 1.0)
+    if (ty == 1u) { float sn = (isnan(f) ? 0.0f : clamp(f, -1.0f, 1.0f)) * maxs; return (uint)(int)(w == 2u ? (abs(sn) >= 0.5f ? (sn < 0.0f ? -1.0f : 1.0f) : 0.0f) : round(sn)); }
     if (ty == 2u) return (uint)f;
     if (ty == 3u) return (uint)(int)f;
     if (ty == 4u) return w >= 32u ? x : min(x, (1u << w) - 1u);
