@@ -142,6 +142,7 @@ impl Config {
     /// the drive-letter mount onto `{data}\pls`. None when the mounts have no such drive.
     pub fn pls_drive(&self) -> Option<String> {
         self.mounts.iter().find_map(|(prefix, target)| {
+            let prefix = prefix.trim_end_matches(['\\', '/']);
             let b = prefix.as_bytes();
             let target = target.replace('/', "\\");
             let is_drive = b.len() == 2 && b[0].is_ascii_alphabetic() && b[1] == b':';
@@ -214,7 +215,9 @@ impl Config {
                 let mut c: Config = toml::from_str(&s).map_err(|e| format!("{}: {e}", path.display()))?;
                 // default mounts added since the file was written
                 for (k, v) in Config::default().mounts {
-                    c.mounts.entry(k).or_insert(v);
+                    if !c.mounts.keys().any(|prefix| prefix.trim_end_matches(['\\', '/']).eq_ignore_ascii_case(&k)) {
+                        c.mounts.insert(k, v);
+                    }
                 }
                 // the old default console id, written into every xcl.toml created before
                 if c.console_id == OLD_CONSOLE_ID {
@@ -312,6 +315,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn default_mounts_do_not_shadow_equivalent_user_prefixes() {
+        use crate::vfs::{Target, Vfs};
+
+        let dir = std::env::temp_dir().join(format!("xcl_cfg_mount_overrides_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("xcl.toml");
+        for prefix in ["G:", "g:", "G:\\", "g:/", "GaMe:"] {
+            std::fs::write(&path, format!("[mounts]\n'{prefix}' = 'C:\\custom'\n")).unwrap();
+            let boot = Boot {
+                title: "MountOverride".into(),
+                exe_path: PathBuf::from("C:\\game\\game.exe"),
+                game_root: PathBuf::from("C:\\game"),
+                data_dir: dir.clone(),
+                config: Config::load_or_create(&path).unwrap(),
+            };
+            let mounts = boot.config.mounts.iter().map(|(k, v)| (k.clone(), boot.expand(v))).collect();
+            let vfs = Vfs::new(&boot.game_root, &boot.data_dir, mounts);
+            let input = format!("{}\\asset.bin", prefix.trim_end_matches(['\\', '/']));
+            assert_eq!(
+                vfs.classify_with(&input, |p| Some(p.to_string())),
+                Target::Translated("C:\\custom\\asset.bin".into()),
+                "{prefix}"
+            );
+            assert_eq!(
+                vfs.classify_with("D:\\asset.bin", |p| Some(p.to_string())),
+                Target::Game { rel: "asset.bin".into() }
+            );
+        }
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
     fn default_roundtrips_through_toml() {
         let c = Config::default();
         let s = toml::to_string_pretty(&c).unwrap();
@@ -350,10 +386,12 @@ mod tests {
         // a user-moved drive (any spelling of the target) is followed
         c.mounts.remove("S:");
         assert_eq!(c.pls_drive(), None);
-        c.mounts.insert("p:".into(), "{data}/PLS\\".into());
-        assert_eq!(c.pls_drive().as_deref(), Some("P:\\"));
+        for prefix in ["p:", "P:\\", "p:/"] {
+            c.mounts.insert(prefix.into(), "{data}/PLS\\".into());
+            assert_eq!(c.pls_drive().as_deref(), Some("P:\\"));
+            c.mounts.remove(prefix);
+        }
         // directory-style prefixes are not drives
-        c.mounts.remove("p:");
         c.mounts.insert("PLS:".into(), PLS_MOUNT_TARGET.into());
         assert_eq!(c.pls_drive(), None);
     }
