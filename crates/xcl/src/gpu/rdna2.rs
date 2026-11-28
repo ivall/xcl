@@ -158,18 +158,18 @@ fn read_words(code: &[u8], n: usize) -> Vec<u32> {
 
 /// Operand types that are encoded as a scalar/vector source code and therefore can
 /// select the 32-bit literal (code 255).
-fn is_src_type(ty: &str) -> bool {
+pub(super) fn is_src_type(ty: &str) -> bool {
     matches!(
         ty,
         "OPR_SRC" | "OPR_SRC_NOLDS" | "OPR_SRC_VGPR" | "OPR_SSRC" | "OPR_SSRC_NOLDS" | "OPR_SSRC_LANESEL" | "OPR_SIMM32"
     )
 }
 
-fn is_valu32(enc: &Encoding) -> bool {
+pub(super) fn is_valu32(enc: &Encoding) -> bool {
     matches!(enc.name, "ENC_VOP1" | "ENC_VOP2" | "ENC_VOPC")
 }
 
-fn is_valu(enc: &Encoding) -> bool {
+pub(super) fn is_valu(enc: &Encoding) -> bool {
     is_valu32(enc) || matches!(enc.name, "ENC_VOP3" | "ENC_VOP3P")
 }
 
@@ -733,8 +733,12 @@ fn mimg_text(d: &Decoded) -> String {
 }
 
 pub fn mnemonic(d: &Decoded) -> String {
-    let mut m = d.inst.name.to_ascii_lowercase();
-    match d.variant {
+    mnemonic_of(d.inst, d.variant)
+}
+
+pub(super) fn mnemonic_of(inst: &Inst, variant: Variant) -> String {
+    let mut m = inst.name.to_ascii_lowercase();
+    match variant {
         Variant::Sdwa => m.push_str("_sdwa"),
         Variant::Dpp16 => m.push_str("_dpp"),
         Variant::Dpp8 => m.push_str("_dpp8"),

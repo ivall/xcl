@@ -9,6 +9,7 @@ const TRANSLATION_GLUE_REVISION: &str = "pso-glue-v4";
 const TRANSLATOR_SOURCES: &[&str] = &[
     "src/gpu/dxbc.rs",
     "src/gpu/rdna2.rs",
+    "src/gpu/rdna2_scan.rs",
     "src/gpu/rdna2_spec.rs",
     "src/gpu/rdna2_xbox.rs",
     "src/gpu/recomp/dxc.rs",

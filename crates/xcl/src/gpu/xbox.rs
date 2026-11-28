@@ -32,7 +32,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::rdna2;
+use super::{rdna2, rdna2_scan};
 use super::shader::container_parts;
 
 pub const XDAT_HASH: u32 = 0x12;
@@ -360,6 +360,28 @@ fn analyze_fssm(f: &mut Fssm) {
 
 /// Static branch targets of a code segment (PCs in the same space as `pc`), far jumps included.
 fn branch_targets(seg: &[u8], pc: u64) -> Vec<u64> {
+    let mut out = Vec::new();
+    let mut off = 0usize;
+    // bit n: the instruction n + 1 back is an s_getpc_b64
+    let mut getpc = 0u32;
+    while off + 4 <= seg.len() {
+        let Some(s) = rdna2_scan::step(&seg[off..]) else {
+            off += 4;
+            continue;
+        };
+        if s.op.setpc && getpc & 4 != 0 {
+            // where a far jump ends (`resolve_far_jumps`): its target is in the operands
+            return branch_targets_decoded(seg, pc);
+        }
+        getpc = getpc << 1 | s.op.getpc as u32;
+        out.extend(s.branch_target(pc + off as u64));
+        off += s.len;
+    }
+    out
+}
+
+/// `branch_targets` from whole decoded instructions.
+fn branch_targets_decoded(seg: &[u8], pc: u64) -> Vec<u64> {
     let mut insts = Vec::new();
     let mut off = 0usize;
     while off + 4 <= seg.len() {
@@ -390,12 +412,12 @@ pub fn is_data_block(seg: &[u8]) -> bool {
     let mut off = 0usize;
     let (mut words, mut bad) = (0usize, 0usize);
     while off + 4 <= seg.len() {
-        match rdna2::decode(&seg[off..], off as u64) {
-            Ok(d) => {
-                words += d.len / 4;
-                off += d.len;
+        match rdna2_scan::step(&seg[off..]) {
+            Some(s) => {
+                words += s.len / 4;
+                off += s.len;
             }
-            Err(_) => {
+            None => {
                 if off == 0 {
                     return true;
                 }
@@ -478,20 +500,20 @@ pub fn split_segments(code: &[u8]) -> Vec<Segment> {
         }
         let mut ended = false;
         while off + 4 <= code.len() {
-            match rdna2::decode(&code[off..], off as u64) {
-                Ok(d) => {
-                    off += d.len;
-                    if d.inst.flags & rdna2::F_TERMINATOR != 0 && word(off - d.len) == S_ENDPGM {
+            match rdna2_scan::step(&code[off..]) {
+                Some(s) => {
+                    off += s.len;
+                    if s.op.inst.flags & rdna2::F_TERMINATOR != 0 && word(off - s.len) == S_ENDPGM {
                         ended = true;
                         break;
                     }
                     // an ES that continues into its GS: the jump, then only padding
-                    if is_setpc(word(off - d.len)) && (off..code.len()).step_by(4).all(|o| o + 4 > code.len() || matches!(word(o), S_CODE_END | 0)) {
+                    if is_setpc(word(off - s.len)) && (off..code.len()).step_by(4).all(|o| o + 4 > code.len() || matches!(word(o), S_CODE_END | 0)) {
                         ended = true;
                         break;
                     }
                 }
-                Err(_) => off += 4,
+                None => off += 4,
             }
         }
         out.push(Segment { offset: start, len: off.min(code.len()) - start, counted_data: false });
@@ -500,6 +522,44 @@ pub fn split_segments(code: &[u8]) -> Vec<Segment> {
         }
     }
     out
+}
+
+/// Instructions counted by their number (`rdna2::all_instructions`) and variant: the names are
+/// made once per mnemonic (`flush`), not per instruction.
+#[derive(Default)]
+struct InstCounts {
+    by_inst: Vec<[u64; 4]>,
+    instructions: u64,
+    undecoded: u64,
+}
+
+impl InstCounts {
+    const VARIANTS: [rdna2::Variant; 4] = [rdna2::Variant::Plain, rdna2::Variant::Sdwa, rdna2::Variant::Dpp16, rdna2::Variant::Dpp8];
+
+    fn add_code(&mut self, code: &[u8]) {
+        self.by_inst.resize(rdna2::all_instructions().count(), [0; 4]);
+        let mut off = 0usize;
+        while off + 4 <= code.len() {
+            let Some(s) = rdna2_scan::step(&code[off..]) else {
+                self.undecoded += 1;
+                off += 4;
+                continue;
+            };
+            self.instructions += 1;
+            self.by_inst[s.op.index][s.variant as usize] += 1;
+            off += s.len;
+        }
+    }
+
+    fn flush(&self, to: &mut InstStats) {
+        to.instructions += self.instructions;
+        to.undecoded += self.undecoded;
+        for (inst, counts) in rdna2::all_instructions().zip(&self.by_inst) {
+            for (variant, &n) in Self::VARIANTS.into_iter().zip(counts).filter(|(_, &n)| n != 0) {
+                *to.by_mnemonic.entry(rdna2::mnemonic_of(inst, variant)).or_default() += n;
+            }
+        }
+    }
 }
 
 /// Instruction statistics for a set of programs.
@@ -512,28 +572,19 @@ pub struct InstStats {
 
 impl InstStats {
     pub fn add_code(&mut self, code: &[u8]) {
-        let mut off = 0usize;
-        while off + 4 <= code.len() {
-            match rdna2::decode(&code[off..], off as u64) {
-                Ok(d) => {
-                    self.instructions += 1;
-                    *self.by_mnemonic.entry(rdna2::mnemonic(&d)).or_default() += 1;
-                    off += d.len;
-                }
-                Err(_) => {
-                    self.undecoded += 1;
-                    off += 4;
-                }
-            }
-        }
+        let mut counts = InstCounts::default();
+        counts.add_code(code);
+        counts.flush(self);
     }
 
     pub fn add_shader(&mut self, sh: &XboxShader) {
+        let mut counts = InstCounts::default();
         for f in &sh.fssm {
             for p in &f.programs {
-                self.add_code(&f.data[p.offset..p.offset + p.len]);
+                counts.add_code(&f.data[p.offset..p.offset + p.len]);
             }
         }
+        counts.flush(self);
     }
 
     pub fn merge(&mut self, other: &InstStats) {
@@ -1058,5 +1109,187 @@ mod merged_es_tests {
         assert_eq!(segs.len(), 1);
         assert_eq!((segs[0].offset, segs[0].len), (0, 8));
         assert!(is_setpc(0xBE80_2020) && !is_setpc(S_ENDPGM));
+    }
+}
+
+/// `rdna2_scan` against the same walks with `rdna2::decode`, as they were.
+#[cfg(test)]
+mod scan_tests {
+    use super::*;
+    use crate::gpu::rdna2_scan::tests::rng;
+
+    /// (words, undecodable words) of `is_data_block`; instruction statistics
+    fn add_code_decoded(st: &mut InstStats, code: &[u8]) -> (usize, usize) {
+        let (mut words, mut bad, mut off) = (0, 0, 0);
+        while off + 4 <= code.len() {
+            match rdna2::decode(&code[off..], off as u64) {
+                Ok(d) => {
+                    st.instructions += 1;
+                    *st.by_mnemonic.entry(rdna2::mnemonic(&d)).or_default() += 1;
+                    words += d.len / 4;
+                    off += d.len;
+                }
+                Err(_) => {
+                    st.undecoded += 1;
+                    words += 1;
+                    bad += 1;
+                    off += 4;
+                }
+            }
+        }
+        (words, bad)
+    }
+
+    fn split_segments_decoded(code: &[u8]) -> Vec<Segment> {
+        let word = |o: usize| u32::from_le_bytes(code[o..o + 4].try_into().unwrap());
+        let mut out: Vec<Segment> = Vec::new();
+        let mut off = 0usize;
+        loop {
+            while off + 4 <= code.len() && matches!(word(off), S_CODE_END | 0) {
+                off += 4;
+            }
+            if off + 4 > code.len() {
+                return out;
+            }
+            let start = off;
+            let end = start + 4 + 4 * word(start) as usize;
+            if !out.is_empty() && word(start) > 0 && end + 4 <= code.len() && word(end) == S_ENDPGM {
+                out.push(Segment { offset: start, len: end + 4 - start, counted_data: true });
+                off = end + 4;
+                continue;
+            }
+            let mut ended = false;
+            while off + 4 <= code.len() && !ended {
+                match rdna2::decode(&code[off..], off as u64) {
+                    Ok(d) => {
+                        let w = word(off);
+                        off += d.len;
+                        let rest = || (off..code.len()).step_by(4).all(|o| o + 4 > code.len() || matches!(word(o), S_CODE_END | 0));
+                        ended = d.inst.flags & rdna2::F_TERMINATOR != 0 && w == S_ENDPGM || is_setpc(w) && rest();
+                    }
+                    Err(_) => off += 4,
+                }
+            }
+            out.push(Segment { offset: start, len: off.min(code.len()) - start, counted_data: false });
+            if !ended {
+                return out;
+            }
+        }
+    }
+
+    /// Dwords as code has them: instructions of every encoding, branches, program ends, counted
+    /// data, padding, far jumps and jumps that look like one.
+    fn code(r: &mut impl FnMut() -> u64, n: usize) -> Vec<u8> {
+        let mut v = Vec::new();
+        while v.len() < n {
+            let k = r() as u32;
+            match r() % 32 {
+                0 => le(&mut v, S_ENDPGM),
+                1 => le(&mut v, [S_CODE_END, 0][k as usize & 1]),
+                2 => {
+                    le(&mut v, k % 5);
+                    (0..k % 5).for_each(|_| le(&mut v, r() as u32));
+                    le(&mut v, S_ENDPGM);
+                }
+                // s_getpc_b64 s[8:9]; s_add_u32 s8, s8, c; s_addc_u32 s9, s9, 0; (s_nop;) s_setpc_b64 s[8:9]
+                3 => {
+                    for w in [0xBE88_1F00, 0x8008_8008 | (k % 64) << 8, 0x8209_8009] {
+                        le(&mut v, w);
+                    }
+                    if k >> 8 & 1 == 1 {
+                        le(&mut v, 0xBF80_0000);
+                    }
+                    le(&mut v, 0xBE80_2008);
+                }
+                4 => le(&mut v, 0xBE80_2000 | k & 0x7F),
+                5 | 6 => le(&mut v, 0xBF80_0000 | (k % 9 + 2) << 16 | (k >> 8) % 64),
+                7 => le(&mut v, k),
+                8..=15 => le(&mut v, k & 0x7FFF_FFFF),
+                16..=19 => le(&mut v, 0x8000_0000 | k & 0x3FFF_FFFF),
+                _ => {
+                    le(&mut v, 0xC000_0000 | k);
+                    le(&mut v, r() as u32);
+                }
+            }
+        }
+        v
+    }
+
+    fn le(v: &mut Vec<u8>, w: u32) {
+        v.extend_from_slice(&w.to_le_bytes());
+    }
+
+    #[test]
+    fn programs_and_statistics_are_as_decoded() {
+        let mut r = rng();
+        let (mut far, mut data) = (0, 0);
+        for i in 0..3000 {
+            let c = code(&mut r, 8 + i % 600);
+            let c = &c[..c.len() - r() as usize % 4];
+            let segs = split_segments(c);
+            assert_eq!(segs, split_segments_decoded(c));
+            for s in &segs {
+                let seg = &c[s.offset..s.offset + s.len];
+                let targets = branch_targets(seg, s.offset as u64);
+                assert_eq!(targets, branch_targets_decoded(seg, s.offset as u64));
+                let (mut a, mut b) = (InstStats::default(), InstStats::default());
+                a.add_code(seg);
+                let (words, bad) = add_code_decoded(&mut b, seg);
+                assert_eq!((a.instructions, a.undecoded, &a.by_mnemonic), (b.instructions, b.undecoded, &b.by_mnemonic));
+                let first_bad = seg.len() >= 4 && rdna2::decode(seg, 0).is_err();
+                assert_eq!(is_data_block(seg), counted_data_block(seg) || first_bad || bad * 4 >= words.max(1));
+                data += is_data_block(seg) as usize;
+                far += seg.windows(16).step_by(4).filter(|w| w[..4] == 0xBE88_1F00u32.to_le_bytes() && w[12..] == 0xBE80_2008u32.to_le_bytes()).count();
+            }
+        }
+        assert!(data > 100 && far > 100, "{data} data blocks, {far} far jumps");
+        let jump = [0xBE88_1F00u32, 0x8008_A008, 0x8209_8009, 0xBE80_2008];
+        let seg: Vec<u8> = jump.iter().flat_map(|w| w.to_le_bytes()).collect();
+        assert_eq!(branch_targets(&seg, 0x100), vec![0x100 + 4 + 32]);
+    }
+
+    /// `cargo test --release -p xcl --lib scan_tests -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn bench_scan() {
+        let mut r = rng();
+        // straight code: what a program mostly is (an s_endpgm only at its end)
+        let mut c = Vec::new();
+        while c.len() < 4 << 20 {
+            let k = r();
+            let w = match k % 8 {
+                0..=2 => 0x0600_0100 | (k >> 8) as u32 & 0x01FF_FFFF,  // VOP2 v_add_f32
+                3 => 0x7E00_0300 | (k >> 8) as u32 & 0x00FE_00FF,      // VOP1 v_mov_b32
+                4 => 0x8780_0000 | (k >> 8) as u32 & 0x007F_7F7F,      // SOP2 s_and_b64
+                5 => 0xBF8C_0000 | (k >> 8) as u32 & 0xFFFF,           // s_waitcnt
+                6 => 0xD54B_0000 | (k >> 8) as u32 & 0xFF,             // VOP3 v_fma_f32
+                _ => 0xF080_0F08 | (k >> 8) as u32 & 0x1000,           // MIMG image_sample
+            };
+            le(&mut c, w);
+            if k % 8 >= 6 {
+                le(&mut c, 0x0402_0100 | (k >> 32) as u32 & 0x03FF_FFFF);
+            }
+        }
+        le(&mut c, S_ENDPGM);
+        let mut n = InstStats::default();
+        n.add_code(&c);
+        let n = n.instructions as f64;
+        let best = |f: &mut dyn FnMut()| {
+            (0..9).fold(f64::MAX, |m, _| {
+                let t = std::time::Instant::now();
+                f();
+                m.min(t.elapsed().as_secs_f64() * 1e9 / n)
+            })
+        };
+        let row = |what: &str, old: f64, new: f64| println!("{what}: {old:.1} -> {new:.2} ns / instruction ({:.0}x)", old / new);
+        row("split_segments", best(&mut || assert_eq!(split_segments_decoded(&c).len(), 1)), best(&mut || assert_eq!(split_segments(&c).len(), 1)));
+        let targets = |f: fn(&[u8], u64) -> Vec<u64>| assert!(f(&c, 0).is_empty());
+        row("branch_targets", best(&mut || targets(branch_targets_decoded)), best(&mut || targets(branch_targets)));
+        let stats = |f: &dyn Fn(&mut InstStats)| {
+            let mut st = InstStats::default();
+            f(&mut st);
+            assert_eq!(st.instructions as f64, n);
+        };
+        row("instruction statistics", best(&mut || stats(&|st| assert_eq!(add_code_decoded(st, &c).1, 0))), best(&mut || stats(&|st| st.add_code(&c))));
     }
 }
