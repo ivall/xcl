@@ -6346,7 +6346,10 @@ bool xcl_x_meet() {
         } else {
             [loop] for (uint n = 0u; ; n++) {
                 uint c;
-                InterlockedAdd(XCL_XC(other), 0u, c);
+                // the poll is a compare-exchange that never changes the word: Mesa's NIR turns an
+                // add of 0 into a load and hoists it out of the loop (#847), so the wave would
+                // never see the other half arrive and always run to the bound
+                InterlockedCompareExchange(XCL_XC(other), 0u, 0u, c);
                 if ((c & XCL_X_FAIL) != 0u) { ok = 0u; break; }
                 if (c >= need) break;
                 if (n >= (1u << 20)) {
@@ -6442,9 +6445,10 @@ void xcl_s_barrier() {
         uint _next = ((_gen + 1u) & 0xFFFFFu) << 12;
         [loop] for (uint _n = 0u; ; _n++) {
             uint _s, _alive;
-            InterlockedAdd(XCL_BAR_STATE, 0u, _s);
+            // compare-exchanges that change nothing, not adds of 0 (see `xcl_x_meet`)
+            InterlockedCompareExchange(XCL_BAR_STATE, 0u, 0u, _s);
             if ((_s >> 12) != _gen) break;
-            InterlockedAdd(XCL_BAR_ALIVE, 0u, _alive);
+            InterlockedCompareExchange(XCL_BAR_ALIVE, 0u, 0u, _alive);
             if ((int)_alive <= 0 || (_s & 0xFFFu) >= _alive) {
                 uint _orig;
                 InterlockedCompareExchange(XCL_BAR_STATE, _s, _next, _orig);
