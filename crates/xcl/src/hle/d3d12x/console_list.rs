@@ -941,8 +941,12 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                 let off = ((w0 & 0x3FF) >> 2) as usize;
                 let n = ((w0 >> 16) & 0x3FFF) as usize + 1;
                 match layout.as_ref().and_then(|l| l.params.get(i).copied()) {
-                    Some(Param::Constants { at: o, .. }) => {
+                    Some(Param::Constants { at: o, count }) => {
+                        let limit = count as usize;
                         for k in 0..n {
+                            if off + k >= limit {
+                                break;
+                            }
                             let d = (o as usize) + 4 * (off + k);
                             if let Some(t) = table.get_mut(d..d + 4) {
                                 t.copy_from_slice(&get(1 + k).to_le_bytes());

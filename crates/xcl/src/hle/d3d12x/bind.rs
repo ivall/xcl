@@ -511,14 +511,25 @@ pub(crate) fn remove_state_for_test(list: *mut c_void) {
 fn put_in(list: *mut c_void, gfx: bool, i: u32, offset: u32, bytes: &[u8]) {
     with(list, |s| {
         let (layout, args) = if gfx { (&s.layout_gfx, &mut s.args_gfx) } else { (&s.layout, &mut s.args) };
-        let Some(at) = layout.as_ref().and_then(|l| l.params.get(i as usize)).map(|p| match *p {
-            Param::Constants { at, .. } => at as usize + 4 * offset as usize,
-            Param::Descriptor { at } | Param::Table { at } => at as usize,
+        let Some((at, limit)) = layout.as_ref().and_then(|l| l.params.get(i as usize)).and_then(|p| match *p {
+            Param::Constants { at, count } => {
+                let end = (at as usize).checked_add((count as usize).checked_mul(4)?)?;
+                let start = (at as usize).checked_add((offset as usize).checked_mul(4)?)?;
+                Some((start, end))
+            }
+            Param::Descriptor { at } => Some((at as usize, (at as usize).checked_add(8)?)),
+            Param::Table { at } => Some((at as usize, (at as usize).checked_add(4)?)),
         }) else {
             return;
         };
-        if let Some(t) = args.get_mut(at..at + bytes.len()) {
-            t.copy_from_slice(bytes);
+        let Some(end) = at.checked_add(bytes.len()) else {
+            return;
+        };
+        let write_end = end.min(limit);
+        if write_end > at {
+            if let Some(t) = args.get_mut(at..write_end) {
+                t.copy_from_slice(&bytes[..write_end - at]);
+            }
         }
     })
 }
@@ -2179,6 +2190,42 @@ void main(uint t : SV_GroupIndex) {
             0, 0, 4,           // shader_reg=0, reg_space=0, num_32bit_values=4
         ];
         words.iter().flat_map(|w| w.to_le_bytes()).collect()
+    }
+
+    #[test]
+    fn out_of_bounds_root_constants_do_not_clobber_adjacent_parameter() {
+        // Param 0: Constants(count=2) -> bytes 0..8; Param 1: Descriptor (CBV=2) -> bytes 8..16.
+        let words: [u32; 18] = [
+            2, 2, 24, 0, 0, 0,
+            1, 0, 48, // param 0: Constants
+            2, 0, 60, // param 1: CBV Descriptor
+            0, 0, 2,  // param 0 payload: reg=0, space=0, count=2
+            0, 0, 0,  // param 1 payload
+        ];
+        let blob: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let list = 0x7100_00F1usize as *mut c_void;
+        let rs = 0x7100_00F2usize;
+        console_list::note_root_signature(rs, &blob);
+        unsafe {
+            set_compute_root_signature(list, rs as *mut c_void);
+            set_compute_root_descriptor(list, 1, 0x1122_3344_5566_7788);
+            // Offset 2 is past count=2: must not overwrite param 1 at bytes 8..12.
+            set_compute_root_constant(list, 0, 0xDEAD_BEEF, 2);
+            // Multi-constant write starting at offset 1 with 3 dwords: only offset 1 fits.
+            let vals = [0xAAAA_BBBBu32, 0xCCCC_DDDDu32, 0xEEEE_FFFFu32];
+            set_compute_root_constants(list, 0, vals.len() as u32, vals.as_ptr(), 1);
+            // Overflowing offset must not panic.
+            set_compute_root_constant(list, 0, 0x9999_9999, u32::MAX);
+        }
+        let (_, _, args, _, _) = reset_state_for_test(list);
+        remove_state_for_test(list);
+        assert_eq!(&args[0..4], &0u32.to_le_bytes());
+        assert_eq!(&args[4..8], &0xAAAA_BBBBu32.to_le_bytes());
+        assert_eq!(
+            &args[8..16],
+            &0x1122_3344_5566_7788u64.to_le_bytes(),
+            "out-of-bounds root constant overwrote adjacent root descriptor"
+        );
     }
 
     #[test]
