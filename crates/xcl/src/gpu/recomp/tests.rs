@@ -9416,6 +9416,50 @@ fn gpu_sdwa_f16_inline_constants() {
 }
 
 #[test]
+fn gpu_buffer_load_format_d16_x_and_xyz_preserve_upper_half() {
+    if !gpu_ready() {
+        return;
+    }
+    let ident = 4 | 5 << 3 | 6 << 6 | 7 << 9;
+    // Format 11 = 16_UINT, format 69 = 16_16_16_16_UINT
+    let vs = |base: u32, records: u32, fmt: u32| [base, 0, records, ident | fmt << 12];
+    let p = prog(&[
+        // in-bounds D16_X -> low 16 bits = 0x1234, high 16 bits preserved (0xDEAD)
+        ("BUFFER_LOAD_FORMAT_D16_X", "ENC_MUBUF", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SOFFSET", 128), ("OFFEN", 1)], None),
+        // OOB D16_X -> low 16 bits = 0x0000, high 16 bits preserved (0xCAFE)
+        ("BUFFER_LOAD_FORMAT_D16_X", "ENC_MUBUF", &[("VDATA", 11), ("VADDR", 1), ("SRSRC", 4), ("SOFFSET", 128), ("OFFEN", 1)], None),
+        // in-bounds D16_XYZ -> v12 = (0x2222 << 16) | 0x1111, v13 low = 0x3333, v13 high preserved (0xBEEF)
+        ("BUFFER_LOAD_FORMAT_D16_XYZ", "ENC_MUBUF", &[("VDATA", 12), ("VADDR", 0), ("SRSRC", 5), ("SOFFSET", 128), ("OFFEN", 1)], None),
+        // OOB D16_XYZ -> v14 = 0, v15 low = 0, v15 high preserved (0xFACE)
+        ("BUFFER_LOAD_FORMAT_D16_XYZ", "ENC_MUBUF", &[("VDATA", 14), ("VADDR", 1), ("SRSRC", 5), ("SOFFSET", 128), ("OFFEN", 1)], None),
+    ]);
+    let mut st = KernelState::default();
+    st.sgpr[16..20].copy_from_slice(&vs(0x100, 16, 11));
+    st.sgpr[20..24].copy_from_slice(&vs(0x110, 16, 69));
+    for r in st.vgpr.iter_mut() {
+        r[0] = 0;  // in-bounds
+        r[1] = 64; // OOB
+        r[10] = 0xDEAD_FFFF;
+        r[11] = 0xCAFE_FFFF;
+        r[12] = 0x9999_9999;
+        r[13] = 0xBEEF_FFFF;
+        r[14] = 0x8888_8888;
+        r[15] = 0xFACE_FFFF;
+    }
+    let mut mem = vec![0u32; 0x80];
+    mem[0x100 / 4] = 0x0000_1234;
+    mem[0x110 / 4] = 0x2222_1111;
+    mem[0x114 / 4] = 0x4444_3333;
+    let r = runner::run_code(&p, &st, &mem).unwrap();
+    assert_eq!(r.vgpr[0][10], 0xDEAD_1234, "in-bounds D16_X preserves upper 16 bits");
+    assert_eq!(r.vgpr[0][11], 0xCAFE_0000, "OOB D16_X zeroes low 16 bits and preserves upper 16 bits");
+    assert_eq!(r.vgpr[0][12], 0x2222_1111, "in-bounds D16_XYZ XY");
+    assert_eq!(r.vgpr[0][13], 0xBEEF_3333, "in-bounds D16_XYZ preserves upper 16 bits of Z VGPR");
+    assert_eq!(r.vgpr[0][14], 0x0000_0000, "OOB D16_XYZ zeroes XY");
+    assert_eq!(r.vgpr[0][15], 0xFACE_0000, "OOB D16_XYZ zeroes Z and preserves upper 16 bits");
+}
+
+#[test]
 fn fspx_compute_user_sgprs_from_rsrc2() {
     use crate::gpu::xbox::tests::container;
 
