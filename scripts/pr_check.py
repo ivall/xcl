@@ -155,7 +155,9 @@ def check(body, head, files, is_main_ancestor, *, test_only=False):
                     problems.append("the main and PR regression runs are not of the same title for the same time")
                 else:
                     pf, mf = number(pr.get("frames shown")), number(m.get("frames shown"))
-                    if mf and (pf is None or pf < FRAMES_KEPT * mf):
+                    if mf == 0 and pf == 0:
+                        problems.append("both regression runs show zero frames; rerun them with a title that presents frames")
+                    elif mf and (pf is None or pf < FRAMES_KEPT * mf):
                         problems.append(f"the PR's run shows fewer frames than main's ({pf} against {mf})")
                     pc, mc = number(pr.get("peak commit")), number(m.get("peak commit"))
                     if pc and mc and pc > COMMIT_GROWTH * mc:
