@@ -47,8 +47,11 @@ pub fn parse_ret(s: &str) -> Option<u64> {
     if let Some(h) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
         return u64::from_str_radix(h, 16).ok();
     }
-    if let Some(n) = t.strip_prefix('-') {
-        return n.parse::<u64>().ok().map(|v| (v as i64).wrapping_neg() as u64);
+    // A negative value is a console return (`-1` for `0xFFFF_FFFF`). It is taken as an i64 and
+    // refused when it does not fit one: a magnitude past i64::MIN used to be negated as u64
+    // and came back positive (`-9223372036854775809` → `0x7FFF_FFFF_FFFF_FFFF`).
+    if let Ok(v) = t.parse::<i64>() {
+        return Some(v as u64);
     }
     t.parse::<u64>().ok()
 }
@@ -363,6 +366,18 @@ mod tests {
         assert_eq!(parse_ret("-1"), Some(u64::MAX));
         assert_eq!(parse_ret("7"), Some(7));
         assert_eq!(parse_ret("bogus"), None);
+    }
+
+    #[test]
+    fn a_negative_return_spec_is_not_wrapped_around_i64_min() {
+        assert_eq!(parse_ret(" -1 "), Some(u64::MAX));
+        assert_eq!(parse_ret("-9223372036854775808"), Some(1 << 63), "i64::MIN itself is a return value");
+        assert_eq!(parse_ret("-2147483649"), Some((-2147483649i64) as u64));
+        assert_eq!(parse_ret("-9223372036854775809"), None, "below i64::MIN: refused, not negated as u64");
+        assert_eq!(parse_ret("-18446744073709551615"), None);
+        assert_eq!(parse_ret("-+1"), None, "a sign after the minus is not a number");
+        assert_eq!(parse_ret("-"), None);
+        assert_eq!(parse_ret("18446744073709551615"), Some(u64::MAX), "a whole u64 is still accepted");
     }
 
     #[test]
