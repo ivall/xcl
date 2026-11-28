@@ -1177,6 +1177,14 @@ unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
     }
     let public = iface.methods.len();
     let m0 = module_of(*ot);
+    // a host D3D12 whose code is in no PE module (Apple's D3DMetal under Wine)
+    if m0 == 0 {
+        static ONCE: AtomicBool = AtomicBool::new(false);
+        if !ONCE.swap(true, Ordering::Relaxed) {
+            crate::gpu::shader::NATIVE_HOST_MEMORY.store(true, Ordering::Relaxed);
+            crate::xlog_warn!("D3D12.X: the host's D3D12 is not a PE module (a native host: D3DMetal)");
+        }
+    }
     let mut scanned = 0;
     while scanned < public + MAX_SCAN && module_of(*ot.add(scanned)) == m0 {
         scanned += 1;
@@ -2643,7 +2651,36 @@ unsafe extern "system" fn dev_create_dsv_x(this: *mut c_void, res: *mut c_void, 
     if copy.is_none() {
         copy = ID3D12Resource::from_raw_borrowed(&res).and_then(|r| default_dsv(&r.GetDesc()));
     }
+    // a native host: the resource's own depth family whatever the view names (Metal ends the
+    // process on a view of another family, `device_x::depth_only`)
+    if let (Some(c), Some(r)) = (copy.as_mut(), ID3D12Resource::from_raw_borrowed(&res)) {
+        let rd = r.GetDesc();
+        let made = super::device_x::pc_depth_view_format(rd.Format.0 as u32, c.Format.0 as u32);
+        trace_depth_view("depth", res, &rd, desc.as_ref().map_or(0, |d| d.Format.0), made as i32);
+        c.Format = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(made as i32);
+    }
     f(this, res, copy.as_ref().map_or(desc, |c| c as *const _), cpu)
+}
+
+/// `XCL_TRACE_DEPTH_VIEWS=1`: every view made of a resource in a depth format family (the
+/// format asked for, the one made, the resource) – flushed line by line, since a view the host
+/// cannot make ends the process there (D3DMetal: Metal's texture assertion).
+unsafe fn trace_depth_view(kind: &str, res: *mut c_void, rd: &D3D12_RESOURCE_DESC, asked: i32, made: i32) {
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !matches!(rd.Format.0, 19..=22 | 39..=41 | 44..=47 | 53..=56) || !*ON.get_or_init(|| std::env::var_os("XCL_TRACE_DEPTH_VIEWS").is_some()) {
+        return;
+    }
+    crate::xlog_info!(
+        "depth views: {kind} view format {asked} → {made} of {res:p} (format {}, {}x{}x{}, {} mips, {} samples, flags {:#x})",
+        rd.Format.0,
+        rd.Width,
+        rd.Height,
+        rd.DepthOrArraySize,
+        rd.MipLevels,
+        rd.SampleDesc.Count,
+        rd.Flags.0
+    );
+    crate::log::flush();
 }
 
 /// The view a DSV without a description has, for a depth buffer `pc_resource_desc` made
@@ -2740,6 +2777,9 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
     // a D16S8 buffer …: an invalid call, the device removed)
     if let Some(v) = ID3D12Resource::from_raw_borrowed(&res).and_then(|r| pc_srv(&r.GetDesc(), copy.as_ref())) {
         copy = Some(v);
+    }
+    if let Some(r) = ID3D12Resource::from_raw_borrowed(&res) {
+        trace_depth_view("shader", res, &r.GetDesc(), desc.as_ref().map_or(0, |d| d.Format.0), copy.as_ref().map_or(0, |c| c.Format.0));
     }
     let desc = copy.as_ref().map_or(desc, |c| c as *const _);
     let Some(slot) = super::console_heap::slot(cpu) else { return f(this, res, desc, cpu) };
@@ -3126,8 +3166,10 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
     let mut copy = desc.as_ref().copied();
     if let Some(c) = copy.as_mut() {
         if let Some(r) = ID3D12Resource::from_raw_borrowed(&res) {
-            let rf = r.GetDesc().Format.0 as u32;
-            c.Format = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(super::device_x::pc_shader_view_format(rf, c.Format.0 as u32) as i32);
+            let rd = r.GetDesc();
+            let asked = c.Format.0;
+            c.Format = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(super::device_x::pc_shader_view_format(rd.Format.0 as u32, c.Format.0 as u32) as i32);
+            trace_depth_view("unordered access", res, &rd, asked, c.Format.0);
         } else {
             c.Format = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(super::device_x::pc_view_format(c.Format.0 as u32) as i32);
             if c.Format == windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_UNKNOWN && view_dim_to_image_type(c.ViewDimension.0).is_some() {
@@ -10985,6 +11027,7 @@ mod console_format_query_tests {
 
     #[test]
     fn console_formats_are_asked_as_the_pcs() {
+        let _pc = crate::hle::d3d12x::device_x::depth_only_for_test(false);
         for (console, pc) in [(116u32, 10u32), (117, 10), (118, 45), (119, 46), (120, 47)] {
             let mut d = [0u32; 3];
             d[0] = console;
