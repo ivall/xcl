@@ -84,6 +84,18 @@ class SmokeBlockTests(unittest.TestCase):
                 "```\nxcl-smoke v1\ncommit: 1234567890\ntitle: G\n```\n")
         self.assertEqual(["1111111aaaa", "1234567890"], [b["commit"] for b in smoke_blocks(body)])
 
+    def test_v2_blocks_with_counter_lines_parse_and_pass(self):
+        run = ("title: G\nseconds: 150\nframes shown: 1600\npresents per 2 s (last 3): 28 30 29\n"
+               "draws per 2 s (last 3): 120 130 125\ndevice removals: 0\ncrashes: 0\npeak commit: 34000 MB\n"
+               "video memory peak: 14090 MB local, 4903 MB non-local\ntranslated pipelines: 1786\n"
+               "refused pipelines: 40\nfallback pipelines: 0\nfailed pipelines: 0\n")
+        body = ("```\nxcl-smoke v2\ncommit: 1111111aaaa\n" + run + "\n"
+                "xcl-smoke v2\ncommit: 1234567890\n" + run + "```\n")
+        blocks = smoke_blocks(body)
+        self.assertEqual(["1111111aaaa", "1234567890"], [b["commit"] for b in blocks])
+        self.assertEqual("40", blocks[0]["refused pipelines"])
+        self.assertEqual([], check(BODY + body, HEAD, [changed("crates/xcl/src/hle/d3d12x/vram.rs")], lambda sha: sha == "1111111aaaa"))
+
     def smoke_problems(self, main_run, pr_run):
         body = ("```\nxcl-smoke v1\ncommit: 1111111aaaa\n" + main_run + "```\n"
                 "```\nxcl-smoke v1\ncommit: 1234567890\n" + pr_run + "```\n")

@@ -82,15 +82,25 @@ $commits = [regex]::Matches($text, 'memory: (\d+) MB committed') | ForEach-Objec
 $peak = if ($commits) { ($commits | Measure-Object -Maximum).Maximum } else { 'n/a' }
 $removals = ([regex]::Matches($text, 'device removed')).Count
 $crashes = ([regex]::Matches($text, 'unhandled exception|process ends with status')).Count
-# the adapter XCL ran on (report.json next to the log; XCL removes the last run's at start),
-# not the first one Windows lists – on a machine with an iGPU that is often not the one used
-$gpu = $null
+# report.json next to the log (XCL removes the last run's at start): the adapter XCL ran on –
+# not the first one Windows lists, which on an iGPU machine is often not the one used – and the pipeline counters
+$rep = $null
 $report = Join-Path (Split-Path $log -Parent) 'report.json'
-if (Test-Path $report) {
-    try { $gpu = ((Get-Content $report -Raw -Encoding utf8 | ConvertFrom-Json).d3d12.adapter -replace '\s*\([^()]*VRAM\)$', '') } catch { }
-}
+if (Test-Path $report) { try { $rep = Get-Content $report -Raw -Encoding utf8 | ConvertFrom-Json } catch { } }
+$gpu = if ($rep) { $rep.d3d12.adapter -replace '\s*\([^()]*VRAM\)$', '' } else { $null }
 if (-not $gpu) { $gpu = (Get-CimInstance Win32_VideoController | Where-Object { $_.Name -notmatch 'Basic' } | Select-Object -First 1).Name }
 $code = if ($timedOut) { 'killed (no exit)' } else { '0x{0:x}' -f $p.ExitCode }
+# counts, not speed: draws keep the screen shape, the pipeline counters say what the run refused
+$draws = [regex]::Matches($text, 'activity \(2 s\): \d+ presents, \d+ submits, (\d+) draws') | ForEach-Object { [int]$_.Groups[1].Value }
+$lastDraws = if ($draws) { ($draws | Select-Object -Last 3) -join ' ' } else { 'n/a' }
+$d = if ($rep) { $rep.d3d12 } else { $null }
+$translated = if ($d) { $d.translated_pipelines } else { 'n/a' }
+$refused = if ($d -and $d.translation_errors) { @($d.translation_errors).Count } else { 0 }
+$fallback = if ($d) { $d.fallback_pipelines } else { 'n/a' }
+$failed = if ($d) { $d.failed_pipelines } else { 'n/a' }
+$vm = [regex]::Matches($text, 'video memory (\d+) MB local, (\d+) MB non-local')
+$vlocal = if ($vm) { ($vm | ForEach-Object { [int]$_.Groups[1].Value } | Measure-Object -Maximum).Maximum } else { 'n/a' }
+$vnon = if ($vm) { ($vm | ForEach-Object { [int]$_.Groups[2].Value } | Measure-Object -Maximum).Maximum } else { 'n/a' }
 
 if ($OutDir) {
     if (-not (Test-Path $OutDir)) {
@@ -124,7 +134,7 @@ if ($OutDir) {
 
 @"
 ``````
-xcl-smoke v1
+xcl-smoke v2
 commit: $commit$(if ($dirty) { ' (uncommitted changes)' })
 gpu: $gpu
 title: $Title
@@ -132,8 +142,14 @@ seconds: $Seconds
 exit: $code
 frames shown: $frames
 presents per 2 s (last 3): $lastPresents
+draws per 2 s (last 3): $lastDraws
 device removals: $removals
 crashes: $crashes
 peak commit: $peak MB
+video memory peak: $vlocal MB local, $vnon MB non-local
+translated pipelines: $translated
+refused pipelines: $refused
+fallback pipelines: $fallback
+failed pipelines: $failed
 ``````
 "@

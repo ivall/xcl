@@ -40,10 +40,10 @@ SMOKE_NUMBERS = ("seconds", "frames shown")
 
 
 def smoke_blocks(body):
-    """The `xcl-smoke v1` blocks of `body`: each a dict of its `key: value` lines. A block ends at
-    a code fence or at the next block's header (both blocks pasted in one fence)."""
+    """The `xcl-smoke v1`/`v2` blocks of `body`: each a dict of its `key: value` lines. A block
+    ends at a code fence or at the next block's header (both blocks pasted in one fence)."""
     out = []
-    for m in re.finditer(r"xcl-smoke v1\s*\n(.*?)(?=xcl-smoke v1|```|\Z)", body, re.S):
+    for m in re.finditer(r"xcl-smoke v[12]\s*\n(.*?)(?=xcl-smoke v[12]|```|\Z)", body, re.S):
         block = {}
         for line in m.group(1).splitlines():
             k, sep, v = line.partition(":")
