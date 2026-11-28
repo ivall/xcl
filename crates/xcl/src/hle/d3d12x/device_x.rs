@@ -1151,6 +1151,38 @@ fn note_alias(va: usize, x: &[u8; 0x38]) {
     }
 }
 
+/// The size of a texture (`x`: the console's desc) in title memory: XG's, or for a 3-D texture
+/// XG does not lay out (render targets: a retail title's 33x33x33 RGBA16F colour LUTs, 512 KiB
+/// apart) the bytes of its texels, which no console layout of them is smaller than. Without a
+/// size, `vram` gave such a texture every tile of the PC texture as a page at its address (18 for
+/// that LUT), so neighbouring LUTs shared 10 pages and overwrote each other's rows.
+fn console_bytes(x: &[u8; 0x38]) -> Option<u64> {
+    crate::hle::xg::Texture::new(x).ok().map(|t| t.size()).filter(|&s| s != u64::MAX && s != 0).or_else(|| volume_texel_bytes(x))
+}
+
+/// The bytes of the texels of every level of a 3-D texture (`x`: the console's desc); None for
+/// other dimensions and formats `xg::element` does not know.
+fn volume_texel_bytes(x: &[u8; 0x38]) -> Option<u64> {
+    let u = |o: usize| u32::from_le_bytes(x[o..o + 4].try_into().unwrap());
+    let w16 = |o: usize| u16::from_le_bytes(x[o..o + 2].try_into().unwrap()) as u64;
+    if u(0) != D3D12_RESOURCE_DIMENSION_TEXTURE3D.0 as u32 {
+        return None;
+    }
+    let (width, height, depth, mips) = (u64::from_le_bytes(x[0x10..0x18].try_into().unwrap()), u(0x18) as u64, w16(0x1C), w16(0x1E));
+    if width == 0 || height == 0 || depth == 0 {
+        return None;
+    }
+    let (e, side) = crate::hle::xg::element(u(0x20))?;
+    let mips = if mips == 0 { 64 - width.max(height).max(depth).leading_zeros() as u64 } else { mips };
+    let mut bytes = 0u64;
+    for i in 0..mips.min(16) {
+        let level = |n: u64| (n >> i).max(1);
+        let texels = level(width).div_ceil(side as u64).checked_mul(level(height).div_ceil(side as u64))?.checked_mul(level(depth))?;
+        bytes = bytes.checked_add(texels.checked_mul(1 << e)?)?;
+    }
+    Some(bytes)
+}
+
 /// device #44 CreatePlacedResourceX(address, desc, initial state, clear value, riid, resource):
 /// a resource in title memory. A buffer at a 64 KiB-aligned address in unified memory is that
 /// memory (placed in its UMA heap); a texture gets a PC texture kept in step with the memory
@@ -1193,7 +1225,7 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
     let mut placed_hr = None;
     if !buffer {
         let pc = std::ptr::read_unaligned(d.as_ptr() as *const D3D12_RESOURCE_DESC);
-        let console_bytes = crate::hle::xg::Texture::new(&x).ok().map(|t| t.size()).filter(|&s| s != u64::MAX && s != 0);
+        let console_bytes = console_bytes(&x);
         if super::vram::gpu_owned(flags) {
             if let Some(hr) = super::vram::place(this, va as usize, &pc, state, clear, console_bytes, riid, ppv) {
                 if hr >= 0 && !(*ppv).is_null() {
@@ -1378,6 +1410,37 @@ mod tests {
         assert_eq!(pc_initial_state(0x2, 0x20), 0x20); // depth read: as it is
         assert_eq!(pc_initial_state(0x2, 0x10_0000), 0);
         assert_eq!(pc_initial_state(0, 0x10_0004), 0x4);
+    }
+
+    /// A retail title's 33x33x33 RGBA16F colour LUT targets (render target + UAV), 512 KiB apart:
+    /// XG does not lay out 3-D render targets, so each is taken at its texels' bytes, and of the
+    /// PC texture's 18 tiles no page of one is a page of the next. A sampled 3-D texture keeps
+    /// XG's size.
+    #[test]
+    fn volume_targets_xg_does_not_lay_out_keep_to_their_texels() {
+        let volume = |flags: u32, mips: u16| {
+            let mut x = [0u8; 0x38];
+            x[0..4].copy_from_slice(&4u32.to_le_bytes()); // texture 3D
+            x[0x10..0x18].copy_from_slice(&33u64.to_le_bytes());
+            x[0x18..0x1C].copy_from_slice(&33u32.to_le_bytes());
+            x[0x1C..0x1E].copy_from_slice(&33u16.to_le_bytes());
+            x[0x1E..0x20].copy_from_slice(&mips.to_le_bytes());
+            x[0x20..0x24].copy_from_slice(&10u32.to_le_bytes()); // R16G16B16A16_FLOAT
+            x[0x24..0x28].copy_from_slice(&1u32.to_le_bytes());
+            x[0x30..0x34].copy_from_slice(&flags.to_le_bytes());
+            x
+        };
+        let lut = volume(0x5, 1);
+        assert!(crate::hle::xg::Texture::new(&lut).is_err());
+        assert_eq!(console_bytes(&lut), Some(33 * 33 * 33 * 8));
+        let (a, b) = (0x15_1c8a_0000usize, 0x15_1c92_0000usize);
+        let (first_a, n_a) = super::super::vram::owned_pages(a, console_bytes(&lut), 18).unwrap();
+        let (first_b, _) = super::super::vram::owned_pages(b, console_bytes(&lut), 18).unwrap();
+        assert!(first_a + n_a * 0x1_0000 <= first_b, "{first_a:#x} + {n_a} pages reach {first_b:#x}");
+        // every level: 33^3, 16^3, ... 1 texels
+        assert_eq!(console_bytes(&volume(0x5, 0)), Some((33 * 33 * 33 + 16 * 16 * 16 + 8 * 8 * 8 + 4 * 4 * 4 + 2 * 2 * 2 + 1) * 8));
+        let sampled = volume(0, 1);
+        assert_eq!(console_bytes(&sampled), Some(crate::hle::xg::Texture::new(&sampled).unwrap().size()));
     }
 
     /// GPU: a 256x256 D16 depth buffer the console creates for unordered access too, in

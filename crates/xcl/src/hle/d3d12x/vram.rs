@@ -1952,7 +1952,7 @@ fn heap_ranges_trimmed(heap: u32, tiles: &[Tile]) -> Vec<(bool, u32, u32)> {
 /// 64 KiB page boundaries `P` with `va <= P < va + bytes`, capped at `total` tiles:
 /// `(first_page, count)`. Because every `P` lies strictly inside `[va, va + bytes)`, two
 /// non-overlapping ranges never share a page here even when `va` is only 4 KiB aligned.
-fn owned_pages(va: usize, console_bytes: Option<u64>, total: usize) -> Option<(usize, usize)> {
+pub(super) fn owned_pages(va: usize, console_bytes: Option<u64>, total: usize) -> Option<(usize, usize)> {
     match console_bytes {
         Some(b) => {
             let bytes = usize::try_from(b).ok()?;
