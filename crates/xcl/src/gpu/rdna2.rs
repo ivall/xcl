@@ -1049,6 +1049,12 @@ mod tests {
     }
 
     #[test]
+    fn console_madak_f32_disassembles() {
+        let d = decode(&[0x02, 0x07, 0x02, 0x42, 0x00, 0x00, 0x80, 0x3f], 0).unwrap();
+        assert_eq!(format(&d), "v_madak_f32 v1, v2, v3, 0x3f800000");
+    }
+
+    #[test]
     fn truncated_and_unknown() {
         assert_eq!(decode(&[0x01, 0x02], 0).err(), Some(DecodeError::Truncated));
         assert_eq!(decode(&[0xff, 0x03, 0x80, 0xbe], 0).err(), Some(DecodeError::Truncated));
