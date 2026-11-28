@@ -4349,7 +4349,7 @@ impl Em {
         }
         let act = self.act();
         if x2 {
-            return self.atomic64(op, &format!("{t}_a"), vdata, vdata + 2, f("GLC") == 1, vdata, &format!("and({act}, {t}_ok)"));
+            return self.atomic64(op, &format!("{t}_a"), vdata, vdata + 2, f("GLC") == 1, vdata, &act, Some(&format!("{t}_ok")));
         }
         let (v, cmp) = (self.vreg(vdata), self.vreg(vdata + 1));
         let body = rmw32(op, &At::Mem(format!("{t}_a")), &v, &cmp, &format!("{t}_old"), &t).ok_or("buffer_atomic")?;
@@ -4364,16 +4364,20 @@ impl Em {
     /// A 64-bit atomic (`_x2`) at byte address `a` of the flat memory; data in VGPRs
     /// `data`, `data + 1` (compare value of cmpswap at `cmp`); the old value to `dst` (GLC).
     #[allow(clippy::too_many_arguments)]
-    fn atomic64(&mut self, op: &str, a: &str, data: u64, cmp: u64, glc: bool, dst: u64, active: &str) -> Result<(), &'static str> {
+    fn atomic64(&mut self, op: &str, a: &str, data: u64, cmp: u64, glc: bool, dst: u64, act: &str, ok: Option<&str>) -> Result<(), &'static str> {
         let t = self.t();
         let (lo, hi) = (self.vreg(data), self.vreg(data + 1));
         let (clo, chi) = (self.vreg(cmp), self.vreg(cmp + 1));
         self.line(&format!("uint64_t {t}_v = (uint64_t){lo} | ((uint64_t){hi} << 32); uint64_t {t}_cmp = (uint64_t){clo} | ((uint64_t){chi} << 32); uint64_t {t}_old = 0;"));
         let body = rmw64(op, a, &format!("{t}_v"), &format!("{t}_cmp"), &format!("{t}_old"), &t).ok_or("atomic 64")?;
-        self.line(&format!("if ({active}) {{ {body} }}"));
+        let mem_active = match ok {
+            Some(ok) => format!("and({act}, {ok})"),
+            None => act.to_string(),
+        };
+        self.line(&format!("if ({mem_active}) {{ {body} }}"));
         if glc {
             let (r0, r1) = (self.vreg(dst), self.vreg(dst + 1));
-            self.line(&format!("if ({active}) {{ {r0} = (uint){t}_old; {r1} = (uint)({t}_old >> 32); }}"));
+            self.line(&format!("if ({act}) {{ {r0} = (uint){t}_old; {r1} = (uint)({t}_old >> 32); }}"));
         }
         Ok(())
     }
@@ -4542,7 +4546,7 @@ impl Em {
         let act = self.act();
         if x2 {
             let data = f("DATA");
-            return self.atomic64(op, &format!("{t}_a"), data, data + 2, f("GLC") == 1, f("VDST"), &act);
+            return self.atomic64(op, &format!("{t}_a"), data, data + 2, f("GLC") == 1, f("VDST"), &act, None);
         }
         let v = self.vreg(f("DATA"));
         self.line(&format!("uint {t}_old = 0u;"));

@@ -9416,6 +9416,39 @@ fn gpu_sdwa_f16_inline_constants() {
 }
 
 #[test]
+fn gpu_buffer_atomic_x2_oob_glc_zeroes_vdata() {
+    if !gpu_ready() {
+        return;
+    }
+    let p = prog(&[
+        // Mask EXEC to lanes 0..16 so lane 16 is an inactive OOB control
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 255)], Some(0x0000_FFFF)),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 127), ("SSRC0", 128)], None),
+        // BUFFER_ATOMIC_ADD_X2 GLC=1: lane 0 in-bounds (voff=0), lane 1 OOB (voff=16), lane 16 inactive OOB
+        ("BUFFER_ATOMIC_ADD_X2", "ENC_MUBUF", &[("VDATA", 4), ("VADDR", 8), ("SRSRC", 4), ("SOFFSET", 128), ("OFFEN", 1), ("GLC", 1)], None),
+    ]);
+    let mut st = KernelState::default();
+    // V# at s[16:19]: base = 0x100, stride = 0 (raw), num_records = 8 (one u64)
+    st.sgpr[16..20].copy_from_slice(&[0x100, 0, 8, 0]);
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        r[4] = 0x1111_2222;
+        r[5] = 0x3333_4444;
+        r[8] = if l == 0 { 0 } else { 16 };
+    }
+    let mut mem = vec![0u32; 0x80];
+    mem[0x100 / 4] = 0x0000_0010;
+    mem[0x104 / 4] = 0x0000_0020;
+    let r = runner::run_code(&p, &st, &mem).unwrap();
+    // lane 0 (active, in-bounds): returns old memory qword and adds (0x11112222, 0x33334444)
+    assert_eq!((r.vgpr[0][4], r.vgpr[0][5]), (0x0000_0010, 0x0000_0020), "lane 0 in-bounds GLC old value");
+    assert_eq!((r.mem[0x100 / 4], r.mem[0x104 / 4]), (0x1111_2232, 0x3333_4464), "in-bounds memory updated");
+    // lane 1 (active, OOB): GLC must return (0, 0)
+    assert_eq!((r.vgpr[1][4], r.vgpr[1][5]), (0, 0), "lane 1 OOB active GLC must zero VDATA[0:1]");
+    // lane 16 (inactive, OOB): VDATA preserved
+    assert_eq!((r.vgpr[16][4], r.vgpr[16][5]), (0x1111_2222, 0x3333_4444), "lane 16 inactive must preserve VDATA[0:1]");
+}
+
+#[test]
 fn fspx_compute_user_sgprs_from_rsrc2() {
     use crate::gpu::xbox::tests::container;
 
