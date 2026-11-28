@@ -347,6 +347,8 @@ Fill the reusable DXIL cache ahead of a run with the read-only package wrapper. 
   `s` seconds after the first present) with GPU timestamps and logs the 60 programs that took the
   most GPU time per frame (`D3D12.X: GPU times:` lines); the times are coarse, fine for ranking.
   A coarse sample can miss detail; a non-dark sample does not establish correct rendering or gameplay.
+- Driver-call timing slots are returned when their threads exit, so short-lived threads do not
+  permanently exhaust the 64-thread limit for stall diagnostics.
 - **Diagnostics for a bug report** (all off by default; set them in the environment of `xcl run`):
   - `XCL_RUN_SECONDS=n`: the title ends itself after `n` seconds, with the GPU drained and
     `xcl.log` and `report.json` written, so a run of a fixed length can be attached. A value that
