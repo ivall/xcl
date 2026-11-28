@@ -353,8 +353,9 @@ struct WatchRanges {
     excess_bytes: usize,
 }
 
-/// cached `watch_ranges` keyed by `(sparse::mapped_gen, TEXTURES_GEN, graphics_reservations_gen)`
-static WATCH_CACHE: Mutex<Option<((u64, u64, u64), Arc<WatchRanges>)>> = Mutex::new(None);
+/// cached `watch_ranges` keyed by `(sparse::mapped_gen, TEXTURES_GEN, graphics_reservations_gen,
+/// list_x::mirror_sources_gen)`
+static WATCH_CACHE: Mutex<Option<((u64, u64, u64, u64), Arc<WatchRanges>)>> = Mutex::new(None);
 /// the queue uploads go to, per device
 static QUEUES: Mutex<BTreeMap<usize, ID3D12CommandQueue>> = Mutex::new(BTreeMap::new());
 static UPLOADS: AtomicU64 = AtomicU64::new(0);
@@ -867,6 +868,7 @@ fn cached_watch_ranges(u: &crate::gpu::uma::Uma, measure: bool) -> Arc<WatchRang
         super::sparse::mapped_gen(),
         TEXTURES_GEN.load(Ordering::Acquire),
         crate::hle::kernelx::graphics_reservations_gen(),
+        super::list_x::mirror_sources_gen(),
     );
     {
         let g = WATCH_CACHE.lock().unwrap();
@@ -889,6 +891,8 @@ fn cached_watch_ranges(u: &crate::gpu::uma::Uma, measure: bool) -> Arc<WatchRang
         .filter_map(|e| watched_texture_span(e.src, e.tex.size()))
         .collect();
     wanted.extend(super::sparse::mapped_ranges());
+    // the sources of buffer mirrors: a draw copies only the pages written (`list_x::copy_written`)
+    wanted.extend(super::list_x::mirror_sources());
     let exact = measure.then(|| plan_watch_ranges(&regions, wanted.clone(), usize::MAX));
     let ranges = watch_ranges(&regions, wanted);
     let wanted_bytes = exact.as_ref().map_or(0, |exact| exact.iter().fold(0usize, |bytes, &(_, n)| bytes.saturating_add(n)));
@@ -993,10 +997,17 @@ fn note_watch_measurement(plan: &WatchRanges, measurement: &WatchMeasurement) {
     }
 }
 
+/// Whether a look has anything to watch: sparse windows, title textures, or buffer mirrors
+/// (whose sources a draw copies only where the look last saw writes, `list_x::copy_written`;
+/// without looks every page ever written stays on the write-watch and is copied at every draw).
+fn look_needed(sparse: bool, textures: usize, mirrors: bool) -> bool {
+    sparse || textures > 0 || mirrors
+}
+
 unsafe fn refresh_once(queue: *mut c_void, mut look: Option<&mut super::sparse::LookSample>) -> super::sparse::PreparationOutcome {
     let Some(u) = crate::gpu::uma::get() else { return super::sparse::PreparationOutcome::Ready };
     let sparse = u.has_sparse();
-    if !sparse && CPU_TEXTURES_LEN.load(Ordering::Relaxed) == 0 {
+    if !look_needed(sparse, CPU_TEXTURES_LEN.load(Ordering::Relaxed), super::list_x::mirror_sources_gen() != 0) {
         return super::sparse::PreparationOutcome::Ready;
     }
     recheck_gpu_view_sources();
@@ -1012,11 +1023,14 @@ unsafe fn refresh_once(queue: *mut c_void, mut look: Option<&mut super::sparse::
             if buf.len() < 16384 {
                 buf.resize(16384, std::ptr::null_mut());
             }
+            super::list_x::mirror_look_begin();
             for &(base, size) in &ranges.ranges {
                 take_written(base, size, &mut buf, &mut dirty, &mut page, measurement.as_mut());
             }
         });
         dirty.sort_unstable();
+        // pages of buffer mirrors' sources, now off the write-watch: their next draw copies them
+        super::list_x::mirror_pages_written(&dirty);
         dirty.len()
     });
     if let Some(measurement) = &measurement {
@@ -1983,12 +1997,22 @@ fn watch_ranges(regions: &[(usize, usize)], mut wanted: Vec<(usize, usize)>) -> 
 /// `0`. Because Windows may return `read == 0` when a fault occurs later in the span, binary-split
 /// failed multi-page ranges at 4 KiB boundaries so all still-committed pages are copied in O(log N)
 /// calls and only unreadable pages are zeroed.
-unsafe fn copy_committed_region(src: usize, dst: *mut u8, len: usize) {
+pub(super) unsafe fn copy_committed_region(src: usize, dst: *mut u8, len: usize) {
+    copy_committed(src, dst, len, true)
+}
+
+/// `copy_committed_region`, but a page that cannot be read keeps what `dst` holds (the per-draw
+/// mirror sync compares it with the mirror's bytes: a page the title freed keeps the mirror's).
+pub(super) unsafe fn copy_committed_pages(src: usize, dst: *mut u8, len: usize) {
+    copy_committed(src, dst, len, false)
+}
+
+unsafe fn copy_committed(src: usize, dst: *mut u8, len: usize, zero: bool) {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     const PAGE: usize = 0x1000;
 
-    unsafe fn copy_rec(proc: *mut c_void, src: usize, dst: *mut u8, len: usize) {
+    unsafe fn copy_rec(proc: *mut c_void, src: usize, dst: *mut u8, len: usize, zero: bool) {
         if len == 0 {
             return;
         }
@@ -2002,16 +2026,18 @@ unsafe fn copy_committed_region(src: usize, dst: *mut u8, len: usize) {
         let len = len - read;
         let page_end = (src & !(PAGE - 1)).saturating_add(PAGE).min(src + len);
         if page_end == src + len {
-            std::ptr::write_bytes(dst, 0, len);
+            if zero {
+                std::ptr::write_bytes(dst, 0, len);
+            }
             return;
         }
         let mid = ((src + len / 2) & !(PAGE - 1)).max(page_end);
         let left = mid - src;
-        copy_rec(proc, src, dst, left);
-        copy_rec(proc, mid, dst.add(left), len - left);
+        copy_rec(proc, src, dst, left, zero);
+        copy_rec(proc, mid, dst.add(left), len - left, zero);
     }
 
-    copy_rec(GetCurrentProcess(), src, dst, len);
+    copy_rec(GetCurrentProcess(), src, dst, len, zero);
 }
 
 /// `len` bytes at `at`: the committed, readable pages copied, the rest zero (a streaming pool
@@ -3576,6 +3602,65 @@ mod tests {
         let mut wrong_shape = pc(&uav);
         wrong_shape.MipLevels -= 1;
         assert!(gpu_owned_layout(&uav, &wrong_shape).is_err());
+    }
+
+    /// A look runs when there is something to watch – buffer mirrors too, with no sparse
+    /// window and no title texture (before, it did not, and the mirror sync then copied every
+    /// page ever written at every draw).
+    #[test]
+    fn a_look_runs_for_buffer_mirrors_alone() {
+        assert!(!look_needed(false, 0, false));
+        assert!(look_needed(false, 0, true), "buffer mirrors alone");
+        assert!(look_needed(true, 0, false));
+        assert!(look_needed(false, 1, false));
+    }
+
+    /// Through the look before a submit (`refresh`): after it, a draw with a mirrored buffer
+    /// in write-watched title memory copies only the pages the title wrote since.
+    #[test]
+    fn the_look_before_a_submit_lets_the_mirror_sync_skip_unwritten_pages() {
+        let _vram_guard = super::super::vram::VRAM_TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock().unwrap();
+        if crate::gpu::uma::get().is_none() {
+            crate::gpu::recomp::runner::skip_test("no unified memory");
+            return;
+        }
+        unsafe {
+            // GPU-visible title memory as kernelx gives it out when no window has room:
+            // write-watched, one of the graphics reservations the look watches
+            let src = crate::hle::kernelx::reserve_watched(0x10_0000, 0x2000_3000, 0x2404) as *mut u8;
+            assert!(!src.is_null());
+            let bytes = 0x3000usize;
+            std::ptr::write_bytes(src, 0x11, bytes);
+            let list = 0x7e57_0000_2478usize as *mut c_void;
+            let m = super::super::list_x::bind_mirrored_vertex_buffer(list, src as u64, bytes as u32, 16);
+            let draw = |mark: u8| {
+                std::ptr::write_bytes(m, mark, bytes);
+                super::super::list_x::sync_title_buffers(list, None, 0, bytes as u32 / 16, 1);
+            };
+            let page = |k: usize| *m.add(k << 12 | 0x123);
+            // the writes before the mirror was made: copied once, at the draw after the look
+            refresh(std::ptr::null_mut());
+            draw(0xee);
+            refresh(std::ptr::null_mut());
+            draw(0xee);
+            assert_eq!((page(0), page(1), page(2)), (0xee, 0xee, 0xee), "unchanged since the last look: nothing copied");
+            *src.add(0x1000 | 0x123) = 0x22;
+            refresh(std::ptr::null_mut());
+            draw(0xee);
+            assert_eq!((page(0), page(1), page(2)), (0xee, 0x22, 0xee), "the page written before the look is copied");
+            // two draws on disjoint halves of one page written before the look: the first copies
+            // all of the page, so the second (with no write since) reads the title's bytes too
+            *src.add(0x1000 | 0x123) = 0x33;
+            *src.add(0x1000 | 0x923) = 0x44;
+            refresh(std::ptr::null_mut());
+            std::ptr::write_bytes(m, 0xee, bytes);
+            super::super::list_x::sync_title_buffers(list, None, 0x1000 / 16, 0x800 / 16, 1);
+            super::super::list_x::sync_title_buffers(list, None, 0x1800 / 16, 0x800 / 16, 1);
+            assert_eq!((*m.add(0x1123), *m.add(0x1923)), (0x33, 0x44), "each draw on the page reads the title's bytes");
+            super::super::list_x::forget_list_for_test(list);
+            // (the reservation stays: the mirror table is never emptied)
+        }
     }
 
     /// One state while every subresource has it, one each while they differ.
