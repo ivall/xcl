@@ -70,6 +70,20 @@ class BannedModelTests(unittest.TestCase):
 
 
 class SmokeBlockTests(unittest.TestCase):
+    def test_main_baseline_must_have_no_uncommitted_changes(self):
+        baseline = "xcl-smoke v1\ncommit: 1111111aaaa{}\ntitle: G\nseconds: 60\n"
+        head = "xcl-smoke v1\ncommit: 1234567890\ntitle: G\nseconds: 60\n"
+        files = [changed("crates/xcl/src/hle/d3d12x/vram.rs")]
+        is_main_ancestor = lambda sha: sha == "1111111aaaa"
+
+        dirty = baseline.format(" (uncommitted changes)")
+        problems = check(BODY + dirty + head, HEAD, files, is_main_ancestor)
+        self.assertEqual(1, len(problems), problems)
+        self.assertIn("clean checkout of main", problems[0])
+
+        clean = baseline.format("")
+        self.assertEqual([], check(BODY + dirty + clean + head, HEAD, files, is_main_ancestor))
+
     def test_two_blocks_in_one_fence_are_two_blocks(self):
         run = "title: G\nseconds: 60\nframes shown: 100\ndevice removals: 0\ncrashes: 0\n"
         body = ("```\nxcl-smoke v1\ncommit: 1111111aaaa\n" + run + "\n"

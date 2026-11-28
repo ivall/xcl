@@ -135,10 +135,10 @@ def check(body, head, files, is_main_ancestor, *, test_only=False):
         if not clean:
             problems.append(f"the PR changes the runtime: **Regression run** needs an `xcl-smoke` block made on this PR's "
                             f"head commit {head[:12]} with no uncommitted changes (rerun scripts/smoke.ps1 after every push)")
-        main = [b for b in base if is_main_ancestor(b["commit"].split()[0])]
+        main = [b for b in base if "uncommitted" not in b["commit"] and is_main_ancestor(b["commit"].split()[0])]
         if not main:
-            problems.append("**Regression run** needs an `xcl-smoke` block made on a commit of main (not the PR's), "
-                            "with the same title and time as the PR's")
+            problems.append("**Regression run** needs an `xcl-smoke` block from a clean checkout of main, "
+                            "using the same title and time as the PR's")
         if clean:
             pr = clean[-1]
             problems += field_problems(pr, "the PR's")

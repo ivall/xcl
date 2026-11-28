@@ -20,8 +20,8 @@ checked before anything else; a PR that does not meet them waits (or is closed a
 3. **A PR that changes the runtime** (`crates/xcl/src` outside tests) **has a regression run on a real
    title**: `scripts/smoke.ps1 -Game <your game folder>` built from `main` and built from the PR's head
    commit, both `xcl-smoke` blocks pasted under **Regression run**, of the same title for the same
-   time. The PR's block must name its head commit with no uncommitted changes (rerun it after every
-   push); the other must be made on a commit of `main`. The PR's run must show no device removal and
+   time. Both runs need clean checkouts. The PR's block must name its head commit (rerun it after every
+   push), and the other must name a commit of `main`. The PR's run must show no device removal and
    no crash (the `main` run may: a PR that fixes a crash shows it there), at least 80 % of `main`'s
    frames and at most 125 % of its peak commit. A run on a title that does not reach the code the PR
    changes still counts as a regression check; say what it does not cover under **Not tested**.
