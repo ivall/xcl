@@ -322,7 +322,13 @@ mod translated {
         h
     }
 
-    pub(super) fn load_in(path: &Path, ident: u64, blob: &[u8]) -> Option<Compiled> {
+    pub(super) fn load_in_with(
+        path: &Path,
+        ident: u64,
+        blob: &[u8],
+        require_symbols: bool,
+        symbols_available: impl FnOnce(&[u8]) -> bool,
+    ) -> Option<Compiled> {
         let b = std::fs::read(path).ok()?;
         let head = header(ident, blob);
         let mut r = b.strip_prefix(head.as_slice())?;
@@ -346,6 +352,7 @@ mod translated {
         if len == 0 { return None; }
         let (whole, mut rest) = r.split_at_checked(len)?;
         if !super::dxc::valid_dxil_container(whole) { return None; }
+        if require_symbols && !symbols_available(whole) { return None; }
         let dispatch_chain = if rest.is_empty() {
             None
         } else {
@@ -365,6 +372,10 @@ mod translated {
             Some(std::sync::Arc::new(crate::gpu::dxil::kernel::DispatchChain { dwords_per_group, pieces }))
         };
         Some(Compiled { dxil: whole.to_vec(), samplers, dispatch_chain })
+    }
+
+    pub(super) fn load_in(path: &Path, ident: u64, blob: &[u8]) -> Option<Compiled> {
+        load_in_with(path, ident, blob, false, |_| true)
     }
 
     pub(super) fn store_in(path: &Path, ident: u64, blob: &[u8], c: &Compiled) {
@@ -564,7 +575,17 @@ mod translated {
         }
         let rerouted = rerouted_identity(ident, direct);
         for id in [ident, rerouted] {
-            if let Some(c) = load_in(&file(dir, id, blob, stage, sampler_base, windows, split), id, blob) {
+            // The HLSL path's translated entry sits above the DXC cache. In symbol mode it is
+            // usable only while the exact DXIL/PDB/source bundle published with it is complete.
+            // A rerouted enormous shader is direct DXIL and has no DXC PDB.
+            let require_symbols = Backend::current() == Backend::Hlsl && id == ident;
+            if let Some(c) = load_in_with(
+                &file(dir, id, blob, stage, sampler_base, windows, split),
+                id,
+                blob,
+                require_symbols,
+                super::dxc::shader_symbols_available,
+            ) {
                 super::dxc::note_memory_hit();
                 return Ok(c);
             }
@@ -1478,6 +1499,8 @@ mod shader_cache_tests {
         translated::store_in(&path, 42, b"console", &c);
         let back = translated::load_in(&path, 42, b"console").expect("stored");
         assert_eq!((back.dxil, back.samplers), (c.dxil.clone(), c.samplers.clone()));
+        assert!(translated::load_in_with(&path, 42, b"console", true, |_| false).is_none(), "a missing symbol bundle invalidates an HLSL cache hit");
+        assert!(translated::load_in_with(&path, 42, b"console", true, |_| true).is_some(), "a complete symbol bundle keeps the cache hit");
         assert!(translated::load_in(&path, 43, b"console").is_none(), "another identity");
         assert!(translated::load_in(&path, 42, b"consolf").is_none(), "other bytes");
         let full = std::fs::read(&path).unwrap();
