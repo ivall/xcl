@@ -263,6 +263,8 @@ xcl shaders D:\data\shaders.rpf --measure-pso HEX --repeat 3         # cold driv
 xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 ```
 
+If you omit `--out`, `xcl rpf` extracts records to `rpf_out` in the current working directory.
+
 <details>
 <summary><b>Switches, caches, logs and the files XCL writes</b></summary>
 
