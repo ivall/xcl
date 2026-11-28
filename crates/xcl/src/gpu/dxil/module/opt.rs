@@ -1994,3 +1994,174 @@ mod int_minmax_tests {
     }
 
 }
+
+#[cfg(test)]
+mod int_minmax_tests {
+    use super::*;
+    use crate::gpu::dxil::{
+        kernel::{self, KernelOptions},
+        validate,
+    };
+    use crate::gpu::rdna2::encode;
+    use crate::gpu::recomp::runner;
+
+    #[test]
+    fn simplify_int_minmax_folds_bounds_absorption_and_clamps() {
+        let mut m = Module::new();
+        m.define_entry("main");
+        let entry = m.entry_block();
+        let i32t = m.i32();
+        let void = m.void();
+        let src_ty = m.func_ty(i32t, &[]);
+        let sink_ty = m.func_ty(void, &[i32t]);
+        let bin_ty = m.func_ty(i32t, &[i32t, i32t, i32t]);
+        let src = m.declare("src", src_ty, FnAttrs::NoUnwind);
+        let sink = m.declare("sink", sink_ty, FnAttrs::NoUnwind);
+        let bin_fn = m.declare("dx.op.binary.i32", bin_ty, FnAttrs::ReadNone);
+        m.set_block(entry);
+
+        let x = m.call(src, &[]);
+        let y = m.call(src, &[]);
+        let imax = m.i32c(37);
+        let imin = m.i32c(38);
+        let umax = m.i32c(39);
+        let umin = m.i32c(40);
+        let c0 = m.i32c(0);
+        let c16 = m.i32c(16);
+        let c255 = m.i32c(255);
+        let c100 = m.i32c(100);
+        let cneg = m.i32c((-10i32) as u32);
+        let cu_max = m.i32c(u32::MAX);
+        let ci_min = m.i32c(i32::MIN as u32);
+        let ci_max = m.i32c(i32::MAX as u32);
+        let mff = m.i32c(0xFF);
+
+        // 1. Constant folding & identity/absorbing bounds.
+        let k_umin = m.call(bin_fn, &[umin, c255, c100]);
+        let k_imax = m.call(bin_fn, &[imax, cneg, c100]);
+        let umin_zero = m.call(bin_fn, &[umin, x, c0]);
+        let umax_zero = m.call(bin_fn, &[umax, x, c0]);
+        let umin_all = m.call(bin_fn, &[umin, x, cu_max]);
+        let imin_min = m.call(bin_fn, &[imin, x, ci_min]);
+        let imax_min = m.call(bin_fn, &[imax, x, ci_min]);
+        let imin_max = m.call(bin_fn, &[imin, x, ci_max]);
+
+        // 2. Lattice idempotence & absorption.
+        let mxy = m.call(bin_fn, &[umin, x, y]);
+        let idemp = m.call(bin_fn, &[umin, mxy, x]);
+        let absorb = m.call(bin_fn, &[umax, mxy, x]);
+
+        // 3. Range-based elision on masked byte (0..=255) and ashr16 (-32768..=32767).
+        let byte = m.bin(BinOp::And, x, mff);
+        let byte_imax0 = m.call(bin_fn, &[imax, byte, c0]);
+        let byte_umin255 = m.call(bin_fn, &[umin, byte, c255]);
+        let s16 = m.bin(BinOp::AShr, x, c16);
+        let c_i16_lo = m.i32c((-32768i32) as u32);
+        let c_i16_hi = m.i32c(32767);
+        let s16_lo = m.call(bin_fn, &[imax, s16, c_i16_lo]);
+        let s16_hi = m.call(bin_fn, &[imin, s16_lo, c_i16_hi]);
+
+        // 4. Full 4-op med3_i32(x, 0, 255) collapses to 2 ops: imin(imax(x, 0), 255).
+        let p = m.call(bin_fn, &[imin, x, c0]);
+        let q = m.call(bin_fn, &[imax, x, c0]);
+        let r = m.call(bin_fn, &[imin, q, c255]);
+        let med = m.call(bin_fn, &[imax, p, r]);
+
+        // 5. Soundness check: signed mask with bit 31 set MUST NOT fold imax(x & 0x8000_00FF, 0).
+        let m_sign = m.i32c(0x8000_00FF);
+        let signed_bits = m.bin(BinOp::And, x, m_sign);
+        let must_stay = m.call(bin_fn, &[imax, signed_bits, c0]);
+
+        for v in [
+            k_umin,
+            k_imax,
+            umin_zero,
+            umax_zero,
+            umin_all,
+            imin_min,
+            imax_min,
+            imin_max,
+            idemp,
+            absorb,
+            byte_imax0,
+            byte_umin255,
+            s16_hi,
+            med,
+            must_stay,
+        ] {
+            m.call(sink, &[v]);
+        }
+        m.ret();
+        m.optimize();
+
+        let args: Vec<Value> = m.blocks[entry.0 as usize]
+            .iter()
+            .filter_map(|&i| match &m.insts[i as usize].op {
+                Op::Call(f, a) if *f == sink => Some(a[0]),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(args.len(), 15);
+        assert_eq!(m.const_u64(args[0]), Some(100), "umin(255, 100) -> 100");
+        assert_eq!(m.const_u64(args[1]), Some(100), "imax(-10, 100) -> 100");
+        assert_eq!(m.const_u64(args[2]), Some(0), "umin(x, 0) -> 0");
+        assert_eq!(args[3], x, "umax(x, 0) -> x");
+        assert_eq!(args[4], x, "umin(x, u32::MAX) -> x");
+        assert_eq!(m.const_u64(args[5]), Some(i32::MIN as u32 as u64), "imin(x, i32::MIN) -> i32::MIN");
+        assert_eq!(args[6], x, "imax(x, i32::MIN) -> x");
+        assert_eq!(args[7], x, "imin(x, i32::MAX) -> x");
+        assert_eq!(args[8], mxy, "umin(umin(x, y), x) -> umin(x, y)");
+        assert_eq!(args[9], x, "umax(umin(x, y), x) -> x");
+        assert_eq!(args[10], byte, "imax(x & 0xFF, 0) -> x & 0xFF");
+        assert_eq!(args[11], byte, "umin(x & 0xFF, 255) -> x & 0xFF");
+        assert_eq!(args[12], s16, "clamp(ashr(x, 16), -32768, 32767) -> ashr(x, 16)");
+        assert_eq!(args[13], r, "med3_i32(x, 0, 255) collapses to imin(imax(x, 0), 255)");
+        assert_eq!(args[14], must_stay, "imax(x & 0x800000FF, 0) must not fold");
+    }
+
+    #[test]
+    fn med3_via_sgpr_bounds_collapses_and_matches_gpu() {
+        // Real RDNA2 pattern: upper bound loaded into an SGPR (becomes constant only after mem2reg),
+        // then fed into v_med3_i32 / v_med3_u32 in both bound orders.
+        let mut code = Vec::new();
+        code.extend(encode("S_MOV_B32", "ENC_SOP1", &[("SDST", 2), ("SSRC0", 255)], Some(255)).unwrap());
+        code.extend(encode("S_MOV_B32", "ENC_SOP1", &[("SDST", 3), ("SSRC0", 128)], None).unwrap()); // 0
+        // v2 = med3_i32(v0, s3=0, s2=255) -> 2 ops (down from 4)
+        code.extend(encode("V_MED3_I32", "ENC_VOP3", &[("VDST", 2), ("SRC0", 256), ("SRC1", 3), ("SRC2", 2)], None).unwrap());
+        // v3 = med3_i32(v0, s2=255, s3=0) -> 2 ops (reversed bounds, down from 4)
+        code.extend(encode("V_MED3_I32", "ENC_VOP3", &[("VDST", 3), ("SRC0", 256), ("SRC1", 2), ("SRC2", 3)], None).unwrap());
+        // v4 = med3_u32(v0, s3=0, s2=255) -> 1 op (umin(v0, 255), down from 4)
+        code.extend(encode("V_MED3_U32", "ENC_VOP3", &[("VDST", 4), ("SRC0", 256), ("SRC1", 3), ("SRC2", 2)], None).unwrap());
+        // v5 = med3_u32(v0, s3=0, v1) -> 1 op (umin(v0, v1), down from 4)
+        code.extend(encode("V_MED3_U32", "ENC_VOP3", &[("VDST", 5), ("SRC0", 256), ("SRC1", 3), ("SRC2", 257)], None).unwrap());
+        code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+
+        let ko = KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 };
+        let dxil = kernel::translate(&code, ko).expect("translate sgpr med3");
+        validate::validate(&dxil).expect("validate sgpr med3");
+        let dis = validate::disassemble(&dxil).expect("disasm sgpr med3");
+        let calls = dis.matches("call i32 @dx.op.binary.i32(").count();
+        assert_eq!(calls, 6, "expected 6 binary.i32 calls (2+2+1+1, down from 16), got {calls}:\n{dis}");
+
+        if !matches!(runner::wave32_supported(), Ok(true)) {
+            runner::skip_test("no wave32");
+            return;
+        }
+        let v0s: [u32; 10] = [0, 1, 128, 255, 256, 1000, (-1i32) as u32, (-255i32) as u32, i32::MIN as u32, i32::MAX as u32];
+        let v1s: [u32; 10] = [10, 0, 200, 100, 300, 50, u32::MAX, 42, 0x8000_0001, 500];
+        let mut st = runner::KernelState::default();
+        for l in 0..v0s.len() {
+            st.vgpr[l][0] = v0s[l];
+            st.vgpr[l][1] = v1s[l];
+        }
+        let r = runner::run(&dxil, &st, &[]).expect("GPU run sgpr med3");
+        for l in 0..v0s.len() {
+            let (a, b) = (v0s[l], v1s[l]);
+            let want_clamp_i = (a as i32).clamp(0, 255) as u32;
+            assert_eq!(r.vgpr[l][2], want_clamp_i, "med3_i32(v0, 0, 255) lane {l}");
+            assert_eq!(r.vgpr[l][3], want_clamp_i, "med3_i32(v0, 255, 0) lane {l}");
+            assert_eq!(r.vgpr[l][4], a.min(255), "med3_u32(v0, 0, 255) lane {l}");
+            assert_eq!(r.vgpr[l][5], a.min(b), "med3_u32(v0, 0, v1) lane {l}");
+        }
+    }
+}
