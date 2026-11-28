@@ -508,8 +508,10 @@ impl Vfs {
     }
 
     /// Ensure `rel` exists in the overlay (copying the original when `keep_content`)
-    /// and return the overlay path.
-    pub fn prepare_write(&self, rel: &str, keep_content: bool) -> Result<String, u32> {
+    /// without removing whiteouts or recording the write yet. Call `commit_write(rel)`
+    /// only after the underlying file operation succeeds so a failed open cannot
+    /// resurrect a whited-out original.
+    pub fn prepare_write_staged(&self, rel: &str, keep_content: bool) -> Result<String, u32> {
         let ov = self.overlay_path(rel);
         if let Some(parent) = Path::new(&ov).parent() {
             std::fs::create_dir_all(parent).map_err(|_| ERROR_PATH_NOT_FOUND)?;
@@ -522,8 +524,14 @@ impl Vfs {
                 std::fs::copy(&orig, &ov).map_err(|_| ERROR_ACCESS_DENIED)?;
             }
         }
-        self.remove_whiteout(rel);
-        self.record_write(rel);
+        Ok(ov)
+    }
+
+    /// Ensure `rel` exists in the overlay (copying the original when `keep_content`)
+    /// and return the overlay path.
+    pub fn prepare_write(&self, rel: &str, keep_content: bool) -> Result<String, u32> {
+        let ov = self.prepare_write_staged(rel, keep_content)?;
+        self.commit_write(rel);
         Ok(ov)
     }
 
@@ -533,16 +541,19 @@ impl Vfs {
             || flags & FILE_FLAG_DELETE_ON_CLOSE != 0
     }
 
-    pub fn open_decision_for(&self, target: Target, access: u32, disposition: u32, flags: u32) -> Decision {
+    /// Decide how to open `target`, staging any overlay write without removing whiteouts
+    /// or recording the write yet. Callers must call `commit_write(rel)` on the returned
+    /// relative path only after the underlying open succeeds.
+    pub fn open_decision_staged_for(&self, target: Target, access: u32, disposition: u32, flags: u32) -> (Decision, Option<String>) {
         match target {
-            Target::Pass => Decision::Pass,
+            Target::Pass => (Decision::Pass, None),
             Target::Translated(p) => {
                 if Self::is_write(access, disposition, flags) || disposition == OPEN_ALWAYS {
                     if let Some(parent) = Path::new(&p).parent() {
                         let _ = std::fs::create_dir_all(parent);
                     }
                 }
-                Decision::Use(p)
+                (Decision::Use(p), None)
             }
             Target::Game { rel } => {
                 let in_ov = self.visible_in_overlay(&rel);
@@ -550,18 +561,19 @@ impl Vfs {
                 let visible = in_ov || in_orig;
                 let write = Self::is_write(access, disposition, flags) || (disposition == OPEN_ALWAYS && !visible);
                 if !write {
-                    return match self.read_path_rel(&rel) {
+                    let decision = match self.read_path_rel(&rel) {
                         Some(p) => Decision::Use(p),
                         None => Decision::Fail(ERROR_FILE_NOT_FOUND),
                     };
+                    return (decision, None);
                 }
                 // Win32 CreateFile requires GENERIC_WRITE for TRUNCATE_EXISTING before checking existence.
                 if disposition == TRUNCATE_EXISTING && access & GENERIC_WRITE == 0 {
-                    return Decision::Fail(ERROR_INVALID_PARAMETER);
+                    return (Decision::Fail(ERROR_INVALID_PARAMETER), None);
                 }
                 match disposition {
-                    CREATE_NEW if visible => return Decision::Fail(ERROR_FILE_EXISTS),
-                    OPEN_EXISTING | TRUNCATE_EXISTING if !visible => return Decision::Fail(ERROR_FILE_NOT_FOUND),
+                    CREATE_NEW if visible => return (Decision::Fail(ERROR_FILE_EXISTS), None),
+                    OPEN_EXISTING | TRUNCATE_EXISTING if !visible => return (Decision::Fail(ERROR_FILE_NOT_FOUND), None),
                     _ => {}
                 }
                 let ov_entry = in_ov || Path::new(&self.overlay_path(&rel)).symlink_metadata().is_ok();
@@ -578,7 +590,7 @@ impl Vfs {
                         } else {
                             ERROR_ACCESS_DENIED
                         };
-                        return Decision::Fail(err);
+                        return (Decision::Fail(err), None);
                     }
                 }
                 let keep = matches!(disposition, OPEN_EXISTING | OPEN_ALWAYS);
@@ -586,14 +598,26 @@ impl Vfs {
                     && !ov_entry
                     && in_orig
                     && Path::new(&self.original_path(&rel)).is_file();
-                match self.prepare_write(&rel, keep) {
-                    Ok(p) if disposition == TRUNCATE_EXISTING && !ov_entry => Decision::UseWithDisposition(p, CREATE_ALWAYS),
-                    Ok(p) if replaces_original => Decision::CreateOverOriginal(p),
-                    Ok(p) => Decision::Use(p),
-                    Err(e) => Decision::Fail(e),
+                match self.prepare_write_staged(&rel, keep) {
+                    Ok(p) if disposition == TRUNCATE_EXISTING && !ov_entry => (Decision::UseWithDisposition(p, CREATE_ALWAYS), Some(rel)),
+                    Ok(p) if replaces_original => (Decision::CreateOverOriginal(p), Some(rel)),
+                    Ok(p) => (Decision::Use(p), Some(rel)),
+                    Err(e) => (Decision::Fail(e), None),
                 }
             }
         }
+    }
+
+    pub fn open_decision_staged(&self, path: &str, access: u32, disposition: u32, flags: u32) -> (Decision, Option<String>) {
+        self.open_decision_staged_for(self.classify(path), access, disposition, flags)
+    }
+
+    pub fn open_decision_for(&self, target: Target, access: u32, disposition: u32, flags: u32) -> Decision {
+        let (decision, commit_rel) = self.open_decision_staged_for(target, access, disposition, flags);
+        if let Some(rel) = commit_rel {
+            self.commit_write(&rel);
+        }
+        decision
     }
 
     pub fn open_decision(&self, path: &str, access: u32, disposition: u32, flags: u32) -> Decision {
