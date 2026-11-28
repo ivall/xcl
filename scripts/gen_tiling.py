@@ -2,78 +2,88 @@
 GFX10 RB+ (gfx10.3) swizzle pattern info for the 2D colour / depth modes and the 3D thick
 modes, with the nibble tables reduced to the rows they use.
 
-usage: python scripts/gen_tiling.py <path to gfx10SwizzlePattern.h>
+usage: python scripts/gen_tiling.py <path to gfx10SwizzlePattern.h> [out_rs]
 (https://gitlab.freedesktop.org/mesa/mesa/-/raw/main/src/amd/addrlib/src/gfx10/gfx10SwizzlePattern.h)"""
-import io, os, re, sys
+import io
+import os
+import re
+import sys
 
-src = io.open(sys.argv[1], encoding='utf-8').read()
-OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'crates', 'xcl', 'src', 'gpu', 'tiling_tables.rs')
+DEFAULT_OUT = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "crates", "xcl", "src", "gpu", "tiling_tables.rs"
+)
+
 
 # symbolic bits
 def bit(c, i):
     return 1 << ((c << 4) + i)
+
+
 sym = {}
-for c, letter, n in [(0, 'X', 12), (1, 'Y', 12), (2, 'Z', 9), (3, 'S', 3)]:
+for c, letter, n in [(0, "X", 12), (1, "Y", 12), (2, "Z", 9), (3, "S", 3)]:
     for i in range(n):
-        sym[f'{letter}{i}'] = bit(c, i)
+        sym[f"{letter}{i}"] = bit(c, i)
 
 
 def value(tok):
     tok = tok.strip()
     if not tok:
         return None
-    if tok == '0':
+    if tok == "0":
         return 0
     v = 0
-    for part in tok.split('^'):
+    for part in tok.split("^"):
         part = part.strip()
         if part in sym:
             v ^= sym[part]
-        elif part.startswith('0x') or part.isdigit():
+        elif part.startswith("0x") or part.isdigit():
             v ^= int(part, 0)
         else:
-            raise ValueError(tok)
+            raise ValueError(f"unknown swizzle token: '{tok}'")
     return v
 
 
-def table(name):
-    m = re.search(r'const\s+\w+\s+' + re.escape(name) + r'\[\](?:\[\d+\])?\s*=\s*\{(.*?)\n\};', src, re.S)
-    assert m, name
-    rows = re.findall(r'\{([^{}]*)\}', m.group(1))
+def table(name, src):
+    m = re.search(r"const\s+(?:\w+\s+)+" + re.escape(name) + r"\[\](?:\[\d+\])?\s*=\s*\{(.*?)\n\};", src, re.S)
+    if not m:
+        raise ValueError(f"table '{name}' not found in header")
+    rows = re.findall(r"\{([^{}]*)\}", m.group(1))
     out = []
     for r in rows:
-        vals = [value(t) for t in r.split(',')]
+        vals = [value(t) for t in r.split(",")]
         out.append([v for v in vals if v is not None])
     return out
 
+
 # (GFX10 SW_MODE number, table name)
 MODES = [
-    (1, 'GFX10_SW_256_S_RBPLUS_PATINFO'), (2, 'GFX10_SW_256_D_RBPLUS_PATINFO'),
-    (5, 'GFX10_SW_4K_S_RBPLUS_PATINFO'), (6, 'GFX10_SW_4K_D_RBPLUS_PATINFO'),
-    (9, 'GFX10_SW_64K_S_RBPLUS_PATINFO'), (10, 'GFX10_SW_64K_D_RBPLUS_PATINFO'),
-    (17, 'GFX10_SW_64K_S_T_RBPLUS_PATINFO'), (18, 'GFX10_SW_64K_D_T_RBPLUS_PATINFO'),
-    (21, 'GFX10_SW_4K_S_X_RBPLUS_PATINFO'), (22, 'GFX10_SW_4K_D_X_RBPLUS_PATINFO'),
-    (24, 'GFX10_SW_64K_Z_X_1xaa_RBPLUS_PATINFO'), (25, 'GFX10_SW_64K_S_X_RBPLUS_PATINFO'),
-    (26, 'GFX10_SW_64K_D_X_RBPLUS_PATINFO'), (27, 'GFX10_SW_64K_R_X_1xaa_RBPLUS_PATINFO'),
+    (1, "GFX10_SW_256_S_RBPLUS_PATINFO"), (2, "GFX10_SW_256_D_RBPLUS_PATINFO"),
+    (5, "GFX10_SW_4K_S_RBPLUS_PATINFO"), (6, "GFX10_SW_4K_D_RBPLUS_PATINFO"),
+    (9, "GFX10_SW_64K_S_RBPLUS_PATINFO"), (10, "GFX10_SW_64K_D_RBPLUS_PATINFO"),
+    (17, "GFX10_SW_64K_S_T_RBPLUS_PATINFO"), (18, "GFX10_SW_64K_D_T_RBPLUS_PATINFO"),
+    (21, "GFX10_SW_4K_S_X_RBPLUS_PATINFO"), (22, "GFX10_SW_4K_D_X_RBPLUS_PATINFO"),
+    (24, "GFX10_SW_64K_Z_X_1xaa_RBPLUS_PATINFO"), (25, "GFX10_SW_64K_S_X_RBPLUS_PATINFO"),
+    (26, "GFX10_SW_64K_D_X_RBPLUS_PATINFO"), (27, "GFX10_SW_64K_R_X_1xaa_RBPLUS_PATINFO"),
 ]
 # 3D resources in a thick mode (Gfx10Lib::GetSwizzlePatternInfo, ADDR_RSRC_TEX_3D); the thin
 # ones (64KB_Z_X / R_X) use the 2D patterns
 MODES_3D = [
-    (5, 'GFX10_SW_4K_S3_RBPLUS_PATINFO'), (9, 'GFX10_SW_64K_S3_RBPLUS_PATINFO'),
-    (17, 'GFX10_SW_64K_S3_T_RBPLUS_PATINFO'), (21, 'GFX10_SW_4K_S3_X_RBPLUS_PATINFO'),
-    (25, 'GFX10_SW_64K_S3_X_RBPLUS_PATINFO'), (26, 'GFX10_SW_64K_D3_X_RBPLUS_PATINFO'),
+    (5, "GFX10_SW_4K_S3_RBPLUS_PATINFO"), (9, "GFX10_SW_64K_S3_RBPLUS_PATINFO"),
+    (17, "GFX10_SW_64K_S3_T_RBPLUS_PATINFO"), (21, "GFX10_SW_4K_S3_X_RBPLUS_PATINFO"),
+    (25, "GFX10_SW_64K_S3_X_RBPLUS_PATINFO"), (26, "GFX10_SW_64K_D3_X_RBPLUS_PATINFO"),
 ]
-nib = {k: table(n) for k, n in [('01', 'GFX10_SW_PATTERN_NIBBLE01'), ('2', 'GFX10_SW_PATTERN_NIBBLE2'), ('3', 'GFX10_SW_PATTERN_NIBBLE3'), ('4', 'GFX10_SW_PATTERN_NIBBLE4')]}
-used = {k: {} for k in nib}
-def patterns(modes):
+
+
+def patterns(modes, src, nib, used):
     pat = {}
     for mode, name in modes:
-        rows = table(name)
+        rows = table(name, src)
         remapped = []
         for r in rows:
-            assert len(r) == 5, (name, r)
+            if len(r) != 5:
+                raise ValueError(f"expected 5 elements per row in {name}, got {len(r)}")
             idx = []
-            for key, v in zip(['01', '2', '3', '4'], r[1:]):
+            for key, v in zip(["01", "2", "3", "4"], r[1:]):
                 m = used[key]
                 if v not in m:
                     m[v] = len(m)
@@ -83,28 +93,97 @@ def patterns(modes):
     return pat
 
 
-pat = patterns(MODES)
-pat3 = patterns(MODES_3D)
+def generate(src_header, modes=None, modes_3d=None):
+    """Parse AMD addrlib header and generate Rust source for swizzle patterns.
 
-out = io.StringIO()
-out.write('// Generated by scripts/gen_tiling.py from AMD addrlib (Mesa src/amd/addrlib/src/gfx10/\n')
-out.write('// gfx10SwizzlePattern.h): Copyright (C) 2007-2026 Advanced Micro Devices, Inc., MIT.\n')
-out.write('// GFX10 RB+ (gfx10.3) swizzle patterns, 2D colour / depth and 3D thick modes. Each u64 is one address\n')
-out.write('// bit: XOR of the x (bits 0-15), y (16-31), z (32-47) and sample (48-63) bits it masks.\n\n')
-out.write('#![allow(clippy::unreadable_literal)]\n\n')
-for key, width in [('01', 8), ('2', 4), ('3', 4), ('4', 4)]:
-    rows = sorted(used[key].items(), key=lambda kv: kv[1])
-    out.write(f'pub static NIBBLE{key}: [[u64; {width}]; {len(rows)}] = [\n')
-    for orig, _ in rows:
-        vals = nib[key][orig]
-        assert len(vals) == width, (key, orig, vals)
-        out.write('    [' + ', '.join(f'{v:#x}' for v in vals) + '],\n')
-    out.write('];\n\n')
-for label, var, tab in [('2D', 'PATTERNS', pat), ('3D thick', 'PATTERNS_3D', pat3)]:
-    out.write(f'/// {label}: (GFX10 SW_MODE, [nibble01, nibble2, nibble3, nibble4] per (pipes/packers group, bpe) row)\n')
-    out.write(f'pub static {var}: &[(u32, &[[u16; 4]])] = &[\n')
-    for mode, (name, rows) in tab.items():
-        out.write(f'    // {name}\n    ({mode}, &[' + ', '.join('[' + ', '.join(str(i) for i in r) + ']' for r in rows) + ']),\n')
-    out.write('];\n\n' if var == 'PATTERNS' else '];\n')
-io.open(OUT, 'w', encoding='utf-8', newline='\n').write(out.getvalue())
-print({k: len(v) for k, v in used.items()}, {m: len(r) for m, (n, r) in pat.items()}, {m: len(r) for m, (n, r) in pat3.items()})
+    Returns (rust_source_string, stats_tuple).
+    """
+    if modes is None:
+        modes = MODES
+    if modes_3d is None:
+        modes_3d = MODES_3D
+
+    nib = {k: table(n, src_header) for k, n in [
+        ("01", "GFX10_SW_PATTERN_NIBBLE01"),
+        ("2", "GFX10_SW_PATTERN_NIBBLE2"),
+        ("3", "GFX10_SW_PATTERN_NIBBLE3"),
+        ("4", "GFX10_SW_PATTERN_NIBBLE4"),
+    ]}
+    used = {k: {} for k in nib}
+    pat = patterns(modes, src_header, nib, used)
+    pat3 = patterns(modes_3d, src_header, nib, used)
+
+    out = io.StringIO()
+    out.write("// Generated by scripts/gen_tiling.py from AMD addrlib (Mesa src/amd/addrlib/src/gfx10/\n")
+    out.write("// gfx10SwizzlePattern.h): Copyright (C) 2007-2026 Advanced Micro Devices, Inc., MIT.\n")
+    out.write("// GFX10 RB+ (gfx10.3) swizzle patterns, 2D colour / depth and 3D thick modes. Each u64 is one address\n")
+    out.write("// bit: XOR of the x (bits 0-15), y (16-31), z (32-47) and sample (48-63) bits it masks.\n\n")
+    out.write("#![allow(clippy::unreadable_literal)]\n\n")
+    for key, width in [("01", 8), ("2", 4), ("3", 4), ("4", 4)]:
+        rows = sorted(used[key].items(), key=lambda kv: kv[1])
+        out.write(f"pub static NIBBLE{key}: [[u64; {width}]; {len(rows)}] = [\n")
+        for orig, _ in rows:
+            vals = nib[key][orig]
+            if len(vals) != width:
+                raise ValueError(f"expected width {width} for nibble {key}, got {len(vals)}")
+            out.write("    [" + ", ".join(f"{v:#x}" for v in vals) + "],\n")
+        out.write("];\n\n")
+    for label, var, tab in [("2D", "PATTERNS", pat), ("3D thick", "PATTERNS_3D", pat3)]:
+        out.write(f"/// {label}: (GFX10 SW_MODE, [nibble01, nibble2, nibble3, nibble4] per (pipes/packers group, bpe) row)\n")
+        out.write(f"pub static {var}: &[(u32, &[[u16; 4]])] = &[\n")
+        for mode, (name, rows) in tab.items():
+            out.write(f"    // {name}\n    ({mode}, &[" + ", ".join("[" + ", ".join(str(i) for i in r) + "]" for r in rows) + "]),\n")
+        out.write("];\n\n" if var == "PATTERNS" else "];\n")
+
+    stats = (
+        {k: len(v) for k, v in used.items()},
+        {m: len(r) for m, (n, r) in pat.items()},
+        {m: len(r) for m, (n, r) in pat3.items()},
+    )
+    return out.getvalue(), stats
+
+
+def main(argv=None, dst=None):
+    if isinstance(argv, str) and dst is not None:
+        args = [argv, dst]
+    elif isinstance(argv, str):
+        args = [argv]
+    elif argv is not None:
+        args = list(argv)
+    else:
+        args = sys.argv[1:]
+
+    if not args or args[0] in ("-h", "--help"):
+        print(__doc__.strip())
+        return 0 if (args and args[0] in ("-h", "--help")) else 2
+
+    header_path = args[0]
+    if not os.path.isfile(header_path):
+        print(f"error: file not found: '{header_path}'", file=sys.stderr)
+        return 1
+
+    out_path = args[1] if len(args) > 1 else DEFAULT_OUT
+
+    try:
+        with io.open(header_path, encoding="utf-8") as f:
+            src = f.read()
+        content, stats = generate(src)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    except Exception as e:
+        print(f"error: failed to process '{header_path}': {e}", file=sys.stderr)
+        return 1
+
+    out_dir = os.path.dirname(os.path.abspath(out_path))
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    with io.open(out_path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(content)
+
+    print(f"wrote {os.path.normpath(out_path)}: nibbles {stats[0]}, 2D modes {len(stats[1])}, 3D modes {len(stats[2])}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
