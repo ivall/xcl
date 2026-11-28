@@ -113,6 +113,11 @@ fn source_uv_rect(rect: Option<[i32; 4]>, w: u32, h: u32) -> [f32; 4] {
     [0.0, 0.0, 1.0, 1.0]
 }
 
+unsafe fn raw_plane_words(plane_count: u32, planes: *const u8) -> Vec<u64> {
+    let n = (PLANE_STRIDE / 8) * (plane_count as usize).min(MAX_PLANES);
+    if crate::gpu::shader::readable(planes as usize, 8 * n) { (0..n).map(|k| (planes as *const u64).add(k).read_unaligned()).collect() } else { Vec::new() }
+}
+
 unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u8) {
     let frames = BOUNDARIES.fetch_add(1, Ordering::Relaxed) + 1;
     if frames % 300 == 0 {
@@ -132,8 +137,7 @@ unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u
         // plane over the game's): logged with the planes' raw words
         static LAST: AtomicU64 = AtomicU64::new(1);
         if LAST.swap(plane_count as u64, Ordering::Relaxed) != plane_count as u64 {
-            let n = (PLANE_STRIDE / 8) * plane_count as usize;
-            let words: Vec<u64> = if crate::gpu::shader::readable(planes as usize, 8 * n) { (0..n).map(|k| (planes as *const u64).add(k).read_unaligned()).collect() } else { Vec::new() };
+            let words = raw_plane_words(plane_count, planes);
             crate::xlog_info!("D3D12.X: PresentX now with {plane_count} plane(s): {words:x?}");
         }
     }
@@ -1166,7 +1170,9 @@ impl Compositor {
             } else {
                 rt.BlendEnable = false.into();
             }
-            dev.CreateGraphicsPipelineState(&pd).ok()
+            let pso = dev.CreateGraphicsPipelineState(&pd).ok();
+            let _ = ManuallyDrop::into_inner(pd.pRootSignature);
+            pso
         };
         let pair = (make_pso(false)?, make_pso(true)?);
         self.psos.insert(fmt.0, pair.clone());
@@ -1184,6 +1190,16 @@ impl Compositor {
         planes: &[(ID3D12Resource, D3D12_RESOURCE_DESC, [f32; 4])],
         slot: usize,
     ) -> bool {
+        let active = &planes[..planes.len().min(MAX_PLANES)];
+        let plane_ok = |d: &D3D12_RESOURCE_DESC| {
+            d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+                && d.SampleDesc.Count == 1
+                && !d.Flags.contains(D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE)
+                && swap_format(d.Format).is_some()
+        };
+        if dst_w == 0 || dst_h == 0 || active.is_empty() || !active.iter().all(|(_, d, _)| plane_ok(d)) {
+            return false;
+        }
         let first = slot % PRESENT_SLOTS * MAX_PLANES;
         let Some((opaque_pso, blend_pso)) = self.psos_for(dev, dst_fmt) else { return false };
         let rtv_cpu = self.rtv_heap.GetCPUDescriptorHandleForHeapStart();
@@ -1194,7 +1210,7 @@ impl Compositor {
         };
         dev.CreateRenderTargetView(dst, Some(&rtv_desc), rtv_cpu);
         let srv_cpu_base = self.srv_heap.GetCPUDescriptorHandleForHeapStart();
-        for (i, (res, desc, _)) in planes.iter().take(MAX_PLANES).enumerate() {
+        for (i, (res, desc, _)) in active.iter().enumerate() {
             let mut srv_cpu = srv_cpu_base;
             srv_cpu.ptr += (first + i) * self.srv_inc as usize;
             let mut srv_desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
@@ -1220,7 +1236,7 @@ impl Compositor {
         list.SetDescriptorHeaps(&[Some(self.srv_heap.clone())]);
         list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         let srv_gpu_base = self.srv_heap.GetGPUDescriptorHandleForHeapStart();
-        for (i, (_, _, uv_rect)) in planes.iter().take(MAX_PLANES).enumerate() {
+        for (i, (_, _, uv_rect)) in active.iter().enumerate() {
             list.SetPipelineState(if i == 0 { &opaque_pso } else { &blend_pso });
             list.SetGraphicsRoot32BitConstants(0, 4, uv_rect.as_ptr() as *const c_void, 0);
             let mut gpu = srv_gpu_base;
@@ -1362,6 +1378,10 @@ unsafe fn ensure_swapchain(p: &mut Presenter, hwnd: HWND, w: u32, h: u32, fmt: D
     }
 }
 
+fn needs_compositor(planes: &[(ID3D12Resource, D3D12_RESOURCE_DESC, [f32; 4])]) -> bool {
+    planes.len() > 1 || planes.first().is_some_and(|(_, _, uv)| *uv != [0.0, 0.0, 1.0, 1.0])
+}
+
 unsafe fn present_now(min_interval: Duration, frame: Option<(usize, Vec<(usize, Option<[i32; 4]>)>)>) {
     if IN_PRESENT.with(|c| c.replace(true)) {
         return;
@@ -1449,7 +1469,7 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, Vec<(usize, 
     let due = frame_dump_due();
     let mut dumps = Vec::new();
     let mut composited = false;
-    if resolved.len() > 1 {
+    if needs_compositor(&resolved) {
         if p.compositor.is_none() {
             p.compositor = Compositor::new(&p.dev);
         }
@@ -2056,6 +2076,10 @@ mod tests {
         assert_eq!(source_uv_rect(got[0].1, 1600, 900), [0.1, 0.1, 0.5, 0.5]);
         assert_eq!(source_uv_rect(got[1].1, 3840, 2160), [0.0, 0.0, 1.0, 1.0]);
         assert_eq!(source_uv_rect(Some([0, 0, 4000, 900]), 1920, 1080), [0.0, 0.0, 1.0, 1.0]);
+        let big = vec![0u8; (MAX_PLANES + 2) * PLANE_STRIDE];
+        let cap = MAX_PLANES * (PLANE_STRIDE / 8);
+        assert_eq!(unsafe { raw_plane_words((MAX_PLANES + 2) as u32, big.as_ptr()) }.len(), cap);
+        assert_eq!(unsafe { raw_plane_words(u32::MAX, big.as_ptr()) }.len(), cap);
     }
 }
 
@@ -2146,8 +2170,13 @@ mod frame_dump_tests {
         }
     }
 
+    // D3D12CreateDevice(WARP) returns a process-wide singleton device that deduplicates identical
+    // root signatures, so tests checking `comp.root_sig` COM refcounts serialize against siblings.
+    static COMPOSITOR_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn compositor_blends_ui_plane_over_scene_plane() {
+        let _lock = COMPOSITOR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
             let adapter: IDXGIAdapter = factory.EnumWarpAdapter().unwrap();
@@ -2285,6 +2314,106 @@ mod frame_dump_tests {
             assert_eq!(px(6, 1), [255, 0, 0, 255], "opaque UI overwrites scene plane");
             let blend = px(1, 2);
             assert!(blend[0] <= 2 && (126..=130).contains(&blend[1]) && (125..=129).contains(&blend[2]) && blend[3] == 255, "unexpected blend {blend:?}");
+            rb.Unmap(0, None);
+        }
+    }
+
+    unsafe fn warp_env() -> (ID3D12Device, ID3D12CommandAllocator, ID3D12GraphicsCommandList, Compositor) {
+        let adapter: IDXGIAdapter = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap().EnumWarpAdapter().unwrap();
+        let mut dev: Option<ID3D12Device> = None;
+        D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut dev).unwrap();
+        let dev = dev.unwrap();
+        let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+        let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+        (dev.clone(), alloc, list, Compositor::new(&dev).unwrap())
+    }
+
+    unsafe fn make_tex_2d(dev: &ID3D12Device, w: u32, h: u32, samples: u32, flags: D3D12_RESOURCE_FLAGS) -> ID3D12Resource {
+        let mut r: Option<ID3D12Resource> = None;
+        let desc = D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: w as u64, Height: h, DepthOrArraySize: 1, MipLevels: 1, Format: DXGI_FORMAT_R8G8B8A8_UNORM, SampleDesc: DXGI_SAMPLE_DESC { Count: samples, Quality: 0 }, Flags: flags, ..Default::default() };
+        dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut r).unwrap();
+        r.unwrap()
+    }
+
+    #[test]
+    fn compositor_releases_root_sig_and_rejects_invalid_planes() {
+        let _lock = COMPOSITOR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let (dev, _alloc, list, mut comp) = warp_env();
+            let refcount = |p: *mut c_void| -> u32 {
+                let vtbl = *(p as *const *const usize);
+                std::mem::transmute::<usize, unsafe extern "system" fn(*mut c_void) -> u32>(*vtbl.add(1))(p);
+                std::mem::transmute::<usize, unsafe extern "system" fn(*mut c_void) -> u32>(*vtbl.add(2))(p)
+            };
+            let before = refcount(comp.root_sig.as_raw());
+            drop(comp.psos_for(&dev, DXGI_FORMAT_R8G8B8A8_UNORM).unwrap());
+            comp.psos.clear();
+            assert_eq!(refcount(comp.root_sig.as_raw()), before, "psos_for leaked root_sig COM refs on success");
+            // Blending on an integer RTV format with SV_Target0 is rejected with E_INVALIDARG by
+            // both Windows D3D12/WARP and vkd3d-proton (which accepts DXGI_FORMAT_BC1_UNORM).
+            assert!(comp.psos_for(&dev, DXGI_FORMAT_R8G8B8A8_UINT).is_none());
+            assert_eq!(refcount(comp.root_sig.as_raw()), before, "psos_for leaked root_sig COM refs on failure");
+
+            let out = make_tex_2d(&dev, 8, 8, 1, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+            let ok = make_tex_2d(&dev, 4, 4, 1, D3D12_RESOURCE_FLAG_NONE);
+            let msaa = make_tex_2d(&dev, 4, 4, 4, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+            let (mut deny, mut bad_fmt, mut buf) = (ok.GetDesc(), ok.GetDesc(), ok.GetDesc());
+            deny.Flags |= D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE;
+            bad_fmt.Format = DXGI_FORMAT_R32_FLOAT;
+            buf.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            let full = [0.0, 0.0, 1.0, 1.0];
+            let cases: &[&[(ID3D12Resource, D3D12_RESOURCE_DESC, [f32; 4])]] = &[
+                &[(ok.clone(), ok.GetDesc(), full), (ok.clone(), deny, full)],
+                &[(ok.clone(), ok.GetDesc(), full), (msaa.clone(), msaa.GetDesc(), full)],
+                &[(ok.clone(), bad_fmt, full)], &[(ok.clone(), buf, full)], &[],
+            ];
+            for (idx, planes) in cases.iter().enumerate() {
+                assert!(!comp.record(&dev, &list, &out, 8, 8, DXGI_FORMAT_R8G8B8A8_UNORM, planes, 0), "case {idx}");
+                assert!(comp.psos.is_empty(), "case {idx} mutated compositor state");
+            }
+            list.Close().unwrap();
+        }
+    }
+
+    #[test]
+    fn compositor_scales_single_plane_sub_rect() {
+        let _lock = COMPOSITOR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let (dev, _alloc, list, mut comp) = warp_env();
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let (src, out) = (make_tex_2d(&dev, 8, 8, 1, D3D12_RESOURCE_FLAG_NONE), make_tex_2d(&dev, 8, 8, 1, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET));
+            let (full, sub) = ([0.0, 0.0, 1.0, 1.0], [0.0, 0.0, 0.5, 0.5]);
+            assert!(!needs_compositor(&[(src.clone(), src.GetDesc(), full)]));
+            assert!(needs_compositor(&[(src.clone(), src.GetDesc(), sub)]));
+            assert!(needs_compositor(&[(src.clone(), src.GetDesc(), full), (src.clone(), src.GetDesc(), full)]));
+
+            let mut up: Option<ID3D12Resource> = None;
+            let up_desc = D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_BUFFER, Width: 256 * 8, Height: 1, DepthOrArraySize: 1, MipLevels: 1, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR, ..Default::default() };
+            dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_UPLOAD, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &up_desc, D3D12_RESOURCE_STATE_GENERIC_READ, None, &mut up).unwrap();
+            let (up, mut ptr) = (up.unwrap(), std::ptr::null_mut());
+            up.Map(0, None, Some(&mut ptr)).unwrap();
+            let bytes = std::slice::from_raw_parts_mut(ptr as *mut u8, 256 * 8);
+            for y in 0..8usize {
+                for x in 0..8usize { bytes[y * 256 + x * 4..y * 256 + x * 4 + 4].copy_from_slice(if x < 4 && y < 4 { &[0, 255, 0, 255] } else { &[255, 0, 0, 255] }); }
+            }
+            up.Unmap(0, None);
+            let dst_loc = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(&src), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 } };
+            let src_loc = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(&up), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT { Offset: 0, Footprint: D3D12_SUBRESOURCE_FOOTPRINT { Format: DXGI_FORMAT_R8G8B8A8_UNORM, Width: 8, Height: 8, Depth: 1, RowPitch: 256 } } } };
+            list.ResourceBarrier(&[transition(&src, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST)]);
+            list.CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, None);
+            list.ResourceBarrier(&[transition(&src, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON), transition(&out, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET)]);
+            assert!(comp.record(&dev, &list, &out, 8, 8, DXGI_FORMAT_R8G8B8A8_UNORM, &[(src.clone(), src.GetDesc(), sub)], 0));
+            list.ResourceBarrier(&[transition(&out, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            let (rb, fp) = readback_copy(&list, &out, &out.GetDesc()).unwrap();
+            list.Close().unwrap();
+            queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+            queue.Signal(&fence, 1).unwrap();
+            fence::wait(&fence, 1, &dev, None, 5000).unwrap();
+            rb.Map(0, None, Some(&mut ptr)).unwrap();
+            for (x, y) in [(1usize, 1usize), (5, 5), (6, 6)] {
+                assert_eq!((ptr as *const u8).add(fp.Offset as usize + y * fp.Footprint.RowPitch as usize + x * 4).cast::<[u8; 4]>().read_unaligned(), [0, 255, 0, 255], "pixel ({x},{y})");
+            }
             rb.Unmap(0, None);
         }
     }
