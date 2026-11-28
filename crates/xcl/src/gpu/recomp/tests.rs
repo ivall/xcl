@@ -1710,6 +1710,62 @@ fn buffer_format_table_matches_llvm() {
 }
 
 #[test]
+fn buffer_format_components_fit_in_one_dword() {
+    for (format, name) in super::emit::BUF_FORMATS.iter().enumerate() {
+        let info = super::emit::buf_format_info(format);
+        let mut offset = 0;
+        for component in 0..(info & 7) {
+            let width = (info >> (8 + 6 * component)) & 63;
+            assert!(width > 0 && (offset & 31) + width <= 32, "{name} component {component}");
+            offset += width;
+        }
+        assert!(offset <= 128, "{name}");
+    }
+}
+
+#[test]
+fn gpu_buffer_format_component_decode() {
+    if !gpu_ready() {
+        return;
+    }
+    let code = prog(&[("BUFFER_LOAD_FORMAT_XYZW", "ENC_MUBUF", &[("VDATA", 10), ("SRSRC", 3), ("SOFFSET", 128)], None)]);
+    let t = translate(&code, &Options { wave64: false, ..Default::default() }).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    let cases = [
+        ("8_8_8_8_UNORM", [0x00FF00FFu32, 0, 0, 0], [f(1.0), 0, f(1.0), 0]),
+        ("2_10_10_10_SNORM", [1 << 30 | 0x200 << 20 | 0x1FF << 10, 0, 0, 0], [0, f(1.0), f(-1.0), f(1.0)]),
+        ("8_8_USCALED", [0x7FFF, 0, 0, 0], [f(255.0), f(127.0), 0, f(1.0)]),
+        ("8_8_SSCALED", [0x7FFF, 0, 0, 0], [f(-1.0), f(127.0), 0, f(1.0)]),
+        ("16_16_SINT", [0xFF00FFFC, 0, 0, 0], [(-4i32) as u32, (-256i32) as u32, 0, 1]),
+        ("32_32_32_32_UINT", [0, 0x80000000, 0x12345678, u32::MAX], [0, 0x80000000, 0x12345678, u32::MAX]),
+        ("32_32_32_32_FLOAT", [f(-0.0), f(2.5), f(f32::INFINITY), f(-1.0)], [f(-0.0), f(2.5), f(f32::INFINITY), f(-1.0)]),
+        ("16_16_16_16_FLOAT", [0x00003C00, 0x3800C000, 0, 0], [f(1.0), 0, f(-2.0), f(0.5)]),
+        ("10_11_11_FLOAT", [1 | (31 << 6) << 11 | (15 << 5) << 22, 0, 0, 0], [f(2.0f32.powi(-20)), f(f32::INFINITY), f(1.0), f(1.0)]),
+        ("11_11_10_FLOAT", [1 | ((15 << 6) | 32) << 10 | ((31 << 6) | 1) << 21, 0, 0, 0], [f(2.0f32.powi(-19)), f(1.5), 0x7FC00000, f(1.0)]),
+        ("INVALID", [u32::MAX; 4], [0; 4]),
+    ];
+    let mut state = KernelState::default();
+    let dst_sel = 4 | 5 << 3 | 6 << 6 | 7 << 9;
+    for level in ["-O0", "-O3"] {
+        let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[level]).unwrap();
+        for (name, input, expected) in cases {
+            let format = super::emit::BUF_FORMATS.iter().position(|&f| f == name).unwrap() as u32;
+            // The buffer starts at byte 1 to exercise ld_raw's unaligned load.
+            state.sgpr[12..16].copy_from_slice(&[1, 0, 16, dst_sel | format << 12]);
+            let mut bytes = [0; 20];
+            for (dst, word) in bytes[1..17].chunks_exact_mut(4).zip(input) {
+                dst.copy_from_slice(&word.to_le_bytes());
+            }
+            let mem: Vec<u32> = bytes.chunks_exact(4).map(|word| u32::from_le_bytes(word.try_into().unwrap())).collect();
+            let result = runner::run(&dxil, &state, &mem).unwrap();
+            for (lane, regs) in result.vgpr[..32].iter().enumerate() {
+                assert_eq!(regs[10..14], expected, "{name} {level} lane {lane}");
+            }
+        }
+    }
+}
+
+#[test]
 fn buffer_format_d16_packs_and_unpacks_halves() {
     let code = prog(&[
         ("BUFFER_LOAD_FORMAT_D16_XYZW", "ENC_MUBUF", &[("VDATA", 10), ("SRSRC", 3), ("SOFFSET", 128)], None),

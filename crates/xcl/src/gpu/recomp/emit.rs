@@ -6145,16 +6145,13 @@ void or_at4(inout uint4 r, uint i, uint v) {
     r.x |= select(i == 0u, v, 0u); r.y |= select(i == 1u, v, 0u);
     r.z |= select(i == 2u, v, 0u); r.w |= select(i == 3u, v, 0u);
 }
-uint bits_at(uint4 r, uint off, uint w) {
-    uint i = off >> 5; uint s = off & 31u;
-    uint lo = pick4(r, i); uint hi = select(i < 3u, pick4(r, min(i + 1u, 3u)), 0u);
-    uint v = select(s == 0u, lo, (lo >> s) | (hi << ((32u - s) & 31u)));
-    return select(w >= 32u, v, v & ((1u << (w & 31u)) - 1u));
-}
 float uf_small(uint v, uint mb) {
-    uint e = v >> mb; uint m = v & ((1u << mb) - 1u); float fm = (float)m / (float)(1u << mb);
+    uint e = v >> mb; uint m = v & ((1u << mb) - 1u);
     float special = select(m != 0u, asfloat(0x7FC00000u), asfloat(0x7F800000u));
-    return select(e == 31u, special, select(e == 0u, fm * exp2(-14.0f), exp2((float)e - 15.0f) * (1.0f + fm)));
+    // Rebase the 5-bit exponent from 15 to 127. Subnormals use 2^(-14 - mb).
+    float subnormal = (float)m * asfloat((113u - mb) << 23);
+    float normal = asfloat(((112u + e) << 23) | (m << (23u - mb)));
+    return select(e == 31u, special, select(e == 0u, subnormal, normal));
 }
 uint fmt_bytes(uint info) { return (((info >> 8) & 63u) + ((info >> 14) & 63u) + ((info >> 20) & 63u) + ((info >> 26) & 63u)) / 8u; }
 uint fmt_comp(uint4 r, uint info, uint c) {
@@ -6162,17 +6159,18 @@ uint fmt_comp(uint4 r, uint info, uint c) {
     bool isint = or(ty == 4u, ty == 5u);
     uint off = select(c > 0u, (info >> 8) & 63u, 0u) + select(c > 1u, (info >> 14) & 63u, 0u) + select(c > 2u, (info >> 20) & 63u, 0u);
     uint w = (info >> ((8u + 6u * c) & 31u)) & 63u;
-    uint v = bits_at(r, off, w);
+    // Each BUF_FORMATS component fits in one dword of the aligned ld_raw result.
     uint sh = (32u - w) & 31u;
-    int sv = select(w >= 32u, (int)v, ((int)(v << sh)) >> sh);
-    float maxu = select(w >= 32u, 4294967295.0f, (float)((1u << (w & 31u)) - 1u));
-    float maxs = select(w >= 32u, 2147483647.0f, (float)((1u << ((w - 1u) & 31u)) - 1u));
-    float fv = (float)v; float fsv = (float)sv;
-    // exact endpoints (the hardware conversion is exact; DXC divides approximately)
-    uint f_un = asuint(select(v == 0u, 0.0f, select(fv >= maxu, 1.0f, fv / maxu)));
-    uint f_sn = asuint(select(sv == 0, 0.0f, select(fsv >= maxs, 1.0f, max(fsv / maxs, -1.0f))));
+    uint v = (pick4(r, (off >> 5) & 3u) >> (off & 31u)) & (0xFFFFFFFFu >> sh);
+    int sv = ((int)(v << sh)) >> sh;
+    uint sign = ty & 1u;
+    bool is_signed = sign != 0u;
+    float value = select(is_signed, (float)sv, (float)v);
+    float maxv = (float)(0xFFFFFFFFu >> ((sh + sign) & 31u));
+    // Share the divide for UNORM and SNORM and keep their endpoints exact.
+    float norm = select(value == 0.0f, 0.0f, select(value >= maxv, 1.0f, max(value / maxv, -1.0f)));
     uint flt = select(w == 32u, v, select(w == 16u, asuint(f16tof32(v)), asuint(uf_small(v, select(w == 11u, 6u, 5u)))));
-    uint res = select(ty == 0u, f_un, select(ty == 1u, f_sn, select(ty == 2u, asuint(fv), select(ty == 3u, asuint(fsv), select(ty == 4u, v, select(ty == 5u, (uint)sv, flt))))));
+    uint res = select(ty < 2u, asuint(norm), select(ty < 4u, asuint(value), select(isint, select(is_signed, (uint)sv, v), flt)));
     return select(c >= n, select(c == 3u, select(isint, 1u, 0x3F800000u), 0u), res);
 }
 // image_bvh(64)_intersect_ray: type = node & 7, at = low 32 bits of base + (node & ~7) * 8.
