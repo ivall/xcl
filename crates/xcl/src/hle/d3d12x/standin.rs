@@ -14,9 +14,11 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
-use windows::core::GUID;
+use windows::core::{Interface, IUnknown, GUID};
+use windows::Win32::Graphics::Direct3D::WKPDID_D3DDebugObjectNameW;
+use windows::Win32::Graphics::Direct3D12::{ID3D12DeviceChild, ID3D12Object, ID3D12Pageable, ID3D12PipelineState};
 
-use crate::util::{HRESULT, E_INVALIDARG, S_OK};
+use crate::util::{HRESULT, E_INVALIDARG, E_NOINTERFACE, S_OK};
 
 const DXGI_ERROR_NOT_FOUND: HRESULT = 0x887A_0002u32 as HRESULT;
 const DXGI_ERROR_MORE_DATA: HRESULT = 0x887A_0003u32 as HRESULT;
@@ -80,26 +82,27 @@ pub unsafe fn shell(key: Key, make: impl FnOnce() -> Result<usize, HRESULT>) -> 
     let shared = match found {
         Some(s) => s,
         None => {
-            // (outside the lock: the driver's call; a second thread's pipeline of the same key
-            // replaces the first in the table, both live as long as their shells)
+            // Outside the lock: the driver's call; if another thread filled `key` meanwhile,
+            // reuse the winner and release the redundant driver pipeline outside the lock.
             let pipeline = make()?;
-            if key.root_signature != 0 {
-                // a root signature's address must not come back for another one while the key lives
-                addref(key.root_signature);
-            }
-            let s = Arc::new(Shared { pipeline, root_signature: key.root_signature });
             let mut g = SHARED.lock().unwrap();
             let m = g.get_or_insert_with(HashMap::new);
-            if m.len() >= 64 && m.len().is_power_of_two() {
-                m.retain(|_, w| w.strong_count() != 0);
+            if let Some(existing) = m.get(&key).and_then(Weak::upgrade) {
+                drop(g);
+                unref(pipeline);
+                existing
+            } else {
+                if key.root_signature != 0 { addref(key.root_signature); }
+                let s = Arc::new(Shared { pipeline, root_signature: key.root_signature });
+                if m.len() >= 64 && m.len().is_power_of_two() { m.retain(|_, w| w.strong_count() != 0); }
+                let grew = m.insert(key, Arc::downgrade(&s)).is_none();
+                let n = m.len();
+                drop(g);
+                if grew && n.is_power_of_two() {
+                    crate::xlog_info!("D3D12.X: {n} driver pipelines stand in for the pipelines not built yet");
+                }
+                s
             }
-            m.insert(key, Arc::downgrade(&s));
-            let n = m.len();
-            drop(g);
-            if n.is_power_of_two() {
-                crate::xlog_info!("D3D12.X: {n} driver pipelines stand in for the pipelines not built yet");
-            }
-            s
         }
     };
     let pipeline = shared.pipeline;
@@ -131,19 +134,25 @@ impl Drop for Data {
     }
 }
 
+fn is_pipeline_iid(iid: &GUID) -> bool {
+    [IUnknown::IID, ID3D12Object::IID, ID3D12DeviceChild::IID, ID3D12Pageable::IID, ID3D12PipelineState::IID].contains(iid)
+}
+
 unsafe extern "system" fn query_interface(this: *mut c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
-    if ppv.is_null() || riid.is_null() {
-        return E_INVALIDARG;
-    }
-    // the interfaces the driver's object has
+    if ppv.is_null() { return E_INVALIDARG; }
+    *ppv = std::ptr::null_mut();
+    if riid.is_null() { return E_INVALIDARG; }
+    if !is_pipeline_iid(&*riid) { return E_NOINTERFACE; }
+    // `Shell`'s vtable implements the five single-inheritance pipeline IIDs (`IUnknown` through
+    // `ID3D12PipelineState`). Real `d3d12.dll` pipeline objects can return a subobject pointer
+    // distinct from `pipeline` for base IIDs, so accept any non-null success from the driver,
+    // release that driver reference, and return `this`.
     let pipeline = (&*(this as *const Shell)).shared.pipeline;
     let f: unsafe extern "system" fn(usize, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(method(pipeline, 0));
     let mut out = std::ptr::null_mut();
     let hr = f(pipeline, riid, &mut out);
-    *ppv = std::ptr::null_mut();
-    if hr < 0 || out.is_null() {
-        return hr;
-    }
+    if hr < 0 { return hr; }
+    if out.is_null() { return E_NOINTERFACE; }
     unref(out as usize);
     add_ref(this);
     *ppv = this;
@@ -213,18 +222,24 @@ unsafe fn put(this: *mut c_void, guid: *const GUID, d: Option<Data>) -> HRESULT 
 }
 
 unsafe extern "system" fn set_private_data(this: *mut c_void, guid: *const GUID, size: u32, data: *const u8) -> HRESULT {
-    put(this, guid, (!data.is_null()).then(|| Data::Bytes(std::slice::from_raw_parts(data, size as usize).to_vec())))
+    if guid.is_null() || (size != 0 && data.is_null()) { return E_INVALIDARG; }
+    put(this, guid, (size != 0).then(|| Data::Bytes(std::slice::from_raw_parts(data, size as usize).to_vec())))
 }
 
 unsafe extern "system" fn set_private_data_interface(this: *mut c_void, guid: *const GUID, obj: usize) -> HRESULT {
+    if guid.is_null() { return E_INVALIDARG; }
     if obj != 0 {
         addref(obj);
     }
     put(this, guid, (obj != 0).then_some(Data::Interface(obj)))
 }
 
-unsafe extern "system" fn set_name(_this: *mut c_void, _name: *const u16) -> HRESULT {
-    S_OK
+unsafe extern "system" fn set_name(this: *mut c_void, name: *const u16) -> HRESULT {
+    if name.is_null() { return E_INVALIDARG; }
+    let mut len = 0usize;
+    while *name.add(len) != 0 { len += 1; }
+    let bytes = std::slice::from_raw_parts(name as *const u8, (len + 1) * std::mem::size_of::<u16>());
+    put(this, &WKPDID_D3DDebugObjectNameW, Some(Data::Bytes(bytes.to_vec())))
 }
 
 unsafe extern "system" fn get_device(this: *mut c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
@@ -370,6 +385,122 @@ mod tests {
             assert_eq!(refs(held), 2, "let go with the object");
             release(other);
             assert_eq!(refs(a), 0);
+        }
+    }
+
+    #[test]
+    fn concurrent_shell_miss_reuses_winner_and_releases_loser_pipeline() {
+        let (rs, p1, p2, barrier) = (counted(), counted(), counted(), Arc::new(std::sync::Barrier::new(2)));
+        let k = key(rs, 41);
+        let run = |p: usize| {
+            let (b, k) = (barrier.clone(), k.clone());
+            std::thread::spawn(move || unsafe { let (s, d) = shell(k, || { b.wait(); Ok(p) }).unwrap(); (s as usize, d) })
+        };
+        let (t1, t2) = (run(at(p1)), run(at(p2)));
+        let ((s1, d1), (s2, d2)) = (t1.join().unwrap(), t2.join().unwrap());
+        assert!(s1 != s2 && d1 == d2);
+        let (winner, loser) = if d1 == at(p1) { (p1, p2) } else { (p2, p1) };
+        assert_eq!((refs(winner), refs(loser), refs(rs)), (1, 0, 2));
+        unsafe { release(s1 as *mut c_void); release(s2 as *mut c_void); }
+        assert_eq!((refs(p1), refs(p2), refs(rs)), (0, 0, 1));
+    }
+
+    #[test]
+    fn query_interface_rejects_secondary_interfaces_and_zeroes_out_on_null_riid() {
+        const SECONDARY: GUID = GUID::from_u128(0xdead_beef_1234_5678_9abc_def0_1122_3344);
+        #[repr(C)]
+        struct Multi { vtable: *const usize, refs: AtomicU32, tearoff: *const Counted }
+        unsafe extern "system" fn multi_qi(this: *mut c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+            let m = &*(this as *const Multi);
+            if *riid == IUnknown::IID && !m.tearoff.is_null() { up(m.tearoff as *mut c_void); *ppv = m.tearoff as *mut c_void; return S_OK; }
+            if is_pipeline_iid(&*riid) || *riid == SECONDARY { up(this); *ppv = this; return S_OK; }
+            *ppv = std::ptr::null_mut();
+            E_NOINTERFACE
+        }
+        let mk = |t: *const Counted| -> &'static Multi {
+            let v: &'static [usize; 3] = Box::leak(Box::new([multi_qi as usize, up as usize, down as usize]));
+            Box::leak(Box::new(Multi { vtable: v.as_ptr(), refs: AtomicU32::new(1), tearoff: t }))
+        };
+        let (rs, primary, tearoff) = (counted(), mk(std::ptr::null()), counted());
+        let tear_host = mk(tearoff as *const Counted);
+        unsafe {
+            let (s, _) = shell(key(rs, 42), || Ok(primary as *const Multi as usize)).unwrap();
+            let mut out = s;
+            assert_eq!((query_interface(s, std::ptr::null(), &mut out), out.is_null()), (E_INVALIDARG, true));
+            for iid in [IUnknown::IID, ID3D12Object::IID, ID3D12DeviceChild::IID, ID3D12Pageable::IID, ID3D12PipelineState::IID] {
+                out = std::ptr::null_mut();
+                assert_eq!((query_interface(s, &iid, &mut out), out, primary.refs.load(Ordering::Acquire)), (S_OK, s, 1));
+                assert_eq!(release(s), 1);
+            }
+            out = s;
+            assert_eq!((query_interface(s, &SECONDARY, &mut out), out.is_null(), primary.refs.load(Ordering::Acquire)), (E_NOINTERFACE, true, 1));
+            release(s);
+            let (s2, _) = shell(key(rs, 43), || Ok(tear_host as *const Multi as usize)).unwrap();
+            out = std::ptr::null_mut();
+            assert_eq!((query_interface(s2, &IUnknown::IID, &mut out), out, refs(tearoff)), (S_OK, s2, 1));
+            assert_eq!(release(s2), 1);
+            out = s2;
+            assert_eq!((query_interface(s2, &SECONDARY, &mut out), out.is_null(), refs(tearoff)), (E_NOINTERFACE, true, 1));
+            release(s2);
+        }
+    }
+
+    #[test]
+    fn query_interface_on_real_d3d12_pipeline_accepts_hierarchy_and_rejects_other() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::*;
+        let Ok(dxil) = crate::gpu::recomp::dxc::compile("[RootSignature(\"\")][numthreads(1,1,1)] void main() {}", "main", "cs_6_0", &[]) else {
+            return crate::gpu::recomp::runner::skip_test("no DXC");
+        };
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                let Ok(f) = CreateDXGIFactory1::<IDXGIFactory4>() else { return crate::gpu::recomp::runner::skip_test("no GPU or WARP"); };
+                let Ok(w) = f.EnumWarpAdapter::<IDXGIAdapter>() else { return crate::gpu::recomp::runner::skip_test("no GPU or WARP"); };
+                if D3D12CreateDevice(&w, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() { return crate::gpu::recomp::runner::skip_test("no GPU or WARP"); }
+            }
+            let dev = dev.unwrap();
+            let rs: ID3D12RootSignature = dev.CreateRootSignature(0, &dxil).unwrap();
+            let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::ManuallyDrop::new(Some(rs.clone())),
+                CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr() as _, BytecodeLength: dxil.len() },
+                ..Default::default()
+            };
+            let pso: ID3D12PipelineState = dev.CreateComputePipelineState(&desc).unwrap();
+            let _ = std::mem::ManuallyDrop::into_inner(desc.pRootSignature);
+            let pso_raw = pso.into_raw() as usize;
+            let k = Key { device: dev.as_raw() as usize, root_signature: rs.as_raw() as usize, kind: 1, state: vec![0x51] };
+            let (s, _) = shell(k, || Ok(pso_raw)).unwrap();
+            for iid in [IUnknown::IID, ID3D12Object::IID, ID3D12DeviceChild::IID, ID3D12Pageable::IID, ID3D12PipelineState::IID] {
+                let mut out = std::ptr::null_mut();
+                assert_eq!(query_interface(s, &iid, &mut out), S_OK, "real pipeline QI failed for {iid:?}");
+                assert_eq!(out, s);
+                assert_eq!(release(s), 1);
+            }
+            let mut out = s;
+            assert_eq!(query_interface(s, &ID3D12DebugCommandList::IID, &mut out), E_NOINTERFACE);
+            assert!(out.is_null());
+            assert_eq!(release(s), 0);
+        }
+    }
+
+    #[test]
+    fn set_private_data_validation_and_per_shell_set_name() {
+        let (rs, a, id) = (counted(), counted(), GUID::from_u128(0x5678));
+        unsafe {
+            let (s1, _) = shell(key(rs, 44), || Ok(at(a))).unwrap();
+            let (s2, _) = shell(key(rs, 44), || panic!("shared")).unwrap();
+            assert_eq!((set_private_data(s1, &id, 3, [4u8, 5, 6].as_ptr()), set_private_data(s1, &id, 4, std::ptr::null())), (S_OK, E_INVALIDARG));
+            let (mut buf, mut n) = ([0u8; 16], 16u32);
+            assert_eq!((get_private_data(s1, &id, &mut n, buf.as_mut_ptr()), n, &buf[..3]), (S_OK, 3, &[4, 5, 6][..]));
+            assert_eq!(set_private_data(s1, &id, 0, [9u8].as_ptr()), S_OK);
+            n = 16; assert_eq!(get_private_data(s1, &id, &mut n, buf.as_mut_ptr()), DXGI_ERROR_NOT_FOUND);
+            let name: Vec<u16> = "sky\0".encode_utf16().collect();
+            assert_eq!((set_name(s1, std::ptr::null()), set_name(s1, name.as_ptr()), set_name(s1, std::ptr::null())), (E_INVALIDARG, S_OK, E_INVALIDARG));
+            n = 16; assert_eq!((get_private_data(s1, &WKPDID_D3DDebugObjectNameW, &mut n, buf.as_mut_ptr()), n, &buf[..8]), (S_OK, 8, &[b's', 0, b'k', 0, b'y', 0, 0, 0][..]));
+            n = 16; assert_eq!(get_private_data(s2, &WKPDID_D3DDebugObjectNameW, &mut n, buf.as_mut_ptr()), DXGI_ERROR_NOT_FOUND);
+            release(s1); release(s2);
         }
     }
 }
