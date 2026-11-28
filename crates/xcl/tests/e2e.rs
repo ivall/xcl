@@ -360,3 +360,53 @@ fn title_under_the_debug_layer(dred: bool) {
     let bad: Vec<&str> = log.lines().filter(|l| l.contains("is invalid for use as a source buffer")).collect();
     assert!(bad.is_empty(), "{} copies from a buffer that is not in COPY_SOURCE, first: {}", bad.len(), bad[0]);
 }
+
+#[test]
+fn inspect_reports_the_fake_titles_console_imports() {
+    let xcl = PathBuf::from(env!("CARGO_BIN_EXE_xcl"));
+    let bin_dir = xcl.parent().unwrap();
+    let title = bin_dir.join("xcl_testtitle.exe");
+    let dll = bin_dir.join("testgame_mw.dll");
+    assert!(
+        title.is_file() && dll.is_file(),
+        "missing {} / {} – build first: cargo build --workspace",
+        title.display(),
+        dll.display()
+    );
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("inspect");
+    let _ = std::fs::remove_dir_all(&root);
+    let game = root.join("game");
+    copy_dir(&manifest.join("..").join("..").join("tests").join("data").join("testgame"), &game);
+    std::fs::copy(&title, game.join("xcl_testtitle.exe")).unwrap();
+    std::fs::copy(&dll, game.join("testgame_mw.dll")).unwrap();
+
+    let json = Command::new(&xcl)
+        .arg("inspect")
+        .arg(game.join("xcl_testtitle.exe"))
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(json.status.success(), "{:?}", json);
+    let out: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(out["is_dll"], false);
+    let imports = out["imports"].as_array().unwrap();
+    assert!(!imports.is_empty(), "{:?}", json);
+    let statuses: Vec<&str> = imports.iter().map(|e| e["status"].as_str().unwrap()).collect();
+    assert!(statuses.iter().any(|s| *s == "STUB"), "{statuses:?}");
+    assert!(statuses.iter().any(|s| s.starts_with("HLE (kernelx")), "{statuses:?}");
+    assert!(statuses.iter().any(|s| s.starts_with("HLE (xgameruntime")), "{statuses:?}");
+
+    let text = Command::new(&xcl)
+        .arg("inspect")
+        .arg(game.join("xcl_testtitle.exe"))
+        .output()
+        .unwrap();
+    assert!(text.status.success(), "{:?}", text);
+    let out = String::from_utf8(text.stdout).unwrap();
+    assert!(
+        out.contains("Console game:  yes (imports kernelx.dll, xgameruntime.dll)"),
+        "{out}"
+    );
+    std::fs::remove_dir_all(&root).unwrap();
+}
