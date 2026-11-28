@@ -7864,10 +7864,58 @@ fn stream_subobjects(buf: &[u8]) -> Option<Vec<(u32, &[u8])>> {
     Some(out)
 }
 
+/// For a stream that uses a subobject type above 22: its type sequence (read with the console's
+/// numbering) and the sum of its 8-aligned subobject sizes under the console table and under the PC
+/// table (`None` when the PC table does not know a type). None, without allocating, otherwise.
+fn console_stream_sizes(buf: &[u8]) -> Option<(Vec<u32>, usize, Option<usize>)> {
+    let walk = |f: &mut dyn FnMut(u32)| {
+        let mut off = 0usize;
+        while off + 8 <= buf.len() {
+            let ty = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
+            let Some((psize, palign)) = super::null::console_subobject_payload(ty) else { break };
+            f(ty);
+            off += ((if palign == 8 { 8 } else { 4 }) + psize + 7) & !7;
+        }
+    };
+    let mut found = false;
+    walk(&mut |ty| found |= ty >= 23);
+    if !found {
+        return None;
+    }
+    let mut types = Vec::new();
+    walk(&mut |ty| types.push(ty));
+    let sum = |table: fn(u32) -> Option<(usize, usize)>| {
+        types.iter().try_fold(0usize, |s, &ty| {
+            let (psize, palign) = table(ty)?;
+            Some(s + (((if palign == 8 { 8 } else { 4 }) + psize + 7) & !7))
+        })
+    };
+    let console = sum(super::null::console_subobject_payload)?;
+    let pc = sum(super::null::subobject_payload);
+    Some((types, console, pc))
+}
+
+/// Log (rate-limited) a stream that uses console subobject types: whether its size adds up.
+fn log_console_stream(buf: &[u8]) {
+    static N: AtomicU64 = AtomicU64::new(0);
+    if N.load(Ordering::Relaxed) >= 16 {
+        return;
+    }
+    if let Some((types, console, pc)) = console_stream_sizes(buf) {
+        if N.fetch_add(1, Ordering::Relaxed) < 16 {
+            crate::xlog_info!(
+                "D3D12.X: pipeline stream uses subobject types above 22: types {types:?}, SizeInBytes {}, sum {} (console table, {}) / {} (PC table, {})",
+                buf.len(), console, console == buf.len(),
+                pc.map_or("unknown type".to_string(), |s| s.to_string()), pc == Some(buf.len()));
+        }
+    }
+}
+
 /// The stream's subobjects up to the first of a type XCL does not know (logged): a console
 /// shader in front of it must still be found.
 // Checked parsing and extended rasterizer projection adapted from PR #2621 by Decodere.
 fn known_subobjects_checked(buf: &[u8]) -> (Vec<(u32, &[u8])>, bool) {
+    log_console_stream(buf);
     let mut out = Vec::new();
     let mut off = 0usize;
     loop {
@@ -11201,6 +11249,45 @@ mod map_tests {
                 m.remove(&(upload.as_raw() as usize));
             }
         }
+    }
+
+    fn raw_stream(subobjects: &[(u32, usize, usize)]) -> Vec<u8> {
+        let mut b = Vec::new();
+        for &(ty, psize, palign) in subobjects {
+            b.extend_from_slice(&ty.to_le_bytes());
+            if palign == 8 {
+                b.extend_from_slice(&[0; 4]);
+            }
+            b.extend(std::iter::repeat(0u8).take(psize));
+            while b.len() % 8 != 0 {
+                b.push(0);
+            }
+        }
+        b
+    }
+
+    #[test]
+    fn console_stream_sizes_add_up_under_the_console_table_only() {
+        let seq = [1u32, 2, 23, 24, 25, 26, 27, 28, 29, 15, 16];
+        // The console's payload sizes, written out (not read from the table under test).
+        let stream = raw_stream(&[
+            (1, 16, 8), (2, 16, 8), (23, 16, 8), (24, 16, 8), (25, 32, 4), (26, 24, 4),
+            (27, 60, 4), (28, 12, 4), (29, 24, 4), (15, 36, 4), (16, 4, 4),
+        ]);
+        let (types, console, pc) = console_stream_sizes(&stream).unwrap();
+        assert_eq!(types, seq);
+        assert_eq!(console, stream.len());
+        assert_ne!(pc, Some(stream.len()));
+    }
+
+    #[test]
+    fn pc_only_stream_adds_up_under_both_tables() {
+        let stream = raw_stream(&[(1, 16, 8), (2, 16, 8), (15, 36, 4), (16, 4, 4)]);
+        assert!(console_stream_sizes(&stream).is_none(), "no type above 22: nothing to log");
+        let mut with_ms = stream.clone();
+        with_ms.extend(raw_stream(&[(24, 16, 8)]));
+        let (_, console, pc) = console_stream_sizes(&with_ms).unwrap();
+        assert_eq!((console, pc), (with_ms.len(), Some(with_ms.len())));
     }
 
     #[test]

@@ -355,6 +355,27 @@ pub fn subobject_payload(ty: u32) -> Option<(usize, usize)> {
     })
 }
 
+/// (payload size, payload alignment) of a pipeline-state stream subobject in the console's
+/// numbering: the PC's up to type 22, then 23 AS, 24 MS, 25 pixel-shader options, 26 depth-stencil
+/// options, 27 graphics shader limits, 28 tessellation params, 29 compute shader limits and
+/// 100 / 101 / 102 = the PC's DEPTH_STENCIL2 / RASTERIZER1 / RASTERIZER2. Diagnostics only:
+/// `subobject_payload` stays the PC table.
+pub fn console_subobject_payload(ty: u32) -> Option<(usize, usize)> {
+    Some(match ty {
+        0..=22 => return subobject_payload(ty),
+        23 | 24 => (16, 8),
+        25 => (32, 4),
+        26 => (24, 4),
+        27 => (60, 4),
+        28 => (12, 4),
+        29 => (24, 4),
+        100 => (60, 4),
+        101 => (44, 4),
+        102 => (40, 4),
+        _ => return None,
+    })
+}
+
 /// D3D12_PIPELINE_STATE_STREAM_DESC { SIZE_T SizeInBytes; void* pPipelineStateSubobjectStream; }
 pub unsafe fn capture_stream_desc(desc: *const u8) {
     if !crate::gpu::shader::readable(desc as usize, 16) {
