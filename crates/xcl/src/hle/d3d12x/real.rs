@@ -6430,6 +6430,32 @@ mod compute_blob_tests {
         assert!(std::sync::Arc::ptr_eq(&kept, &built));
         assert_eq!(cache.blobs.lock().unwrap().as_ref().unwrap().1, built.len());
     }
+
+    /// A blob the in-memory store has no room for still goes back to its caller (e.g. for warm
+    /// replay receipts); one that fits is kept in memory as well.
+    #[test]
+    fn a_blob_over_the_memory_budget_still_reaches_its_caller() {
+        let cache = super::DriverBlobs::new();
+        let took = std::time::Duration::ZERO;
+        let fits = super::keep_driver_blob(&cache, 4, 1u64, super::COMPUTE_BLOB_MIN_DXIL, None, took, || Some(vec![7u8; 4]))
+            .expect("a blob that fits");
+        assert_eq!(fits.as_slice(), &[7u8; 4]);
+        assert!(std::sync::Arc::ptr_eq(&cache.get(1).unwrap(), &fits));
+        assert_eq!(cache.blobs.lock().unwrap().as_ref().unwrap().1, 4);
+
+        // Concurrent/duplicate lookup still sees the kept blob without double-charging RAM.
+        let dup = super::keep_driver_blob(&cache, 4, 1u64, super::COMPUTE_BLOB_MIN_DXIL, None, took, || panic!("duplicate read"));
+        assert!(std::sync::Arc::ptr_eq(&fits, &dup.unwrap()));
+        assert_eq!(cache.blobs.lock().unwrap().as_ref().unwrap().1, 4);
+
+        // The RAM cache is full: the new blob is not admitted to RAM, yet still returned to its caller.
+        let over = super::keep_driver_blob(&cache, 4, 2u64, super::COMPUTE_BLOB_MIN_DXIL, None, took, || Some(vec![9u8; 8]));
+        assert!(cache.get(2).is_none());
+        assert_eq!(cache.blobs.lock().unwrap().as_ref().unwrap().1, 4);
+        assert_eq!(over.expect("the blob for the caller").as_slice(), &[9u8; 8]);
+
+        assert!(super::keep_driver_blob(&cache, 4, 3u64, super::COMPUTE_BLOB_MIN_DXIL, None, took, || Some(Vec::new())).is_none());
+    }
 }
 
 /// Read `GetCachedBlob` from either an adopted or raw PC `ID3D12PipelineState`.
@@ -6457,25 +6483,30 @@ unsafe fn read_pso_cached_blob(pso: *mut c_void) -> Option<Vec<u8>> {
 }
 
 /// Offer the exact result and duration of one successful build to the bounded RAM cache and,
-/// when slow, the disk cache. One same-key owner captures and publishes at a time: another
-/// completed builder cannot charge its duration to these bytes or overwrite them afterward.
+/// when slow, the disk cache, returning the captured blob even when the RAM cap refuses it.
+/// One same-key owner captures and publishes at a time: another completed builder cannot charge
+/// its duration to these bytes or overwrite them afterward.
 fn keep_driver_blob<K: Copy + Eq + std::hash::Hash>(
     cache: &DriverBlobs<K>, limit: usize, key: K, dxil_len: usize,
     disk: Option<&std::path::Path>, took: std::time::Duration, read: impl FnOnce() -> Option<Vec<u8>>,
-) {
-    if (dxil_len < COMPUTE_BLOB_MIN_DXIL && !driver_cache::keep_fixtures()) || !cache.reserve(key) {
-        return;
+) -> Option<std::sync::Arc<Vec<u8>>> {
+    if dxil_len < COMPUTE_BLOB_MIN_DXIL && !driver_cache::keep_fixtures() {
+        return None;
+    }
+    if !cache.reserve(key) {
+        return cache.get(key);
     }
     let keep_turn = disk.and_then(|path| driver_cache::KeepTurn::new(path, took));
     let Some(bytes) = read().filter(|bytes| !bytes.is_empty()) else {
         cache.finish(key, None, limit, false);
-        return;
+        return None;
     };
     let blob = std::sync::Arc::new(bytes);
     // Publish to disk before exposing the blob through RAM: a concurrent consumer cannot reject
     // this generation while its staging file is being renamed into place.
     let persisted = keep_turn.as_ref().is_some_and(|turn| turn.store(&blob));
-    cache.finish(key, Some(blob), limit, persisted);
+    cache.finish(key, Some(blob.clone()), limit, persisted);
+    Some(blob)
 }
 
 /// The driver's compiled form of translated graphics pipelines (`GetCachedBlob`),
@@ -7061,9 +7092,9 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
         }
     }
     if cacheable && build.cache_eligible {
-        keep_driver_blob(&GRAPHICS_BLOBS, GRAPHICS_BLOBS_MAX, gkey, bytes, disk.as_deref(), build.built_in_driver,
+        let kept = keep_driver_blob(&GRAPHICS_BLOBS, GRAPHICS_BLOBS_MAX, gkey, bytes, disk.as_deref(), build.built_in_driver,
             || read_pso_cached_blob(*ppv));
-        if let (Some(p), Some(b)) = (disk.as_deref(), graphics_blob(gkey)) {
+        if let (Some(p), Some(b)) = (disk.as_deref(), kept) {
             crate::shaders::warm_replay::accepted(Some(p), &b);
         }
     } else if build.reused && from_disk {
@@ -8251,9 +8282,9 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
                 driver_cache::note(true, gloaded.take());
             }
         } else {
-            keep_driver_blob(&GRAPHICS_BLOBS, GRAPHICS_BLOBS_MAX, key, mesh_bytes, gdisk.as_deref(), gin_driver,
+            let kept = keep_driver_blob(&GRAPHICS_BLOBS, GRAPHICS_BLOBS_MAX, key, mesh_bytes, gdisk.as_deref(), gin_driver,
                 || read_pso_cached_blob(mesh_pso.as_raw()));
-            if let (Some(path), Some(blob)) = (gdisk.as_deref(), graphics_blob(key)) {
+            if let (Some(path), Some(blob)) = (gdisk.as_deref(), kept) {
                 crate::shaders::warm_replay::accepted(Some(path), &blob);
             }
         }
@@ -8317,9 +8348,9 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
         }
     }
     if hc >= 0 && !creused && !compute.is_null() {
-        keep_driver_blob(&COMPUTE_BLOBS, COMPUTE_BLOBS_MAX, ckey, tp.cs.len(), cdisk.as_deref(), cpersist_took,
+        let kept = keep_driver_blob(&COMPUTE_BLOBS, COMPUTE_BLOBS_MAX, ckey, tp.cs.len(), cdisk.as_deref(), cpersist_took,
             || read_pso_cached_blob(compute));
-        if let (Some(p), Some(b)) = (cdisk.as_deref(), compute_blob(ckey)) {
+        if let (Some(p), Some(b)) = (cdisk.as_deref(), kept) {
             crate::shaders::warm_replay::accepted(Some(p), &b);
         }
     } else if creused && cfrom_disk {
