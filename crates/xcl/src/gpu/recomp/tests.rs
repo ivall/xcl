@@ -1822,6 +1822,57 @@ fn gpu_typed_buffer_loads_and_stores() {
     assert_eq!(r.sgpr[50], 1 | 1 << 5, "s_bitset1");
 }
 
+#[test]
+fn st_bytes_writes_every_dword_of_unaligned_stores() {
+    let code = prog(&[
+        ("BUFFER_STORE_FORMAT_XYZW", "ENC_MUBUF", &[("VDATA", 10), ("SRSRC", 3), ("SOFFSET", 128), ("OFFSET", 3)], None),
+    ]);
+    let t = translate(&code, &Options::default()).unwrap();
+    assert!(t.complete(), "{:?}\n{}", t.unsupported_why, t.hlsl);
+    assert!(
+        t.hlsl.contains("uint rem = min(4u, n - k * 4u);") && t.hlsl.contains("st_part(b + 4u * k, m << s, w << s);"),
+        "st_bytes must loop over all dwords on unaligned/non-multiple-of-4 stores:\n{}",
+        t.hlsl
+    );
+    if super::dxc::location().is_ok() {
+        super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+    }
+}
+
+#[test]
+fn gpu_unaligned_multi_dword_format_stores() {
+    if !gpu_ready() {
+        return;
+    }
+    let ident = 4 | 5 << 3 | 6 << 6 | 7 << 9;
+    let vs = |base: u32, fmt: u32| [base, 0, 0x100, ident | fmt << 12];
+    let code = prog(&[
+        ("V_CMPX_EQ_U32", "ENC_VOPC", &[("SRC0", 128), ("VSRC1", 0)], None), // lane 0 only
+        ("BUFFER_STORE_FORMAT_XY", "ENC_MUBUF", &[("VDATA", 10), ("SRSRC", 3), ("SOFFSET", 128), ("OFFSET", 1)], None),   // 8 B @ +1
+        ("BUFFER_STORE_FORMAT_XYZ", "ENC_MUBUF", &[("VDATA", 10), ("SRSRC", 4), ("SOFFSET", 128), ("OFFSET", 2)], None),  // 12 B @ +2
+        ("BUFFER_STORE_FORMAT_XYZW", "ENC_MUBUF", &[("VDATA", 10), ("SRSRC", 5), ("SOFFSET", 128), ("OFFSET", 3)], None), // 16 B @ +3
+    ]);
+    let mem = vec![0xAAAA_AAAAu32; 256];
+    let mut st = KernelState::default();
+    for (i, v) in [vs(0x100, 62), vs(0x140, 72), vs(0x180, 75)].iter().enumerate() {
+        st.sgpr[12 + 4 * i..16 + 4 * i].copy_from_slice(v);
+    }
+    let words = [0x1122_3344u32, 0x5566_7788, 0x99AA_BBCC, 0xDDEE_FF01];
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        r[0] = l as u32;
+        r[10..14].copy_from_slice(&words);
+    }
+    let r = runner::run_code(&code, &st, &mem).unwrap();
+    let bytes: Vec<u8> = r.mem.iter().flat_map(|w| w.to_le_bytes()).collect();
+    for (base, off, count) in [(0x100usize, 1usize, 2usize), (0x140, 2, 3), (0x180, 3, 4)] {
+        let mut expected = vec![0xAAu8; 24];
+        for k in 0..count {
+            expected[off + 4 * k..off + 4 * k + 4].copy_from_slice(&words[k].to_le_bytes());
+        }
+        assert_eq!(&bytes[base..base + 24], expected.as_slice(), "store of {} bytes at {base:#x}+{off}", 4 * count);
+    }
+}
+
 fn el(name: &str, index: u32, sv: u32, ct: u32, reg: u32, mask: u8) -> crate::gpu::dxbc::SigElement {
     crate::gpu::dxbc::SigElement { name: name.into(), index, system_value: sv, component_type: ct, register: reg, mask, rw_mask: mask, stream: 0 }
 }

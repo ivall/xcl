@@ -6266,9 +6266,15 @@ void st_part(uint b, uint m, uint v) { mem.InterlockedAnd(b, ~m); mem.Interlocke
 void st_bytes(uint a, uint4 r, uint n) {
     uint s = (a & 3u) * 8u; uint b = a & ~3u;
     if (s == 0u && (n & 3u) == 0u) { [unroll] for (uint k = 0u; k < 4u; k++) if (k * 4u < n) mem.Store(b + 4u * k, r[k]); return; }
-    uint m = n >= 4u ? 0xFFFFFFFFu : ((1u << (8u * n)) - 1u);
-    st_part(b, m << s, r.x << s);
-    if (s != 0u && s + 8u * n > 32u) st_part(b + 4u, m >> (32u - s), r.x >> (32u - s));
+    [unroll] for (uint k = 0u; k < 4u; k++) {
+        if (k * 4u < n) {
+            uint rem = min(4u, n - k * 4u);
+            uint m = rem >= 4u ? 0xFFFFFFFFu : ((1u << (8u * rem)) - 1u);
+            uint w = r[k];
+            st_part(b + 4u * k, m << s, w << s);
+            if (s != 0u && s + 8u * rem > 32u) st_part(b + 4u * k + 4u, m >> (32u - s), w >> (32u - s));
+        }
+    }
 }
 uint dst_sel(uint4 c, uint sel, bool isint) { return select(sel == 0u, 0u, select(sel == 1u, select(isint, 1u, 0x3F800000u), pick4(c, (sel - 4u) & 3u))); }
 "#;
