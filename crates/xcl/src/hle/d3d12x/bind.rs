@@ -879,6 +879,7 @@ pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
         untrack_two_pass_list(list as usize);
     }
     unmark_deferring(list);
+    super::indirect_guard::forget_batch(list);
     console_list::hold_until_reset(old, blocks);
     retire_recording_res(old, res_bufs, res_marks, res_untracked);
 }
@@ -944,6 +945,7 @@ pub(super) fn inherit_for_split(from: *mut c_void, to: *mut c_void, allocator: u
         untrack_two_pass_list(to as usize);
     }
     unmark_deferring(to);
+    super::indirect_guard::forget_batch(to);
     console_list::hold_until_reset(old, blocks);
     retire_recording_res(old, res_bufs, res_marks, res_untracked);
 }
@@ -1687,6 +1689,13 @@ fn flush_wanted(slot: usize, newer_layout: bool, from_title: bool, deferring: bo
     deferring && from_title && !keeps_two_pass_batch(slot, newer_layout)
 }
 
+/// Whether a list call through `slot` ends the list's batch of ExecuteIndirect checks
+/// (`indirect_guard`, `open`): any but those a run of deferred draws goes on across and the
+/// viewport, blend factor and index / vertex buffer sets – none writes memory or orders writes.
+fn guard_batch_end_wanted(slot: usize, newer_layout: bool, from_title: bool, open: bool) -> bool {
+    open && from_title && !keeps_two_pass_batch(slot, newer_layout) && !matches!(slot, 21 | 23 | 47 | 48)
+}
+
 /// What ended a run (`flush_two_pass`), for the log: a title call through a console list slot
 /// (`before_list_call`), or one of these.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1744,17 +1753,24 @@ fn run_ends_text(n: usize) -> String {
     v.iter().take(n).map(|&(c, i)| format!("{} {c}", run_end_name(i, newer))).collect::<Vec<_>>().join(", ")
 }
 
-/// In front of every command list slot with `XCL_TWO_PASS_BATCH=2` (`real::class_for`): a title
-/// call on a list with deferred draws records them first, unless the slot keeps the run
-/// (`keeps_two_pass_batch`). Calls from XCL and the runtime go on as they are.
+/// In front of every command list slot with `XCL_TWO_PASS_BATCH=2` or
+/// `XCL_INDIRECT_GUARD_BATCH=1` (`real::class_for`): a title call on a list with deferred draws
+/// records them first, unless the slot keeps the run (`keeps_two_pass_batch`), and one on a list
+/// with a batch of ExecuteIndirect checks ends it (`guard_batch_end_wanted`). Calls from XCL and
+/// the runtime go on as they are.
 pub(super) unsafe extern "system" fn before_list_call(caller: usize, slot: u64, frame: *const u64) -> usize {
-    if DEFERRING_LISTS.load(Ordering::Relaxed) == 0 {
+    let this = *frame.add(0x80 / 8) as *mut c_void;
+    let batching = super::indirect_guard::batch_open(this);
+    if DEFERRING_LISTS.load(Ordering::Relaxed) == 0 && !batching {
         return 0;
     }
-    let this = *frame.add(0x80 / 8) as *mut c_void;
-    let deferring = DEFERRING.contains(this as usize);
+    let deferring = DEFERRING_LISTS.load(Ordering::Relaxed) != 0 && DEFERRING.contains(this as usize);
     let newer = super::real::QUEUE_SHIFTED.load(Ordering::Acquire);
-    if flush_wanted(slot as usize, newer, deferring && crate::modules::image_base_for_addr(caller).is_some(), deferring) {
+    let from_title = (deferring || batching) && crate::modules::image_base_for_addr(caller).is_some();
+    if guard_batch_end_wanted(slot as usize, newer, from_title, batching) {
+        super::indirect_guard::end_batch(this);
+    }
+    if flush_wanted(slot as usize, newer, from_title, deferring) {
         flush_two_pass(this, RunEnd::Call(slot as usize));
     }
     0
@@ -1969,6 +1985,10 @@ unsafe fn emit_commands(this: *mut c_void, list: &ID3D12GraphicsCommandList, cmd
 /// The deferred draws of the list `this`, recorded now (`batch_commands`), for `why`; nothing
 /// when it has none.
 pub(super) unsafe fn flush_two_pass(this: *mut c_void, why: RunEnd) {
+    // (a list or segment that closes ends its batch of ExecuteIndirect checks too)
+    if matches!(why, RunEnd::Close | RunEnd::Segment) {
+        super::indirect_guard::end_batch(this);
+    }
     if DEFERRING_LISTS.load(Ordering::Relaxed) == 0 || !DEFERRING.contains(this as usize) {
         return;
     }
@@ -6395,6 +6415,26 @@ void main(uint t : SV_GroupIndex) {
             assert!(!flush_wanted(ei, newer, true, true) && !flush_wanted(36, newer, true, true));
             assert!(!flush_wanted(25, newer, false, true), "XCL's own calls");
             assert!(!flush_wanted(25, newer, true, false), "nothing deferred");
+        }
+    }
+
+    /// A batch of ExecuteIndirect checks goes on across the calls that write no memory and order
+    /// no writes; anything else a title calls ends it.
+    #[test]
+    fn a_title_call_that_can_write_or_order_memory_ends_a_batch_of_checks() {
+        for newer in [false, true] {
+            let (ei, dm) = if newer { (61, 129) } else { (59, 127) };
+            for slot in (0..=8).chain([20, 21, 22, 23, 24, 25, 47, 48]).chain(33..=46).chain([ei, dm]) {
+                assert!(!guard_batch_end_wanted(slot, newer, true, true), "slot {slot}, newer layout: {newer}");
+            }
+            // barriers, draws, dispatches, copies, clears, render targets, heaps, queries,
+            // predication, bundles, stream output, Close, Reset, the console's own methods
+            // (waits, writes, flushes, its UAV barrier)
+            for slot in [26, 12, 13, 14, 15, 16, 17, 18, 19, 27, 28, 29, 30, 31, 32, 49, 50, 51, 52, 53, 54, 55, 9, 10, 11, 60, 67, 69, 71, 72, 78, 81, 85, 93, 146] {
+                assert!(guard_batch_end_wanted(slot, newer, true, true), "slot {slot}, newer layout: {newer}");
+            }
+            assert!(!guard_batch_end_wanted(26, newer, false, true), "XCL's own calls");
+            assert!(!guard_batch_end_wanted(26, newer, true, false), "no batch open");
         }
     }
 

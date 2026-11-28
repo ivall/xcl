@@ -12,11 +12,21 @@
 //! `XCL_INDIRECT_GUARD=0` turns it off (`=dispatch`: only dispatches are checked);
 //! `XCL_INDIRECT_MAX_GROUPS` is the most groups one ExecuteIndirect may run (4 Mi: a 4K target
 //! in 8x8 groups has 130 thousand).
+//!
+//! `XCL_INDIRECT_GUARD_BATCH=1`: the checks of a list's draws share one pass (`BatchPass`), until
+//! the title makes a call that could write memory or order its writes. Each check alone is a UAV
+//! barrier, a dispatch and two transitions in front of its ExecuteIndirect; a retail title makes
+//! thousands a frame. The pass goes in front of the first draw of its batch and reads the jobs
+//! the CPU writes while the list is recorded (before it is submitted). Between that draw and the
+//! last one the title makes no call but ExecuteIndirect, DispatchMesh and ones that change no
+//! memory (`bind::guard_batch_end_wanted`); what those draws write reaches the counts of a later
+//! one only through a barrier, which ends the batch: the counts the pass reads are the ones each
+//! draw would have read. Off unless asked for, to be measured first.
 
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::mem::{transmute_copy, ManuallyDrop};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use windows::core::Interface;
@@ -71,6 +81,88 @@ fn on(kind: Counts) -> bool {
         _ => 2,
     });
     *MODE == 2 || (*MODE == 1 && kind == Counts::Dispatch)
+}
+
+/// `XCL_INDIRECT_GUARD_BATCH=1`: the checks of draws go in batches (read once).
+pub(super) fn batch_on() -> bool {
+    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var("XCL_INDIRECT_GUARD_BATCH").is_ok_and(|v| v.trim() == "1"));
+    *ON
+}
+
+/// checks in one batch: the threads of its pass's one group
+const BATCH: u32 = 32;
+/// bytes of a job: window, offset in it, slot, kind, the program's id, the title's address
+const JOB: u32 = 32;
+/// bytes of a block of jobs: the count of them (16 bytes), the jobs
+const BLOCK_BYTES: u32 = 16 + BATCH * JOB;
+/// Blocks of jobs (a ring; 17 MB). A recording submitted again once its block went to another
+/// batch has its pass check the other's counts: its draws run counts checked before (in range).
+const BLOCKS: u32 = 1 << 14;
+/// memory windows the pass reads counts through (root UAVs); counts in another are checked alone
+const BATCH_WINDOWS: usize = 8;
+
+/// Whether a check of `kind` can go in a batch (`on`: `batch_on`). Dispatches go alone: their
+/// counts are clamped after the check (`clamp`), which reads them as a UAV.
+fn batchable(on: bool, kind: Counts, compare: bool) -> bool {
+    on && kind != Counts::Dispatch && !compare
+}
+
+/// A job's window and offset for counts at offset `off` of window `k` of `size` bytes whose GPU
+/// address is known (`mapped`): all `COUNT_BYTES` in it, in one of the pass's windows.
+fn window_job(k: usize, off: usize, size: usize, mapped: bool) -> Option<(u32, u32)> {
+    if !mapped || k >= BATCH_WINDOWS || off.checked_add(COUNT_BYTES)? > size {
+        return None;
+    }
+    Some((k as u32, u32::try_from(off).ok()?))
+}
+
+/// `window_job` for counts at UMA address `t` (in a window `counts_va` reads through).
+fn job_of(t: usize) -> Option<(u32, u32)> {
+    let u = crate::gpu::uma::get()?;
+    let k = u.window_of(t)?;
+    let (base, size) = u.window(k);
+    let mapped = real::uma_window_buffer_gpu(t, COUNT_BYTES).is_some() && real::uma_window_va(k).is_some_and(|v| v != 0);
+    window_job(k, t.checked_sub(base)?, size, mapped)
+}
+
+/// A list's open batch: its block of jobs and how many are in it
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Batch {
+    block: u32,
+    count: u32,
+}
+
+/// The block and the place in it of the next check of a list with `open` (None: a new batch).
+fn joins(open: Option<Batch>) -> Option<(u32, u32)> {
+    open.filter(|b| b.count < BATCH).map(|b| (b.block, b.count))
+}
+
+/// Lists with a batch open (the buffer of checked counts left INDIRECT_ARGUMENT), and how many.
+static OPEN: super::sharded::Sharded<Batch> = super::sharded::Sharded::new();
+static OPEN_LISTS: AtomicUsize = AtomicUsize::new(0);
+
+/// Whether `list` has a batch open.
+pub(super) fn batch_open(list: *mut c_void) -> bool {
+    OPEN_LISTS.load(Ordering::Relaxed) != 0 && OPEN.contains(list as usize)
+}
+
+/// The batch of `list` ends: the buffer of checked counts back to COMMON on it.
+pub(super) unsafe fn end_batch(list: *mut c_void) {
+    if OPEN_LISTS.load(Ordering::Relaxed) == 0 || OPEN.remove(list as usize).is_none() {
+        return;
+    }
+    OPEN_LISTS.fetch_sub(1, Ordering::Relaxed);
+    let g = GUARD.lock().unwrap().clone();
+    if let Some(g) = g {
+        super::list_x::transition(list, g.out.as_raw() as usize, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COMMON);
+    }
+}
+
+/// The recording of `list` ends without its batch (Reset, a list split): nothing is recorded.
+pub(super) fn forget_batch(list: *mut c_void) {
+    if OPEN_LISTS.load(Ordering::Relaxed) != 0 && OPEN.remove(list as usize).is_some() {
+        OPEN_LISTS.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 /// The groups in all a dispatch whose counts XCL has to check, fold or clamp may have
@@ -164,6 +256,89 @@ void main() {{
     )
 }
 
+/// `program` for the draws of a block of jobs (`BatchPass`): a thread a job, the counts read
+/// through the job's memory window.
+fn batch_program() -> String {
+    let rs_windows: String = (0..BATCH_WINDOWS).map(|k| format!(", UAV(u{})", k + 2)).collect();
+    let windows: String = (0..BATCH_WINDOWS).map(|k| format!("RWByteAddressBuffer w{k} : register(u{});\n", k + 2)).collect();
+    let cases: String = (0..BATCH_WINDOWS).map(|k| format!("    case {k}: return w{k}.Load(at);\n")).collect();
+    format!(
+        r#"
+#define RS "RootConstants(num32BitConstants=1, b0), SRV(t0), UAV(u0), UAV(u1){rs_windows}"
+cbuffer C : register(b0) {{ uint block; }};
+// the jobs, written by the CPU while the list was recorded
+ByteAddressBuffer jobs : register(t0);
+RWByteAddressBuffer outp : register(u0);
+RWByteAddressBuffer seen : register(u1);
+{windows}
+uint word(uint w, uint at) {{
+    switch (w) {{
+{cases}    default: return 0u;
+    }}
+}}
+[RootSignature(RS)]
+[numthreads({BATCH}, 1, 1)]
+void main(uint i : SV_GroupIndex) {{
+    uint first = block * {BLOCK_BYTES}u;
+    if (i >= jobs.Load(first))
+        return;
+    uint j = first + 16u + i * {JOB}u;
+    // window, offset, slot, kind; the program's id and the title's address, for the log
+    uint4 h = jobs.Load4(j);
+    uint4 t = jobs.Load4(j + 16u);
+    uint slot = h.z;
+    uint kind = h.w;
+    uint4 a = uint4(word(h.x, h.y), word(h.x, h.y + 4u), word(h.x, h.y + 8u), word(h.x, h.y + 12u));
+    uint a4 = 0u;
+    [branch] if (kind == 2u) {{ a4 = word(h.x, h.y + 16u); }}
+    // (as `program` for a draw)
+    bool ok = a.x == 0u || a.y == 0u || (a.x <= {MAX_VERTICES}u && a.y <= {MAX_INSTANCES}u && (float)a.x * (float)a.y <= (float){MAX_VERTICES}u);
+    uint at = slot * {SLOT}u;
+    outp.Store4(at, ok ? a : uint4(0u, 0u, 0u, 0u));
+    outp.Store(at + 16u, ok ? a4 : 0u);
+    seen.Store4({SEEN_AT}u + at, a);
+    seen.Store2({SEEN_AT}u + at + 16u, uint2(a4, 1u));
+    if (!ok) {{
+        uint m;
+        seen.InterlockedAdd(0u, 1u, m);
+        uint n;
+        seen.InterlockedAdd(8u, 1u, n);
+        if (n < {BAD_KEPT}u) {{
+            uint r = {BAD_AT}u + n * {BAD_SIZE}u;
+            seen.Store4(r, a);
+            seen.Store4(r + 16u, t);
+            seen.Store4(r + 32u, a);
+            seen.Store4(r + 48u, uint4(kind, 2u, slot, 1u));
+        }}
+    }}
+}}
+"#
+    )
+}
+
+/// The pass of a batch of checks (`XCL_INDIRECT_GUARD_BATCH=1`) and its blocks of jobs
+struct BatchPass {
+    rs: ID3D12RootSignature,
+    pso: ID3D12PipelineState,
+    /// `BLOCKS` blocks the CPU writes (mapped at `jobs_at`) and the pass reads
+    _jobs: ID3D12Resource,
+    jobs_va: u64,
+    jobs_at: usize,
+    next: AtomicU32,
+}
+
+unsafe fn make_batch(dev: &ID3D12Device, jobs: ID3D12Resource) -> Result<BatchPass, String> {
+    let dxil = crate::gpu::recomp::dxc::compile(&batch_program(), "main", "cs_6_0", &[])?;
+    let rs: ID3D12RootSignature = dev.CreateRootSignature(0, &dxil).map_err(|e| format!("its root signature: {e}"))?;
+    let code = D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr() as *const c_void, BytecodeLength: dxil.len() };
+    let pso: ID3D12PipelineState = dev
+        .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC { pRootSignature: transmute_copy(&rs), CS: code, ..Default::default() })
+        .map_err(|e| format!("its pipeline: {e}"))?;
+    let mut p = std::ptr::null_mut();
+    jobs.Map(0, None, Some(&mut p)).map_err(|e| format!("Map: {e}"))?;
+    Ok(BatchPass { jobs_va: jobs.GetGPUVirtualAddress(), jobs_at: p as usize, rs, pso, _jobs: jobs, next: AtomicU32::new(0) })
+}
+
 struct Guard {
     dev: usize,
     rs: ID3D12RootSignature,
@@ -176,6 +351,8 @@ struct Guard {
     seen_va: u64,
     seen_at: usize,
     next: AtomicU32,
+    /// with `batch_on` (None: its pass could not be made, the checks go alone)
+    batch: Option<BatchPass>,
 }
 
 // SAFETY: the mapping lives as long as `_seen`; D3D12 objects are free-threaded.
@@ -263,7 +440,20 @@ unsafe fn make(dev: &ID3D12Device) -> Result<Guard, String> {
     let mut p = std::ptr::null_mut();
     seen.Map(0, None, Some(&mut p)).map_err(|e| format!("Map: {e}"))?;
     std::ptr::write_bytes(p.cast::<u8>(), 0, bytes as usize);
+    let batch = if batch_on() {
+        let cpu = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_CUSTOM, CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK, MemoryPoolPreference: D3D12_MEMORY_POOL_L0, ..Default::default() };
+        match buffer(cpu, BLOCKS as u64 * BLOCK_BYTES as u64).and_then(|jobs| make_batch(dev, jobs)) {
+            Ok(b) => Some(b),
+            Err(e) => {
+                crate::xlog_warn!("D3D12.X: ExecuteIndirect: the counts are checked one call at a time, not in batches ({e})");
+                None
+            }
+        }
+    } else {
+        None
+    };
     Ok(Guard {
+        batch,
         dev: dev.as_raw() as usize,
         out_va: out.GetGPUVirtualAddress(),
         seen_va: seen.GetGPUVirtualAddress(),
@@ -297,6 +487,63 @@ fn counts_va_in(t: usize, in_one_window: impl Fn(usize, usize) -> bool, va_of: i
 pub(super) struct Checked {
     guard: Arc<Guard>,
     pub(super) slot: u32,
+    /// checked in a batch: the buffer is INDIRECT_ARGUMENT already (until `end_batch`)
+    batched: bool,
+}
+
+/// The check of a draw's counts at `job` (window, offset) in the batch of `list`, whose pass
+/// goes in front of the batch's first draw: the check's slot. None: no batch pass.
+unsafe fn batched(list: *mut c_void, l: &ID3D12GraphicsCommandList, g: &Guard, kind: Counts, job: (u32, u32), id: u64, at: u64) -> Option<u32> {
+    let b = g.batch.as_ref()?;
+    let (block, n) = match joins(OPEN.get(list as usize)) {
+        Some(j) => j,
+        None => {
+            // (a full batch ends first)
+            end_batch(list);
+            let block = b.next.fetch_add(1, Ordering::Relaxed) % BLOCKS;
+            jobs_in(b, block).store(0, Ordering::Release);
+            // the counts were written as UAVs: they are read after those writes
+            let written = D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                Anonymous: D3D12_RESOURCE_BARRIER_0 { UAV: ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER { pResource: ManuallyDrop::new(None) }) },
+            };
+            l.ResourceBarrier(&[written]);
+            l.SetComputeRootSignature(&b.rs);
+            // (past the hook of a title's call: what the title bound stays the list's pipeline)
+            super::list_x::set_compute_pipeline(list, b.pso.as_raw());
+            l.SetComputeRoot32BitConstant(0, block, 0);
+            l.SetComputeRootShaderResourceView(1, b.jobs_va);
+            l.SetComputeRootUnorderedAccessView(2, g.out_va);
+            l.SetComputeRootUnorderedAccessView(3, g.seen_va);
+            for k in 0..BATCH_WINDOWS {
+                // (a window there is not: never read, any buffer)
+                l.SetComputeRootUnorderedAccessView(4 + k as u32, real::uma_window_va(k).filter(|&v| v != 0).unwrap_or(g.seen_va));
+            }
+            l.Dispatch(1, 1, 1);
+            // (the driver reads the counts after the pass's writes with this transition only,
+            // `bind::fresh_indirect_arguments`)
+            super::list_x::transition(list, g.out.as_raw() as usize, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+            if OPEN.insert(list as usize, Batch { block, count: 0 }).is_none() {
+                OPEN_LISTS.fetch_add(1, Ordering::Relaxed);
+            }
+            (block, 0)
+        }
+    };
+    let slot = g.next.fetch_add(1, Ordering::Relaxed) % SLOTS;
+    g.word(SEEN_AT + slot * SLOT + 4 * SEEN_WORD).store(0, Ordering::Release);
+    let words = [job.0, job.1, slot, kind as u32, id as u32, (id >> 32) as u32, at as u32, (at >> 32) as u32];
+    let rec = (b.jobs_at + (block * BLOCK_BYTES + 16 + n * JOB) as usize) as *mut u32;
+    std::ptr::copy_nonoverlapping(words.as_ptr(), rec, words.len());
+    // (the list is submitted after this: the pass reads the jobs then)
+    jobs_in(b, block).store(n + 1, Ordering::Release);
+    OPEN.insert(list as usize, Batch { block, count: n + 1 });
+    Some(slot)
+}
+
+/// The count of jobs in block `block` of `b`.
+unsafe fn jobs_in(b: &BatchPass, block: u32) -> &AtomicU32 {
+    &*((b.jobs_at + (block * BLOCK_BYTES) as usize) as *const AtomicU32)
 }
 
 /// Record the check of an ExecuteIndirect's counts (`args` + `args_off`, the PC buffer and the
@@ -333,9 +580,20 @@ pub(super) unsafe fn check(list: *mut c_void, pso: usize, sig: usize, max: u32, 
     let va = title.and_then(counts_va).filter(|v| v % 4 == 0).unwrap_or(shown);
     let shown = if compare() { shown } else { va };
     let g = guard_of(l)?;
+    let id = real::pso_shaders(pso).map_or(0, |(a, _)| a);
+    // (the title's address, for the log; a buffer that is not in unified memory: the GPU's)
+    let at = title.map_or(va, |t| t as u64);
+    let job = if batchable(batch_on(), kind, compare()) { title.and_then(job_of) } else { None };
+    if let Some(job) = job {
+        if let Some(slot) = batched(list, l, &g, kind, job, id, at) {
+            report(&g);
+            return Some(Checked { guard: g, slot, batched: true });
+        }
+    }
+    // (alone: a batch the list has open ends first)
+    end_batch(list);
     let slot = g.next.fetch_add(1, Ordering::Relaxed) % SLOTS;
     g.word(SEEN_AT + slot * SLOT + 4 * SEEN_WORD).store(0, Ordering::Release);
-    let id = real::pso_shaders(pso).map_or(0, |(a, _)| a);
     // the counts were written as UAVs: they are read after those writes
     let written = D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
@@ -346,8 +604,6 @@ pub(super) unsafe fn check(list: *mut c_void, pso: usize, sig: usize, max: u32, 
     l.SetComputeRootSignature(&g.rs);
     // (past the hook of a title's call: what the title bound stays the list's pipeline)
     super::list_x::set_compute_pipeline(list, g.pso.as_raw());
-    // (the title's address, for the log; a buffer that is not in unified memory: the GPU's)
-    let at = title.map_or(va, |t| t as u64);
     let constants = [max_groups(), slot, id as u32, (id >> 32) as u32, at as u32, (at >> 32) as u32, kind as u32];
     l.SetComputeRoot32BitConstants(0, constants.len() as u32, constants.as_ptr() as *const c_void, 0);
     l.SetComputeRootUnorderedAccessView(1, va);
@@ -356,13 +612,16 @@ pub(super) unsafe fn check(list: *mut c_void, pso: usize, sig: usize, max: u32, 
     l.SetComputeRootUnorderedAccessView(4, shown);
     l.Dispatch(1, 1, 1);
     report(&g);
-    Some(Checked { guard: g, slot })
+    Some(Checked { guard: g, slot, batched: false })
 }
 
 impl Checked {
     /// `op(buffer, offset)`: the ExecuteIndirect with the checked counts.
     pub(super) unsafe fn run(&self, list: *mut c_void, op: impl FnOnce(usize, u64)) {
         let out = self.guard.out.as_raw() as usize;
+        if self.batched {
+            return op(out, self.slot as u64 * SLOT as u64);
+        }
         // (the driver reads the counts after the program's writes with this transition only,
         // `bind::fresh_indirect_arguments`)
         super::list_x::transition(list, out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
@@ -534,6 +793,49 @@ mod tests {
         assert!(logged_again(0, 1) && logged_again(0, 7) && logged_again(3, 5));
         assert!(logged_again(7, 8) && logged_again(7, 100) && logged_again(64, 129));
         assert!(!logged_again(7, 7) && !logged_again(8, 15) && !logged_again(100, 127));
+    }
+
+    /// Draws go in batches when asked for; dispatches (clamped after the check) and the compare
+    /// diagnostic go alone.
+    #[test]
+    fn only_draws_are_checked_in_batches() {
+        assert!(batchable(true, Counts::Draw, false) && batchable(true, Counts::DrawIndexed, false));
+        assert!(!batchable(false, Counts::Draw, false), "off");
+        assert!(!batchable(true, Counts::Dispatch, false), "a dispatch");
+        assert!(!batchable(true, Counts::DrawIndexed, true), "XCL_INDIRECT_GUARD=compare");
+    }
+
+    /// A job is counts all in one of the pass's windows, at an offset the pass can address.
+    #[test]
+    fn a_job_is_counts_in_one_of_the_pass_windows() {
+        let gib4 = 1usize << 32;
+        assert_eq!(window_job(0, 0x100, gib4, true), Some((0, 0x100)));
+        assert_eq!(window_job(BATCH_WINDOWS - 1, gib4 - COUNT_BYTES, gib4, true), Some((BATCH_WINDOWS as u32 - 1, (gib4 - COUNT_BYTES) as u32)), "the last record in a window");
+        assert_eq!(window_job(1, gib4 - 8, gib4, true), None, "across the window's end");
+        assert_eq!(window_job(BATCH_WINDOWS, 0x100, gib4, true), None, "a window the pass does not bind");
+        assert_eq!(window_job(0, 0x100, gib4, false), None, "a window with no GPU address");
+        assert_eq!(window_job(0, usize::MAX - 4, usize::MAX, true), None, "an offset that does not add up");
+    }
+
+    /// A list's next check joins its open batch until `BATCH` are in it; then, and with none
+    /// open, a new batch (its pass) starts.
+    #[test]
+    fn checks_join_the_open_batch_until_it_is_full() {
+        assert_eq!(joins(None), None);
+        assert_eq!(joins(Some(Batch { block: 7, count: 0 })), Some((7, 0)));
+        assert_eq!(joins(Some(Batch { block: 7, count: BATCH - 1 })), Some((7, BATCH - 1)));
+        assert_eq!(joins(Some(Batch { block: 7, count: BATCH })), None, "full");
+    }
+
+    /// The batch pass's program has a window buffer and a root UAV for each window it reads.
+    #[test]
+    fn the_batch_program_binds_each_window() {
+        let p = batch_program();
+        for k in 0..BATCH_WINDOWS {
+            assert!(p.contains(&format!("RWByteAddressBuffer w{k} : register(u{});", k + 2)), "window {k}");
+            assert!(p.contains(&format!("case {k}: return w{k}.Load(at);")), "window {k}");
+        }
+        assert_eq!(p.matches("UAV(u").count(), 2 + BATCH_WINDOWS);
     }
 
     /// Garbage counts run 0 groups and are kept for the log; counts in range run as they are. Each
