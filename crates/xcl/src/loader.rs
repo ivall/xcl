@@ -170,7 +170,11 @@ fn map_image_ex(path: &Path, is_main: bool) -> Result<Arc<MappedModule>, String>
     };
     match pe.delay_imports() {
         Ok(v) => all.extend(v),
-        Err(e) => crate::xlog_warn!("{name}: delay-imports: {e}"),
+        Err(e) => {
+            // same as a broken import table: do not leave a half-mapped module registered
+            modules::unregister_mapped(base);
+            return fail(format!("{name}: delay-import table: {e}"));
+        }
     }
     for dll in &all {
         for e in &dll.entries {
@@ -519,6 +523,34 @@ mod tests {
         for attempt in 0..2 {
             let r = load_game_dll(&p);
             assert!(r.as_ref().is_err_and(|e| e.contains("import table")), "attempt {attempt}: {:?}", r.map(|m| m.base));
+            assert!(modules::find_mapped_by_name(&key).is_none(), "attempt {attempt}: still registered");
+        }
+    }
+
+    /// A delay-import table that does not parse used to only warn and leave the module loaded.
+    /// It must fail like a broken import table and not stay registered.
+    #[test]
+    fn a_dll_with_a_broken_delay_import_table_is_not_left_registered() {
+        let mut code = vec![0xB8, 1, 0, 0, 0, 0xC3];
+        code.resize(0x10, 0xCC);
+        // IMAGE_DELAYLOAD_DESCRIPTOR at RVA 0x1010: attrs=1 (RVAs), Name outside the image
+        for v in [1u32, 0x7FFF_0000, 0, 0x1000, 0x1000, 0, 0, 0] {
+            code.extend_from_slice(&v.to_le_bytes());
+        }
+        let mut bytes = tiny_dll(0x7E54_0000_0000, &code, None);
+        // data directory #13 = delay import
+        let delay_dir = 0x58 + 0x70 + 13 * 8;
+        bytes[delay_dir..delay_dir + 4].copy_from_slice(&0x1010u32.to_le_bytes());
+        bytes[delay_dir + 4..delay_dir + 8].copy_from_slice(&64u32.to_le_bytes());
+        let p = write("xcl_bad_delay.dll", &bytes);
+        let key = crate::util::dll_key("xcl_bad_delay.dll");
+        for attempt in 0..2 {
+            let r = load_game_dll(&p);
+            assert!(
+                r.as_ref().is_err_and(|e| e.contains("delay-import table")),
+                "attempt {attempt}: {:?}",
+                r.map(|m| m.base)
+            );
             assert!(modules::find_mapped_by_name(&key).is_none(), "attempt {attempt}: still registered");
         }
     }
