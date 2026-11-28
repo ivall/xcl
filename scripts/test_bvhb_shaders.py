@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 import struct
 import subprocess
@@ -10,6 +11,28 @@ SCRIPT = Path(__file__).resolve().parent / "re" / "bvhb_shaders.py"
 
 
 class RootDescriptorTests(unittest.TestCase):
+    def test_unbounded_descriptor_ranges_print_in_cp1252(self):
+        root = (
+            struct.pack("<6I", 1, 1, 24, 0, 0, 0)
+            + struct.pack("<3I", 0, 0, 36)  # descriptor table parameter
+            + struct.pack("<2I", 2, 44)
+            + struct.pack("<5I", 1, 4, 2, 0, 0)  # four UAVs starting at u2
+            + struct.pack("<5I", 0, 0xFFFFFFFF, 7, 0, 4)  # unbounded SRVs starting at t7
+        )
+        chunk = b"RTS0" + struct.pack("<I", len(root)) + root
+        blob = struct.pack("<4s16sIII", b"DXBC", bytes(16), 1, 36 + len(chunk), 1)
+        blob += struct.pack("<I", 36) + chunk
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "synthetic.dll"
+            source.write_bytes(blob)
+            result = subprocess.run(
+                [sys.executable, "-B", str(SCRIPT), str(source), str(Path(tmp) / "out")],
+                capture_output=True, encoding="cp1252",
+                env=dict(os.environ, PYTHONIOENCODING="cp1252"),
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("table[UAVx4@2,SRVxunbounded@7]", result.stdout)
+
     def test_root_descriptors_print_their_register_classes(self):
         for version in (1, 2):
             with self.subTest(version=version), tempfile.TemporaryDirectory() as tmp:
