@@ -1538,7 +1538,7 @@ fn dump_sync_trace(why: &str, n: &AtomicU64, times: u64) {
     }
 }
 
-fn queue_id(q: usize) -> usize {
+pub(super) fn queue_id(q: usize) -> usize {
     let mut g = QUEUE_IDS.lock().unwrap();
     if let Some(pos) = g.iter().position(|&x| x == q) {
         pos

@@ -8,15 +8,14 @@
 //! queue signals it, and a worker thread does the writes, in submission order, when the GPU is
 //! there – what bottom of pipe means.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{mpsc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use windows::core::Interface;
-use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Graphics::Direct3D12::*;
-use windows_sys::Win32::System::Threading as th;
 
 /// A bottom-of-pipe write into memory outside unified memory, applied by the CPU once the
 /// queue's fence reaches the submission that recorded it.
@@ -32,8 +31,13 @@ pub(super) enum Write {
 
 struct Job {
     fence: ID3D12Fence,
+    // Capture the diagnostic number while the queue is alive; the worker never looks it up
+    // through a queue address that may have been released or reused.
+    queue_id: usize,
     value: u64,
     writes: Vec<Write>,
+    queued: Instant,
+    warned: bool,
 }
 
 // SAFETY: the fence is a free-threaded COM object; the writes are plain data
@@ -43,42 +47,104 @@ unsafe impl Send for Job {}
 struct QueueFence {
     fence: ID3D12Fence,
     value: u64,
+    failed: bool,
 }
 
 unsafe impl Send for QueueFence {}
 
 static FENCES: Mutex<Option<HashMap<usize, QueueFence>>> = Mutex::new(None);
 
-/// how long the worker waits for one submission before writing anyway (a removed device, a
-/// queue that never gets there)
-const WAIT_MS: u32 = 10_000;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProducerStatus { Pending, Complete, Removed }
+
+fn completion(completed: u64, wanted: u64) -> ProducerStatus {
+    if completed == u64::MAX { ProducerStatus::Removed }
+    else if completed >= wanted { ProducerStatus::Complete }
+    else { ProducerStatus::Pending }
+}
+
+struct PendingQueue<T> {
+    jobs: VecDeque<T>,
+    removed: bool,
+}
+
+/// The key names an owned producer fence, not a reusable command queue address. Keep that
+/// fence and every ordered suffix alive while pending; unrelated fences can still progress.
+fn publish_ready<T>(pending: &mut HashMap<usize, PendingQueue<T>>, mut poll: impl FnMut(&mut T) -> ProducerStatus, mut publish: impl FnMut(T)) {
+    pending.retain(|_, queue| {
+        for _ in 0..64 {
+            if queue.removed { break; }
+            let Some(job) = queue.jobs.front_mut() else { break };
+            match poll(job) {
+                ProducerStatus::Complete => publish(queue.jobs.pop_front().unwrap()),
+                ProducerStatus::Pending => break,
+                ProducerStatus::Removed => { queue.removed = true; break; }
+            }
+        }
+        !queue.jobs.is_empty()
+    });
+}
+
+/// A failed signal gives us no safe retirement point for a submitted readback resource.
+fn keep_if_marked<T>(work: T, marked: bool) -> Option<T> {
+    if marked { Some(work) } else { std::mem::forget(work); None }
+}
+
+fn send_or_retain<T>(sender: &mpsc::Sender<T>, work: T) -> bool {
+    match sender.send(work) {
+        Ok(()) => true,
+        Err(e) => { std::mem::forget(e.0); false }
+    }
+}
 
 fn worker() -> &'static Mutex<mpsc::Sender<Job>> {
     static W: OnceLock<Mutex<mpsc::Sender<Job>>> = OnceLock::new();
     W.get_or_init(|| {
         let (tx, rx) = mpsc::channel::<Job>();
         let spawned = std::thread::Builder::new().name("xcl-cpu-writes".into()).spawn(move || unsafe {
-            let event = th::CreateEventW(std::ptr::null(), 0, 0, std::ptr::null());
-            for job in rx {
-                if super::real::fence_completed(&job.fence) < job.value && job.fence.SetEventOnCompletion(job.value, HANDLE(event as *mut c_void)).is_ok() {
-                    th::WaitForSingleObject(event, WAIT_MS);
-                    if super::real::fence_completed(&job.fence) < job.value {
-                        static LATE: AtomicU64 = AtomicU64::new(0);
-                        let k = LATE.fetch_add(1, Ordering::Relaxed) + 1;
-                        if k.is_power_of_two() {
-                            crate::xlog_warn!("D3D12.X: {k} writes after the GPU so far done although their queue had not got there after {WAIT_MS} ms (fence at {}, wanted {}; {} writes)", super::real::fence_completed(&job.fence), job.value, job.writes.len());
-                        }
+            // Keep the pending map's resources on unwind. This is not a worker-panic recovery
+            // policy: the channel receiver still has its ordinary unwinding behavior.
+            let mut pending = std::mem::ManuallyDrop::new(HashMap::<usize, PendingQueue<Job>>::new());
+            loop {
+                let next = if pending.is_empty() {
+                    rx.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected)
+                } else {
+                    // No reusable event or blocking fence wait: stale notifications and failed
+                    // event registration cannot publish a write or stall another producer.
+                    rx.recv_timeout(Duration::from_millis(2))
+                };
+                match next {
+                    Ok(job) => {
+                        pending.entry(job.fence.as_raw() as usize)
+                            .or_insert_with(|| PendingQueue { jobs: VecDeque::new(), removed: false }).jobs.push_back(job);
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        // The receiver is stopping, not evidence that the GPU finished.
+                        std::mem::forget(pending);
+                        break;
                     }
                 }
-                for w in &job.writes {
-                    match w {
-                        Write::Immediate(va, words) => write_now(*va, words),
-                        Write::ReadbackU64 { va, src, .. } => {
-                            let value = (*(*src as *const AtomicU64)).load(Ordering::Acquire);
-                            write_u64_now(*va, value);
+                publish_ready(&mut pending, |job| {
+                    let done = super::real::fence_completed(&job.fence);
+                    let state = completion(done, job.value);
+                    if state != ProducerStatus::Complete && !job.warned
+                        && (state == ProducerStatus::Removed || job.queued.elapsed() >= Duration::from_secs(10)) {
+                        job.warned = true;
+                        crate::xlog_warn!("D3D12.X: holding {} CPU writes after {} ms: producer {:?}, fence at {}, wanted {} (queue q{}, producer fence {:#x}, Signal accepted)", job.writes.len(), job.queued.elapsed().as_millis(), state, done, job.value, job.queue_id, job.fence.as_raw() as usize);
+                    }
+                    state
+                }, |job| {
+                    for w in &job.writes {
+                        match w {
+                            Write::Immediate(va, words) => write_now(*va, words),
+                            Write::ReadbackU64 { va, src, .. } => {
+                                let value = (*(*src as *const AtomicU64)).load(Ordering::Acquire);
+                                write_u64_now(*va, value);
+                            }
                         }
                     }
-                }
+                });
             }
         });
         if let Err(e) = spawned {
@@ -215,7 +281,10 @@ pub(super) unsafe fn after(queue: *mut c_void, writes: Vec<Write>) {
         return;
     }
     let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) else { return };
-    let job = {
+    let queue_id = super::list_x::queue_id(queue as usize);
+    let sender = worker();
+    let count = writes.len();
+    let sent = {
         let mut g = FENCES.lock().unwrap();
         let m = g.get_or_insert_with(HashMap::new);
         let entry = match m.entry(queue as usize) {
@@ -223,29 +292,254 @@ pub(super) unsafe fn after(queue: *mut c_void, writes: Vec<Write>) {
             std::collections::hash_map::Entry::Vacant(v) => {
                 let mut dev: Option<ID3D12Device> = None;
                 if q.GetDevice(&mut dev).is_err() {
+                    std::mem::forget(writes);
                     return;
                 }
-                let Some(dev) = dev else { return };
-                let Ok(fence) = dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE) else { return };
-                v.insert(QueueFence { fence, value: 0 })
+                let Some(dev) = dev else { std::mem::forget(writes); return };
+                let Ok(fence) = dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE) else { std::mem::forget(writes); return };
+                v.insert(QueueFence { fence, value: 0, failed: false })
             }
         };
-        entry.value += 1;
-        if q.Signal(&entry.fence, entry.value).is_err() {
+        let marked = !entry.failed && entry.value.checked_add(1).filter(|v| *v != u64::MAX).is_some_and(|value| {
+            entry.value = value;
+            q.Signal(&entry.fence, value).is_ok()
+        });
+        let Some(writes) = keep_if_marked(writes, marked) else {
+            if !entry.failed {
+                crate::xlog_error!("D3D12.X: cannot signal CPU-write producer on q{queue_id} (fence {:#x}, last mark {}); retaining in-flight resources without publishing", entry.fence.as_raw() as usize, entry.value);
+            }
+            entry.failed = true;
             return;
-        }
-        Job { fence: entry.fence.clone(), value: entry.value, writes }
+        };
+        let job = Job { fence: entry.fence.clone(), queue_id, value: entry.value, writes, queued: Instant::now(), warned: false };
+        // Enqueue under the signal-order lock: concurrent submitters must not publish value N+1
+        // before the worker has received N. The unbounded send does not wait for GPU/title work.
+        send_or_retain(&sender.lock().unwrap(), job)
     };
     static FIRST: std::sync::Once = std::sync::Once::new();
-    FIRST.call_once(|| crate::xlog_info!("D3D12.X: bottom-of-pipe writes outside unified memory are done by the CPU after the GPU ({} in the first submission)", job.writes.len()));
-    let _ = worker().lock().unwrap().send(job);
+    FIRST.call_once(|| crate::xlog_info!("D3D12.X: bottom-of-pipe writes outside unified memory are done by the CPU after the GPU ({} in the first submission)", count));
+    if !sent {
+        crate::xlog_error!("D3D12.X: CPU-write worker unavailable for q{queue_id}; retaining in-flight resources without publishing");
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+    use std::rc::Rc;
     use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
     use windows::Win32::Graphics::Dxgi::*;
+
+    struct FakeJob {
+        fence: Rc<Cell<u64>>,
+        wanted: u64,
+        word: u32,
+        dropped: Rc<Cell<usize>>,
+    }
+
+    impl Drop for FakeJob {
+        fn drop(&mut self) { self.dropped.set(self.dropped.get() + 1); }
+    }
+
+    fn fake_job(fence: &Rc<Cell<u64>>, wanted: u64, word: u32, dropped: &Rc<Cell<usize>>) -> FakeJob {
+        FakeJob { fence: fence.clone(), wanted, word, dropped: dropped.clone() }
+    }
+
+    fn fake_queue(jobs: Vec<FakeJob>) -> PendingQueue<FakeJob> {
+        PendingQueue { jobs: jobs.into(), removed: false }
+    }
+
+    fn poll_fake(job: &mut FakeJob) -> ProducerStatus { completion(job.fence.get(), job.wanted) }
+
+    #[test]
+    fn pending_cpu_writes_retain_resources_until_confirmed_completion() {
+        let fence = Rc::new(Cell::new(2));
+        let dropped = Rc::new(Cell::new(0));
+        let mut pending = HashMap::from([(1, fake_queue(vec![fake_job(&fence, 3, 17, &dropped)]))]);
+        let destination = Cell::new(0);
+        // Arbitrarily many timeout/wakeup cycles cannot substitute for producer completion.
+        for _ in 0..100 {
+            publish_ready(&mut pending, poll_fake, |j| destination.set(j.word));
+            assert_eq!(destination.get(), 0);
+            assert_eq!(dropped.get(), 0, "readback ownership must survive pending polls");
+        }
+        fence.set(3);
+        publish_ready(&mut pending, poll_fake, |j| destination.set(j.word));
+        assert_eq!(destination.get(), 17);
+        assert_eq!(dropped.get(), 1);
+        assert!(pending.is_empty());
+        publish_ready(&mut pending, poll_fake, |_| panic!("published twice"));
+    }
+
+    #[test]
+    fn pending_cpu_writes_preserve_suffix_without_blocking_other_fences() {
+        let slow = Rc::new(Cell::new(0));
+        let fast = Rc::new(Cell::new(2));
+        let dropped = Rc::new(Cell::new(0));
+        let mut pending = HashMap::from([
+            (1, fake_queue(vec![fake_job(&slow, 1, 11, &dropped), fake_job(&slow, 2, 12, &dropped)])),
+            (2, fake_queue(vec![fake_job(&fast, 2, 21, &dropped)])),
+        ]);
+        let mut writes = Vec::new();
+        publish_ready(&mut pending, poll_fake, |j| writes.push(j.word));
+        assert_eq!(writes, [21]);
+        assert_eq!(dropped.get(), 1);
+        slow.set(2);
+        publish_ready(&mut pending, poll_fake, |j| writes.push(j.word));
+        assert_eq!(writes, [21, 11, 12]);
+        assert_eq!(dropped.get(), 3);
+    }
+
+    #[test]
+    fn a_ready_suffix_never_overtakes_an_unconfirmed_cpu_write() {
+        let first = Rc::new(Cell::new(0));
+        let later = Rc::new(Cell::new(2));
+        let dropped = Rc::new(Cell::new(0));
+        let mut pending = HashMap::from([(1, fake_queue(vec![fake_job(&first, 1, 1, &dropped), fake_job(&later, 2, 2, &dropped)]))]);
+        publish_ready(&mut pending, poll_fake, |_| panic!("unconfirmed head must hold its suffix"));
+        assert_eq!(dropped.get(), 0);
+        first.set(1);
+        let mut writes = Vec::new();
+        publish_ready(&mut pending, poll_fake, |j| writes.push(j.word));
+        assert_eq!(writes, [1, 2]);
+    }
+
+    #[test]
+    fn device_removal_never_publishes_or_releases_cpu_writes() {
+        let removed = Rc::new(Cell::new(u64::MAX));
+        let healthy = Rc::new(Cell::new(1));
+        let dropped = Rc::new(Cell::new(0));
+        let mut pending = HashMap::from([
+            (1, fake_queue(vec![fake_job(&removed, 1, 11, &dropped)])),
+            (2, fake_queue(vec![fake_job(&healthy, 1, 21, &dropped)])),
+        ]);
+        let mut writes = Vec::new();
+        publish_ready(&mut pending, poll_fake, |j| writes.push(j.word));
+        assert_eq!(writes, [21]);
+        assert_eq!(dropped.get(), 1);
+        // Even a later inconsistent observation must not revive a removed producer.
+        removed.set(10);
+        pending.get_mut(&1).unwrap().jobs.push_back(fake_job(&removed, 2, 12, &dropped));
+        publish_ready(&mut pending, |_| panic!("removed producer was polled again"), |_| panic!("removed producer published"));
+        assert_eq!(dropped.get(), 1);
+        assert_eq!(pending[&1].jobs.len(), 2);
+        // This fixture's references are CPU-only; releasing them here is not GPU teardown.
+    }
+
+    #[test]
+    fn failed_producer_signal_retains_inflight_cpu_write_resources() {
+        let fence = Rc::new(Cell::new(0));
+        let dropped = Rc::new(Cell::new(0));
+        assert!(keep_if_marked(fake_job(&fence, 1, 1, &dropped), false).is_none());
+        assert_eq!(dropped.get(), 0, "failed signal cannot retire an in-flight readback");
+        drop(keep_if_marked(fake_job(&fence, 1, 1, &dropped), true).unwrap());
+        assert_eq!(dropped.get(), 1, "successful mark transfers ownership normally");
+    }
+
+    #[test]
+    fn failed_worker_send_retains_inflight_cpu_write_resources() {
+        let fence = Rc::new(Cell::new(0));
+        let dropped = Rc::new(Cell::new(0));
+        let (tx, rx) = mpsc::channel();
+        drop(rx);
+        assert!(!send_or_retain(&tx, fake_job(&fence, 1, 1, &dropped)));
+        assert_eq!(dropped.get(), 0, "lost worker cannot retire an in-flight readback");
+        let (tx, rx) = mpsc::channel();
+        assert!(send_or_retain(&tx, fake_job(&fence, 1, 1, &dropped)));
+        assert_eq!(dropped.get(), 0);
+        drop(rx.recv().unwrap());
+        assert_eq!(dropped.get(), 1);
+    }
+
+    /// Uses the actual worker unchanged on the baseline: a GPU copy is gated beyond its old
+    /// ten-second fallback, then released. No spinning shader or intentional device removal.
+    #[test]
+    fn gpu_readback_is_not_published_after_an_uncompleted_ten_second_wait() {
+        use std::time::{Duration, Instant};
+        const EXPECTED: u64 = 0x1234_5678_9abc_def0;
+        const SENTINEL: u64 = 0xface_cafe_dead_beef;
+        struct Cleanup {
+            gate: ID3D12Fence,
+            done: ID3D12Fence,
+            // Keep the CPU destination as well: a delayed worker can still write to it.
+            held: Option<(ID3D12CommandQueue, ID3D12CommandAllocator, ID3D12GraphicsCommandList, ID3D12Resource, ID3D12Resource, Box<AtomicU64>)>,
+        }
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                unsafe {
+                    let _ = self.gate.Signal(1);
+                    let deadline = Instant::now() + Duration::from_secs(3);
+                    while Instant::now() < deadline {
+                        let done = self.done.GetCompletedValue();
+                        if done != u64::MAX && done >= 1
+                            && self.held.as_ref().unwrap().5.load(Ordering::Acquire) == EXPECTED {
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    // A failed/removed device or delayed worker cannot safely retire these.
+                    std::mem::forget((self.gate.clone(), self.done.clone(), self.held.take()));
+                }
+            }
+        }
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                return crate::gpu::recomp::runner::skip_test("no hardware D3D12 device for gated readback");
+            }
+            let dev = dev.unwrap();
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
+            let allocator: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None).unwrap();
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER, Width: 8, Height: 1,
+                DepthOrArraySize: 1, MipLevels: 1,
+                SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR, ..Default::default()
+            };
+            let mut upload: Option<ID3D12Resource> = None;
+            dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_UPLOAD, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_GENERIC_READ, None, &mut upload).unwrap();
+            let upload = upload.unwrap();
+            let mut readback: Option<ID3D12Resource> = None;
+            dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut readback).unwrap();
+            let readback = readback.unwrap();
+            let mut src = std::ptr::null_mut();
+            upload.Map(0, None, Some(&mut src)).unwrap();
+            (src as *mut u64).write(EXPECTED);
+            upload.Unmap(0, None);
+            let mut rb = std::ptr::null_mut();
+            readback.Map(0, None, Some(&mut rb)).unwrap();
+            (rb as *mut u64).write(0); // distinguish an early read from the GPU's copy
+            list.CopyBufferRegion(&readback, 0, &upload, 0, 8);
+            list.Close().unwrap();
+            let gate: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let done: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let destination = Box::new(AtomicU64::new(SENTINEL));
+            let va = destination.as_ref() as *const AtomicU64 as usize;
+            let cleanup = Cleanup { gate, done, held: Some((queue, allocator, list, upload, readback, destination)) };
+            let (queue, _, list, _, readback, destination) = cleanup.held.as_ref().unwrap();
+            queue.Wait(&cleanup.gate, 1).unwrap();
+            queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+            after(queue.as_raw(), vec![Write::ReadbackU64 { va, src: rb as usize, _buf: readback.clone() }]);
+            queue.Signal(&cleanup.done, 1).unwrap();
+            let hold_until = Instant::now() + Duration::from_secs(11);
+            let mut early = None;
+            while Instant::now() < hold_until {
+                let value = destination.load(Ordering::Acquire);
+                if value != SENTINEL { early = Some(value); break; }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            // Always release the gate before reporting a failure; Cleanup also covers panics.
+            cleanup.gate.Signal(1).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while destination.load(Ordering::Acquire) != EXPECTED && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            assert_eq!(early, None, "CPU published a readback while its GPU producer was gated");
+            assert_eq!(destination.load(Ordering::Acquire), EXPECTED, "GPU-produced readback never reached the destination");
+        }
+    }
 
     /// The value lands after the queue has done what came before it.
     #[test]
@@ -259,16 +553,21 @@ mod tests {
             }
             let dev = dev.unwrap();
             let q: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
-            let cell = Box::new([0u32; 2]);
+            let cell = Box::new([AtomicU32::new(0), AtomicU32::new(0)]);
             let va = cell.as_ptr() as usize;
             assert!(writable(va, 8));
+            // A timeout or unwind must not free memory the worker may still write.
+            let cell = std::mem::ManuallyDrop::new(cell);
             after(q.as_raw(), vec![Write::Immediate(va, vec![7, 9])]);
             let t = std::time::Instant::now();
-            while (*(va as *const AtomicU32)).load(Ordering::Acquire) != 7 {
+            // The last release store follows both destination writes.
+            while cell[1].load(Ordering::Acquire) != 9 {
                 assert!(t.elapsed().as_secs() < 5, "never written");
                 std::thread::yield_now();
             }
-            assert_eq!(*cell, [7, 9]);
+            let actual = [cell[0].load(Ordering::Acquire), cell[1].load(Ordering::Acquire)];
+            drop(std::mem::ManuallyDrop::into_inner(cell));
+            assert_eq!(actual, [7, 9]);
         }
     }
 

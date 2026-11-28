@@ -158,6 +158,10 @@ A gamepad is recommended ([Controls](#controls)). The game folder is never modif
 Far-jump address calculations are resolved to fixed targets only when branches enter at the start of the calculation.
 An entry partway through it keeps the jump indirect and subject to the recompiler's existing indirect-branch limits.
 
+CPU-emulated bottom-of-pipe writes wait for confirmed GPU completion. A stalled or removed
+producer keeps its writes and readback resources held; a timeout does not publish progress.
+Other producer queues can continue. Resources held after device loss remain retained until exit.
+
 </details>
 
 <details>
