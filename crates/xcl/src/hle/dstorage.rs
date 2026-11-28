@@ -65,6 +65,7 @@ const E_ACCESS_VIOLATION: HRESULT = 0x8924_0009u32 as i32;
 const E_DESTINATION_SIZE: HRESULT = 0x8924_000Fu32 as i32;
 const E_QUEUE_CLOSED: HRESULT = 0x8924_0010u32 as i32;
 const E_QUEUE_PRIORITY: HRESULT = 0x8924_0013u32 as i32;
+const E_MEMORY_QUEUE_PRIORITY: HRESULT = 0x8924_0024u32 as i32;
 const E_FILE_HANDLE: HRESULT = 0x8924_0017u32 as i32;
 const E_SOURCE_TYPE: HRESULT = 0x8924_001Bu32 as i32;
 const E_DECOMPRESSION: HRESULT = 0x8924_0030u32 as i32;
@@ -1305,8 +1306,11 @@ unsafe extern "system" fn factory_create_queue(_p: *mut c_void, desc: *const u8,
     if source > 1 {
         return E_QUEUE_TYPE;
     }
-    if !(-1..=2).contains(&priority) || (source == 1 && priority != 2) {
+    if !(-1..=2).contains(&priority) {
         return E_QUEUE_PRIORITY;
+    }
+    if source == 1 && priority != 2 {
+        return E_MEMORY_QUEUE_PRIORITY;
     }
     if capacity < 2 {
         return E_QUEUE_CAPACITY;
@@ -1651,7 +1655,9 @@ mod tests {
             assert_eq!(create_queue(f, desc.as_ptr(), &IID_QUEUE, &mut q), S_OK);
             desc[10] = 0;
             let mut bad = std::ptr::null_mut();
-            assert_eq!(create_queue(f, desc.as_ptr(), &IID_QUEUE, &mut bad), E_QUEUE_PRIORITY, "a memory queue is realtime");
+            assert_eq!(create_queue(f, desc.as_ptr(), &IID_QUEUE, &mut bad), E_MEMORY_QUEUE_PRIORITY, "a memory queue is realtime");
+            desc[10] = 3;
+            assert_eq!(create_queue(f, desc.as_ptr(), &IID_QUEUE, &mut bad), E_QUEUE_PRIORITY, "no such priority");
             let create_status: unsafe extern "system" fn(*mut c_void, u32, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(call(5));
             let mut s = std::ptr::null_mut();
             assert_eq!(create_status(f, 2, std::ptr::null(), &IID_STATUS_ARRAY, &mut s), S_OK);
