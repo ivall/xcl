@@ -6431,7 +6431,9 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
     let gkey = graphics_blob_key(&copy, &vs_dxil, ps_dxil.as_deref(), rect_gs.as_deref(), &samplers);
     // (no file without the adapter's identity: it could be another adapter's)
     let driver = driver_identity(this);
-    let disk = driver.and_then(|id| driver_cache::graphics_path(driver_cache::graphics_file_hash(gkey, id, crate::gpu::recomp::pso::mem_windows()), bytes));
+    let disk = driver
+        .filter(|_| blob_across_processes(!samplers.is_empty(), adapter_vendor(this)))
+        .and_then(|id| driver_cache::graphics_path(driver_cache::graphics_file_hash(gkey, id, crate::gpu::recomp::pso::mem_windows()), bytes));
     // (for the driver compile log of this pipeline only)
     GRAPHICS_STAGES.with(|s| s.set(Some((vs_took, ps_took))));
     // (a preparation worker keeps every blob: the title builds these pipelines at once from them)
@@ -7319,6 +7321,28 @@ fn driver_identity(device: *mut c_void) -> Option<u64> {
     })
 }
 
+/// The PCI vendor of `device`'s adapter (`DXGI_ADAPTER_DESC.VendorId`), per LUID as in
+/// `driver_identity`. None: not known.
+fn adapter_vendor(device: *mut c_void) -> Option<u32> {
+    use windows::Win32::Graphics::Dxgi::*;
+    let dev = unsafe { ID3D12Device::from_raw_borrowed(&device) }?;
+    let luid = unsafe { dev.GetAdapterLuid() };
+    static VENDORS: OnceLock<Mutex<HashMap<(i32, u32), Option<u32>>>> = OnceLock::new();
+    let mut vendors = VENDORS.get_or_init(Default::default).lock().unwrap();
+    *vendors.entry((luid.HighPart, luid.LowPart)).or_insert_with(|| unsafe {
+        let factory: IDXGIFactory4 = CreateDXGIFactory1().ok()?;
+        let adapter: IDXGIAdapter = factory.EnumAdapterByLuid(luid).ok()?;
+        Some(adapter.GetDesc().ok()?.VendorId)
+    })
+}
+
+/// Whether a pipeline may be made from, and kept as, a driver blob on disk (one another process
+/// made). Not one with static samplers on NVIDIA: built from such a blob, its static samplers
+/// lose their linear filtering (#505: the tone map's LUTs sampled as point, contour bands).
+fn blob_across_processes(static_samplers: bool, vendor: Option<u32>) -> bool {
+    !(static_samplers && vendor == Some(0x10DE))
+}
+
 struct TwoPassBlob {
     key: (u64, usize, i32),
     disk: Option<std::path::PathBuf>,
@@ -7473,7 +7497,7 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     let windows = crate::gpu::recomp::pso::mem_windows();
     let cs = TwoPassBlob::new(two_pass_cs_key(&tp.cs, &tp.samplers, driver.unwrap_or(0), windows), tp.cs.len(), rs, false, persist);
     let mesh = two_pass_stream_key(&stream.0, ps_samplers, driver.unwrap_or(0), windows)
-        .map(|(h, n)| TwoPassBlob::new(h, n, mesh_rs, true, persist));
+        .map(|(h, n)| TwoPassBlob::new(h, n, mesh_rs, true, persist && blob_across_processes(!ps_samplers.is_empty(), adapter_vendor(this))));
 
     // Take at most one cold turn for the pair, also when a cached attempt needs a retry.
     let bytes = stream.shader_bytes() + tp.cs.len();
@@ -10901,6 +10925,20 @@ mod mesh_stream_tests {
     /// (`driver_identity` asks the device for its adapter: no adapter has LUID 0, so no identity)
     unsafe extern "system" fn fake_adapter_luid(_: *mut c_void, luid: *mut windows::Win32::Foundation::LUID) {
         *luid = Default::default();
+    }
+
+    #[test]
+    fn a_pipeline_with_static_samplers_takes_no_disk_blob_on_nvidia() {
+        assert!(!blob_across_processes(true, Some(0x10DE)));
+        assert!(blob_across_processes(false, Some(0x10DE)), "no static samplers: the disk blob stays");
+    }
+
+    #[test]
+    fn other_vendors_keep_their_disk_blobs() {
+        for vendor in [Some(0x1002), Some(0x8086), Some(0x1414), None] {
+            assert!(blob_across_processes(true, vendor), "{vendor:x?}");
+            assert!(blob_across_processes(false, vendor), "{vendor:x?}");
+        }
     }
 
     #[test]
