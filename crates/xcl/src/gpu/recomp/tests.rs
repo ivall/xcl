@@ -3636,6 +3636,82 @@ fn gpu_packed_math_dots_movrel() {
     }
 }
 
+/// Check 3-operand integer ALU, bitwise and alignment instructions on the GPU:
+/// v_alignbit_b32, v_alignbyte_b32, v_xad_u32, v_add_lshl_u32, v_lshl_or_b32,
+/// v_and_or_b32, v_or3_b32, v_xor3_b32, v_med3_u32/i32, and v_min3/max3_u32/i32.
+#[test]
+fn gpu_recomp_vop3_three_operand_int_and_bit_ops() {
+    if !gpu_ready() {
+        return;
+    }
+    let ins = |name: &'static str, f: &'static [(&'static str, u64)]| (name, "ENC_VOP3", f, None);
+    let p = prog(&[
+        ins("V_ALIGNBIT_B32", &[("VDST", 30), ("SRC0", V), ("SRC1", V + 1), ("SRC2", V + 2)]),
+        ins("V_ALIGNBYTE_B32", &[("VDST", 31), ("SRC0", V), ("SRC1", V + 1), ("SRC2", V + 27)]),
+        ins("V_XAD_U32", &[("VDST", 32), ("SRC0", V + 3), ("SRC1", V + 4), ("SRC2", V + 5)]),
+        ins("V_ADD_LSHL_U32", &[("VDST", 33), ("SRC0", V + 6), ("SRC1", V + 7), ("SRC2", V + 8)]),
+        ins("V_LSHL_OR_B32", &[("VDST", 34), ("SRC0", V + 9), ("SRC1", V + 10), ("SRC2", V + 11)]),
+        ins("V_AND_OR_B32", &[("VDST", 35), ("SRC0", V + 12), ("SRC1", V + 13), ("SRC2", V + 14)]),
+        ins("V_OR3_B32", &[("VDST", 36), ("SRC0", V + 15), ("SRC1", V + 16), ("SRC2", V + 17)]),
+        ins("V_XOR3_B32", &[("VDST", 37), ("SRC0", V + 18), ("SRC1", V + 19), ("SRC2", V + 20)]),
+        ins("V_MED3_U32", &[("VDST", 38), ("SRC0", V + 21), ("SRC1", V + 22), ("SRC2", V + 23)]),
+        ins("V_MIN3_U32", &[("VDST", 39), ("SRC0", V + 21), ("SRC1", V + 22), ("SRC2", V + 23)]),
+        ins("V_MAX3_U32", &[("VDST", 40), ("SRC0", V + 21), ("SRC1", V + 22), ("SRC2", V + 23)]),
+        ins("V_MED3_I32", &[("VDST", 41), ("SRC0", V + 24), ("SRC1", V + 25), ("SRC2", V + 26)]),
+        ins("V_MIN3_I32", &[("VDST", 42), ("SRC0", V + 24), ("SRC1", V + 25), ("SRC2", V + 26)]),
+        ins("V_MAX3_I32", &[("VDST", 43), ("SRC0", V + 24), ("SRC1", V + 25), ("SRC2", V + 26)]),
+    ]);
+    let mut st = KernelState::default();
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        r[0] = 0x1234_5678;
+        r[1] = 0x9ABC_DEF0;
+        r[2] = 8;
+        r[3] = 0x0F0F_0F0F;
+        r[4] = 0x00FF_00FF;
+        r[5] = 0x0000_1000 + l as u32;
+        r[6] = 10;
+        r[7] = 5;
+        r[8] = 3;
+        r[9] = 0x0000_000F;
+        r[10] = 4;
+        r[11] = 0x0000_0005;
+        r[12] = 0xFFFF_0000;
+        r[13] = 0x1234_5678;
+        r[14] = 0x0000_ABCD;
+        r[15] = 0x1100_0000;
+        r[16] = 0x0022_0000;
+        r[17] = 0x0000_3344;
+        r[18] = 0xAAAA_5555;
+        r[19] = 0xFFFF_0000;
+        r[20] = 0x0000_FFFF;
+        r[21] = 0xFFFF_FFFF;
+        r[22] = 0x8000_0000;
+        r[23] = 100;
+        r[24] = (-100i32) as u32;
+        r[25] = 50i32 as u32;
+        r[26] = (-10i32) as u32;
+        r[27] = 2;
+    }
+    let r = runner::run_program(&p, &st, &[]).unwrap().0;
+    for l in 0..64usize {
+        let v = &r.vgpr[l];
+        assert_eq!(v[30], 0x789A_BCDE, "lane {l} v_alignbit_b32");
+        assert_eq!(v[31], 0x5678_9ABC, "lane {l} v_alignbyte_b32");
+        assert_eq!(v[32], 0x0FF0_1FF0 + l as u32, "lane {l} v_xad_u32");
+        assert_eq!(v[33], 120, "lane {l} v_add_lshl_u32");
+        assert_eq!(v[34], 0xF5, "lane {l} v_lshl_or_b32");
+        assert_eq!(v[35], 0x1234_ABCD, "lane {l} v_and_or_b32");
+        assert_eq!(v[36], 0x1122_3344, "lane {l} v_or3_b32");
+        assert_eq!(v[37], 0x5555_AAAA, "lane {l} v_xor3_b32");
+        assert_eq!(v[38], 0x8000_0000, "lane {l} v_med3_u32");
+        assert_eq!(v[39], 100, "lane {l} v_min3_u32");
+        assert_eq!(v[40], 0xFFFF_FFFF, "lane {l} v_max3_u32");
+        assert_eq!(v[41], (-10i32) as u32, "lane {l} v_med3_i32");
+        assert_eq!(v[42], (-100i32) as u32, "lane {l} v_min3_i32");
+        assert_eq!(v[43], 50, "lane {l} v_max3_i32");
+    }
+}
+
 #[test]
 fn dxc_mesh_shader_probe() {
     use super::dxc;
