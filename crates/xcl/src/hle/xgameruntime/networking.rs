@@ -449,6 +449,26 @@ pub unsafe fn verify_thumbprints(security_info: *const XNetworkingSecurityInform
     matches!(check_thumbprints(security_info, chain_sha1s), PinCheck::NoPins | PinCheck::Matched)
 }
 
+/// The request's URL (`WINHTTP_OPTION_URL`) and the bytes WinHTTP reported, or its Win32
+/// error. A URL longer than the first buffer leaves the bytes it needs in the length: query
+/// again with that much.
+unsafe fn request_url(query: WinHttpQueryOptionFn, request: *mut c_void) -> Result<(Vec<u16>, usize), u32> {
+    let mut url_buf = vec![0u16; 2048];
+    let mut url_bytes = (url_buf.len() * 2) as u32;
+    if query(request, WINHTTP_OPTION_URL, url_buf.as_mut_ptr() as *mut c_void, &mut url_bytes) == 0 {
+        let err = windows_sys::Win32::Foundation::GetLastError();
+        if err != windows_sys::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER || url_bytes as usize <= url_buf.len() * 2 {
+            return Err(err);
+        }
+        url_buf.resize((url_bytes as usize).div_ceil(2), 0);
+        url_bytes = (url_buf.len() * 2) as u32;
+        if query(request, WINHTTP_OPTION_URL, url_buf.as_mut_ptr() as *mut c_void, &mut url_bytes) == 0 {
+            return Err(windows_sys::Win32::Foundation::GetLastError());
+        }
+    }
+    Ok((url_buf, url_bytes as usize))
+}
+
 pub unsafe extern "system" fn XNetworkingVerifyServerCertificate(
     request_handle: *mut c_void,
     security_info: *const XNetworkingSecurityInformation,
@@ -463,12 +483,10 @@ pub unsafe extern "system" fn XNetworkingVerifyServerCertificate(
         return crate::util::E_FAIL;
     };
 
-    let mut url_buf = [0u16; 2048];
-    let mut url_bytes = (url_buf.len() * 2) as u32;
-    if (procs.winhttp_query_option)(request_handle, WINHTTP_OPTION_URL, url_buf.as_mut_ptr() as *mut c_void, &mut url_bytes) == 0 {
-        return win32_failure_hr(windows_sys::Win32::Foundation::GetLastError());
-    }
-    let url_bytes = url_bytes as usize;
+    let (url_buf, url_bytes) = match request_url(procs.winhttp_query_option, request_handle) {
+        Ok(u) => u,
+        Err(err) => return win32_failure_hr(err),
+    };
     if url_bytes == 0 || url_bytes > url_buf.len() * 2 || (url_bytes & 1) != 0 {
         return crate::util::E_FAIL;
     }
@@ -882,5 +900,40 @@ mod tests {
             assert_eq!(check_thumbprints(&info_wrong_len, &chain), PinCheck::InvalidMetadata);
             assert!(!verify_thumbprints(&info_wrong_len, &chain));
         }
+    }
+
+    /// The URL of a request is read whatever its length. The query stands in for
+    /// WinHttpQueryOption(WINHTTP_OPTION_URL) as Windows answers it (measured): a buffer too
+    /// small fails with ERROR_INSUFFICIENT_BUFFER and the bytes needed; a big enough one gets the
+    /// URL and its bytes without the terminator. (Not through WinHTTP itself: the XCL_NETWORK=0
+    /// test hooks WinHttpConnect for the whole test process.)
+    #[test]
+    fn request_url_reads_a_url_of_any_length() {
+        use windows_sys::Win32::Foundation::{SetLastError, ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_HANDLE};
+        static URL: std::sync::Mutex<Vec<u16>> = std::sync::Mutex::new(Vec::new());
+        unsafe extern "system" fn query(_h: *mut c_void, option: u32, buf: *mut c_void, len: *mut u32) -> i32 {
+            assert_eq!(option, WINHTTP_OPTION_URL);
+            let url = URL.lock().unwrap();
+            if (*len as usize) < (url.len() + 1) * 2 {
+                *len = ((url.len() + 1) * 2) as u32;
+                SetLastError(ERROR_INSUFFICIENT_BUFFER);
+                return 0;
+            }
+            std::ptr::copy_nonoverlapping(url.as_ptr(), buf as *mut u16, url.len());
+            *(buf as *mut u16).add(url.len()) = 0;
+            *len = (url.len() * 2) as u32;
+            1
+        }
+        unsafe extern "system" fn invalid(_h: *mut c_void, _option: u32, _buf: *mut c_void, _len: *mut u32) -> i32 {
+            SetLastError(ERROR_INVALID_HANDLE);
+            0
+        }
+        for url in ["http://localhost/short".to_string(), format!("http://localhost/{}", "a".repeat(3000))] {
+            *URL.lock().unwrap() = url.encode_utf16().collect();
+            let (buf, bytes) = unsafe { request_url(query, std::ptr::null_mut()) }.expect("URL read");
+            assert_eq!(bytes, url.len() * 2);
+            assert_eq!(String::from_utf16_lossy(&buf[..bytes / 2]), url);
+        }
+        assert_eq!(unsafe { request_url(invalid, std::ptr::null_mut()) }.unwrap_err(), ERROR_INVALID_HANDLE);
     }
 }
