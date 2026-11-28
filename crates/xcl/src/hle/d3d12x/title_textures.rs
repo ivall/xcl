@@ -1539,6 +1539,14 @@ unsafe fn walk() {
 /// the other (each block of them stayed hot for `hot_for`, and every look walked it).
 static KNOWN: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
 
+/// Newly GPU-visible backing must be scanned even if a prior look consumed its CPU writes.
+/// Unlike an optional storage hint, this is required for the first upload after exposure.
+pub(crate) fn rescan_cpu_backing(at: usize, len: usize) {
+    if len != 0 {
+        KNOWN.lock().unwrap().push((at, len));
+    }
+}
+
 /// `XCL_DS_KNOWN_WRITES=0`: what DirectStorage writes is found by the write watch, as before.
 fn known_writes() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();

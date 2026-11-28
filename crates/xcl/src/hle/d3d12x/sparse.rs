@@ -5248,6 +5248,67 @@ fn forget_in(s: &mut State, res: usize) {
 mod tests {
     use super::*;
 
+    /// Adapted from CallMeBrado's #1916: consumed CPU writes still reach first GPU exposure.
+    #[test]
+    fn private_physical_pages_reach_the_gpu_on_mapping() {
+        const CHILD: &str = "XCL_TEST_PRIVATE_PHYSICAL_PAGES";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "hle::d3d12x::sparse::tests::private_physical_pages_reach_the_gpu_on_mapping", "--nocapture"])
+                .env(CHILD, "1").env("XCL_DEFER_PRIVATE_HOME_TILES", "1")
+                .env("XCL_SPARSE_LAZY", "1").env("XCL_DS_KNOWN_WRITES", "0")
+                .output().unwrap();
+            print!("{}", String::from_utf8_lossy(&output.stdout));
+            eprint!("{}", String::from_utf8_lossy(&output.stderr));
+            assert!(output.status.success());
+            return;
+        }
+        use crate::hle::kernelx::{AllocateTitlePhysicalPages, FreeTitlePhysicalPages, MapTitlePhysicalPages, write_physical_pages};
+        unsafe {
+            let dev = test_device();
+            if software(&dev) {
+                return crate::gpu::recomp::runner::skip_test("no hardware sparse adapter");
+            }
+            let Some(u) = crate::gpu::uma::get() else { return crate::gpu::recomp::runner::skip_test("no UMA"); };
+            if !u.has_sparse() { return crate::gpu::recomp::runner::skip_test("no sparse windows"); }
+            let windows = init(&dev);
+            if windows.is_empty() { return crate::gpu::recomp::runner::skip_test("no reserved sparse buffers"); }
+            for (_, raw, _) in windows { drop(ID3D12Resource::from_raw(raw as *mut c_void)); }
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+            let mut pages = [0usize; 3];
+            let mut n = pages.len();
+            let null = std::ptr::null_mut();
+            assert_eq!(AllocateTitlePhysicalPages(null, 0, &mut n, pages.as_mut_ptr()), 1);
+            let first = vec![0xa7; TILE];
+            let last = vec![0x38; TILE];
+            let before = mapped_ranges();
+            assert!(write_physical_pages(&pages[..1], 0, &first));
+            assert!(write_physical_pages(&pages[2..], 0, &last));
+            super::super::title_textures::refresh(queue.as_raw());
+            assert_eq!(mapped_ranges(), before, "storage-only homes acquired sparse GPU tiles");
+            let first_home = MapTitlePhysicalPages(null, 1, 0, 4, pages.as_mut_ptr());
+            assert!(!first_home.is_null());
+            let home = MapTitlePhysicalPages(null, n, 0, 4, pages.as_mut_ptr()) as usize;
+            assert_eq!(home, first_home as usize);
+            assert!(mapped_ranges().iter().any(|&(a, b)| a <= home && home + n * TILE <= b));
+            assert_eq!(windows_sys::Win32::System::Memory::ResetWriteWatch(home as *const c_void, n * TILE), 0);
+            super::super::title_textures::refresh(queue.as_raw());
+            std::ptr::write_bytes(home as *mut u8, 0xdd, n * TILE);
+            readback_after_execute(&queue, &[(home, n * TILE)], &[]);
+            let started = std::time::Instant::now();
+            while RB_PENDING.load(Ordering::Acquire) != 0 && started.elapsed().as_secs() < 5 {
+                settle_readbacks();
+                std::thread::yield_now();
+            }
+            assert_eq!(RB_PENDING.load(Ordering::Acquire), 0, "copy back did not finish");
+            let result = std::slice::from_raw_parts(home as *const u8, n * TILE);
+            assert_eq!(&result[..TILE], &first);
+            assert!(result[TILE..2 * TILE].iter().all(|&b| b == 0));
+            assert_eq!(&result[2 * TILE..], &last);
+            assert_eq!(FreeTitlePhysicalPages(null, n, pages.as_mut_ptr()), 1);
+        }
+    }
+
     thread_local! {
         /// The VirtualQuery calls `source_holes` made on this thread.
         pub(super) static VIRTUAL_QUERIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
