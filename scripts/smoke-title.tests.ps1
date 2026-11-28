@@ -7,7 +7,8 @@ $fixture = Join-Path ([IO.Path]::GetTempPath()) ('xcl-smoke-title-' + [guid]::Ne
 $null = New-Item -ItemType Directory -Path $fixture
 try {
     $xcl = Join-Path $fixture 'xcl.cmd'
-    [IO.File]::WriteAllText($xcl, "@echo off`r`necho Log: %~dp0xcl.log`r`n")
+    $launchMarker = Join-Path $fixture 'launched.txt'
+    [IO.File]::WriteAllText($xcl, "@echo off`r`ntype nul > `"%~dp0launched.txt`"`r`necho Log: %~dp0xcl.log`r`n")
     [IO.File]::WriteAllText((Join-Path $fixture 'xcl.log'), "(1 frames shown, 1 PresentX calls)`n")
     function Get-SmokeTitle([hashtable]$Arguments) {
         $block = & $smoke -Seconds 1 -Xcl $xcl @Arguments
@@ -29,9 +30,12 @@ try {
     }
     $got = Get-SmokeTitle @{ Game = 'D:\Games\SomeTitle'; Title = '  my label: one  ' }
     if ($got -ne 'my label: one') { throw "-Title printed '$got'" }
-    foreach ($bad in @('', '   ', "a`nb", 'a`b', ('a' + [char]0x2028 + 'commit: 0123456'), ('a' + [char]0x85 + 'b'))) {
+    Remove-Item -LiteralPath $launchMarker
+    foreach ($bad in @('', '   ', "a`nb", 'a`b', ('a' + [char]0x2028 + 'commit: 0123456'),
+                       ('a' + [char]0x85 + 'b'), ('a' + [char]0x202E + 'b'), ('a' + [char]0x2029 + 'b'))) {
         $threw = $false
         try { $null = & $smoke -Game 'D:\Games\SomeTitle' -Seconds 1 -Xcl $xcl -Title $bad } catch { $threw = $true }
+        if (Test-Path -LiteralPath $launchMarker) { throw 'Invalid -Title launched XCL.' }
         if (-not $threw) { throw "-Title '$bad' was accepted" }
     }
     'smoke-title: ok'
