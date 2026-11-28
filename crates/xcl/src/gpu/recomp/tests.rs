@@ -8653,6 +8653,56 @@ fn gpu_nonfused_mad_and_mac_prevent_fma_contraction() {
     assert_eq!(v1[16], 0x2880_0000, "v_fma_f32 cancellation control should stay fused");
 }
 
+/// v_fmac_f32 (the destination is the addend), v_fmamk_f32 (a * K + b) and v_fmaak_f32 (a * b + K)
+/// against a fused multiply-add on the CPU, with the literal K in its place. The operands are small
+/// dyadic values whose products are exact, so a fused and an unfused multiply-add agree here (#472
+/// is about where they don't).
+#[test]
+fn gpu_valu_fmac_fmamk_fmaak() {
+    for wave64 in gpu_waves() {
+        valu_fmac_fmamk_fmaak(wave64);
+    }
+}
+
+fn valu_fmac_fmamk_fmaak(wave64: bool) {
+    const K_MK: f32 = 1.5; // v_fmamk_f32's literal
+    const K_AK: f32 = -2.25; // v_fmaak_f32's literal
+    const OPS: [&str; 3] = ["V_FMAC_F32", "V_FMAMK_F32", "V_FMAAK_F32"];
+    const AB: [f32; 12] = [0.0, -0.0, 1.0, -1.0, 2.0, 0.5, -3.0, 1.5, 0.25, f32::INFINITY, f32::NEG_INFINITY, f32::NAN];
+    const C: [f32; 8] = [0.0, -0.0, 1.0, -2.5, 100.0, 0.75, f32::INFINITY, f32::NAN];
+    // v0 = a, v1 = b, v2 = c, and v3 = c too: v_fmac_f32's addend and destination
+    let code = prog(&[
+        ("V_FMAC_F32", "ENC_VOP2", &[("VDST", 3), ("SRC0", V), ("VSRC1", 1)], None),
+        ("V_FMAMK_F32", "ENC_VOP2", &[("VDST", 4), ("SRC0", V), ("VSRC1", 2)], Some(K_MK.to_bits())),
+        ("V_FMAAK_F32", "ENC_VOP2", &[("VDST", 5), ("SRC0", V), ("VSRC1", 1)], Some(K_AK.to_bits())),
+    ]);
+    let (dxil, mem) = kernel_wave(&code, wave64);
+    let lanes = if wave64 { 64 } else { 32 };
+    let triples: Vec<(f32, f32, f32)> =
+        AB.iter().flat_map(|&a| AB.iter().flat_map(move |&b| C.iter().map(move |&c| (a, b, c)))).collect();
+    let (mut bad, mut wrong) = (Vec::new(), [0usize; 3]);
+    for chunk in triples.chunks(lanes) {
+        let mut st = KernelState::default();
+        for (r, &(a, b, c)) in st.vgpr.iter_mut().zip(chunk) {
+            (r[0], r[1], r[2], r[3]) = (f(a), f(b), f(c), f(c));
+        }
+        let r = runner::run(&dxil, &st, &mem).unwrap();
+        for (l, (v, &(a, b, c))) in r.vgpr.iter().zip(chunk).enumerate() {
+            let want = [a.mul_add(b, c), a.mul_add(K_MK, c), a.mul_add(b, K_AK)];
+            for (k, ((&name, want), &got)) in OPS.iter().zip(want).zip(&v[3..6]).enumerate() {
+                let g = f32::from_bits(got);
+                let ok = if want.is_nan() { g.is_nan() } else { got == want.to_bits() };
+                if !ok {
+                    wrong[k] += 1;
+                    bad.push(format!("lane {l} {name}({a:?}, {b:?}, {c:?}) = {g:?}, want {want:?}"));
+                }
+            }
+        }
+    }
+    let per_op: Vec<String> = OPS.iter().zip(wrong).filter(|(_, n)| *n > 0).map(|(&name, n)| format!("{name}: {n}")).collect();
+    assert!(bad.is_empty(), "wave{lanes}, {} wrong ({}):\n{}", bad.len(), per_op.join(", "), bad[..bad.len().min(24)].join("\n"));
+}
+
 #[test]
 fn gpu_f16_defaults_to_round_to_nearest_even() {
     if !gpu_ready() {
