@@ -1466,12 +1466,7 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, Vec<(usize, 
             p.list.ResourceBarrier(&[transition(&bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET)]);
             if comp.record(&p.dev, &p.list, &bb, w, h, fmt, &resolved, p.ring.cur) {
                 if due {
-                    p.list.ResourceBarrier(&[transition(&bb, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
-                    let bb_desc = bb.GetDesc();
-                    if let Some((buffer, footprint)) = readback_copy(&p.list, &bb, &bb_desc) {
-                        dumps.push(FrameDump { _source: bb.clone(), buffer, footprint, format: bb_desc.Format, tag: "frame".into() });
-                    }
-                    p.list.ResourceBarrier(&[transition(&bb, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PRESENT)]);
+                    dump_backbuffer(&p.list, &bb, D3D12_RESOURCE_STATE_RENDER_TARGET, &mut dumps);
                 } else {
                     p.list.ResourceBarrier(&[transition(&bb, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT)]);
                 }
@@ -1510,13 +1505,14 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, Vec<(usize, 
             let _ = ManuallyDrop::into_inner(dst.pResource);
             let _ = ManuallyDrop::into_inner(src_loc.pResource);
         }
+        // The dump reads the swap chain buffer just copied into, not the title's `src`: XCL owns
+        // the buffer and knows its state, while `src` is in whatever state the title keeps it (#499).
         if due {
-            if let Some((buffer, footprint)) = readback_copy(&p.list, src, desc) {
-                dumps.push(FrameDump { _source: src.clone(), buffer, footprint, format: desc.Format, tag: "frame".into() });
-            }
+            dump_backbuffer(&p.list, &bb, D3D12_RESOURCE_STATE_COPY_DEST, &mut dumps);
+        } else {
+            let b2 = [transition(&bb, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT)];
+            p.list.ResourceBarrier(&b2);
         }
-        let b2 = [transition(&bb, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT)];
-        p.list.ResourceBarrier(&b2);
     }
     // with `XCL_TRACE_FRAME`: also the render target the title binds most (its scene / UI)
     // (and the targets the watched one's contents went on to: rt_<n>_<k>)
@@ -1595,7 +1591,7 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, Vec<(usize, 
 
 /// `XCL_FRAME_DUMP=1`: every 120th shown frame is written to the logs folder (`XCL_FRAME_DUMP=n`,
 /// n > 1: every n-th; a title loading at a few frames a second shows few)
-/// (`frame_<n>.bmp`, a quarter of each side; `XCL_FRAME_DUMP_FULL=1`: full size) – what the title presented, before the window.
+/// (`frame_<n>.bmp`, a quarter of each side; `XCL_FRAME_DUMP_FULL=1`: full size) – the swap chain buffer the window shows, as filled from what the title presented.
 fn frame_dump_due() -> bool {
     static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let every = *EVERY.get_or_init(|| match std::env::var("XCL_FRAME_DUMP") {
@@ -1629,7 +1625,32 @@ pub fn last_frame_dump() -> Option<FrameDumpSample> {
     LAST_FRAME_DUMP.lock().ok().and_then(|s| *s)
 }
 
+/// `XCL_FRAME_DUMP`: the readback of swap chain buffer `bb` (now in `state`) recorded on `list`,
+/// which leaves `bb` in PRESENT.
+unsafe fn dump_backbuffer(list: &ID3D12GraphicsCommandList, bb: &ID3D12Resource, state: D3D12_RESOURCE_STATES, dumps: &mut Vec<FrameDump>) {
+    list.ResourceBarrier(&[transition(bb, state, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+    let desc = bb.GetDesc();
+    if let Some((buffer, footprint)) = readback_copy(list, bb, &desc) {
+        dumps.push(FrameDump { _source: bb.clone(), buffer, footprint, format: desc.Format, tag: "frame".into() });
+    }
+    list.ResourceBarrier(&[transition(bb, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PRESENT)]);
+}
+
+/// Whether `readback_copy` can copy subresource 0 of a resource described by `desc` into a
+/// buffer, from what `GetCopyableFootprints` gave for it: a single-sample 2D texture with a
+/// format and a size (a buffer, an MSAA target or a failed footprint is not one).
+fn readback_possible(desc: &D3D12_RESOURCE_DESC, fp: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT, total: u64) -> bool {
+    desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        && desc.SampleDesc.Count <= 1
+        && desc.Width > 0
+        && desc.Height > 0
+        && fp.Footprint.Format != DXGI_FORMAT_UNKNOWN
+        && total != 0
+        && total != u64::MAX
+}
+
 /// a copy of subresource 0 of `src` into a new readback buffer, recorded on `list`
+/// (None: not a resource such a copy can read, `readback_possible`)
 unsafe fn readback_copy(list: &ID3D12GraphicsCommandList, src: &ID3D12Resource, desc: &D3D12_RESOURCE_DESC) -> Option<(ID3D12Resource, D3D12_PLACED_SUBRESOURCE_FOOTPRINT)> {
     let dev: ID3D12Device = {
         let mut d: Option<ID3D12Device> = None;
@@ -1639,6 +1660,9 @@ unsafe fn readback_copy(list: &ID3D12GraphicsCommandList, src: &ID3D12Resource, 
     let mut fp = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
     let mut total = 0u64;
     dev.GetCopyableFootprints(desc, 0, 1, 0, Some(&mut fp), None, None, Some(&mut total));
+    if !readback_possible(desc, &fp, total) {
+        return None;
+    }
     let mut rb: Option<ID3D12Resource> = None;
     dev.CreateCommittedResource(
         &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() },
@@ -2143,6 +2167,148 @@ mod frame_dump_tests {
             write_frame(&buffer, &fp, DXGI_FORMAT_R32_FLOAT, "frame");
             let json = serde_json::to_value(last_frame_dump().unwrap()).unwrap();
             assert!(json["non_dark_samples"].is_null(), "undecoded is different from dark");
+        }
+    }
+
+    #[test]
+    fn readback_needs_a_single_sample_2d_texture_with_a_footprint() {
+        let tex = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 8,
+            Height: 8,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            ..Default::default()
+        };
+        let fp = D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+            Offset: 0,
+            Footprint: D3D12_SUBRESOURCE_FOOTPRINT { Format: DXGI_FORMAT_R8G8B8A8_UNORM, Width: 8, Height: 8, Depth: 1, RowPitch: 256 },
+        };
+        assert!(readback_possible(&tex, &fp, 256 * 7 + 32));
+        let buffer = D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_BUFFER, Height: 1, Format: DXGI_FORMAT_UNKNOWN, ..tex };
+        assert!(!readback_possible(&buffer, &fp, 8), "a buffer is not a texture copy source");
+        let msaa = D3D12_RESOURCE_DESC { SampleDesc: DXGI_SAMPLE_DESC { Count: 4, Quality: 0 }, ..tex };
+        assert!(!readback_possible(&msaa, &fp, 256 * 7 + 32), "an MSAA target cannot be copied to a buffer");
+        assert!(!readback_possible(&D3D12_RESOURCE_DESC { Width: 0, ..tex }, &fp, 256), "no texels");
+        assert!(!readback_possible(&D3D12_RESOURCE_DESC { Height: 0, ..tex }, &fp, 256), "no rows");
+        let no_format = D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+            Footprint: D3D12_SUBRESOURCE_FOOTPRINT { Format: DXGI_FORMAT_UNKNOWN, ..fp.Footprint },
+            ..fp
+        };
+        assert!(!readback_possible(&tex, &no_format, 256 * 7 + 32), "a footprint without a format");
+        assert!(!readback_possible(&tex, &fp, 0), "GetCopyableFootprints gave no size");
+        assert!(!readback_possible(&tex, &fp, u64::MAX), "GetCopyableFootprints failed");
+    }
+
+    #[test]
+    fn frame_dump_reads_the_swap_chain_buffer_after_its_copy_and_refuses_a_buffer() {
+        unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
+            let adapter: IDXGIAdapter = match factory.EnumWarpAdapter() {
+                Ok(a) => a,
+                Err(_) => {
+                    crate::gpu::recomp::runner::skip_test("no WARP");
+                    return;
+                }
+            };
+            let mut dev: Option<ID3D12Device> = None;
+            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut dev).unwrap();
+            let dev = dev.unwrap();
+            let queue: ID3D12CommandQueue = dev
+                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() })
+                .unwrap();
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let buffer_desc = |w: u64| D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: w,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            };
+            let committed = |heap: D3D12_HEAP_TYPE, desc: &D3D12_RESOURCE_DESC, state: D3D12_RESOURCE_STATES| -> ID3D12Resource {
+                let mut r: Option<ID3D12Resource> = None;
+                dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: heap, ..Default::default() }, D3D12_HEAP_FLAG_NONE, desc, state, None, &mut r)
+                    .unwrap();
+                r.unwrap()
+            };
+
+            // a title buffer handed to the dump is refused instead of recorded as a texture copy
+            let title_buffer = committed(D3D12_HEAP_TYPE_DEFAULT, &buffer_desc(4096), D3D12_RESOURCE_STATE_COMMON);
+            assert!(readback_copy(&list, &title_buffer, &title_buffer.GetDesc()).is_none());
+
+            // the swap chain buffer, as the uncomposited present leaves it: just copied into
+            let bb = committed(
+                D3D12_HEAP_TYPE_DEFAULT,
+                &D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                    Width: 8,
+                    Height: 8,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    ..Default::default()
+                },
+                D3D12_RESOURCE_STATE_COPY_DEST,
+            );
+            let up = committed(D3D12_HEAP_TYPE_UPLOAD, &buffer_desc(256 * 8), D3D12_RESOURCE_STATE_GENERIC_READ);
+            let mut p: *mut c_void = std::ptr::null_mut();
+            up.Map(0, None, Some(&mut p)).unwrap();
+            let bytes = std::slice::from_raw_parts_mut(p as *mut u8, 256 * 8);
+            for y in 0..8 {
+                for x in 0..8 {
+                    bytes[y * 256 + x * 4..y * 256 + x * 4 + 4].copy_from_slice(&[x as u8 * 30, y as u8 * 30, 7, 255]);
+                }
+            }
+            up.Unmap(0, None);
+            let dst = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: ManuallyDrop::new(Some(bb.clone())),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+            };
+            let src = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: ManuallyDrop::new(Some(up.clone())),
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                        Offset: 0,
+                        Footprint: D3D12_SUBRESOURCE_FOOTPRINT { Format: DXGI_FORMAT_R8G8B8A8_UNORM, Width: 8, Height: 8, Depth: 1, RowPitch: 256 },
+                    },
+                },
+            };
+            list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+            let mut dumps = Vec::new();
+            dump_backbuffer(&list, &bb, D3D12_RESOURCE_STATE_COPY_DEST, &mut dumps);
+            assert_eq!(dumps.len(), 1);
+            assert_eq!(dumps[0].format, DXGI_FORMAT_R8G8B8A8_UNORM);
+            // the buffer was left in PRESENT (= COMMON): it goes back to COPY_DEST from there
+            list.ResourceBarrier(&[transition(&bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST)]);
+            list.Close().unwrap();
+            queue.ExecuteCommandLists(&[Some(list.cast::<ID3D12CommandList>().unwrap())]);
+            queue.Signal(&fence, 1).unwrap();
+            fence::wait(&fence, 1, &dev, None, 5000).unwrap();
+            assert!(dev.GetDeviceRemovedReason().is_ok());
+
+            let (rb, fp) = (&dumps[0].buffer, dumps[0].footprint);
+            let mut p: *mut c_void = std::ptr::null_mut();
+            rb.Map(0, None, Some(&mut p)).unwrap();
+            let px = |x: usize, y: usize| -> [u8; 4] {
+                let off = fp.Offset as usize + y * fp.Footprint.RowPitch as usize + x * 4;
+                let s = std::slice::from_raw_parts((p as *const u8).add(off), 4);
+                [s[0], s[1], s[2], s[3]]
+            };
+            assert_eq!(px(0, 0), [0, 0, 7, 255]);
+            assert_eq!(px(5, 3), [150, 90, 7, 255], "the dump holds what was copied into the swap chain buffer");
+            rb.Unmap(0, None);
+            let _ = ManuallyDrop::into_inner(dst.pResource);
+            let _ = ManuallyDrop::into_inner(src.pResource);
         }
     }
 
