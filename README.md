@@ -258,6 +258,7 @@ xcl disasm <shader.bin> [--hex]            # RDNA2 disassembler (console contain
 xcl shaders D:\data\shaders.rpf --top 50   # pack statistics; --recomp / --compile N
 xcl shaders D:\data\shaders.rpf --precompile --only cs --pipelines   # build compute pipelines and save driver blobs for the next run (except by default on AMD)
 xcl shaders D:\data\shaders.rpf --precompile --only cs --pipelines --used-only   # only the compute pipelines an earlier run of the title used
+xcl shaders D:\data\shaders.rpf --precompile --limit 100   # process at most the first 100 shader records
 xcl shaders D:\data\shaders.rpf --export-hlsl out --record-hash HEX  # exact compute HLSL for investigation
 xcl shaders D:\data\shaders.rpf --measure-pso HEX --repeat 3         # cold driver PSO timing (cache disabled)
 xcl rpf D:\data\shaders.rpf --extract NAME --out folder
