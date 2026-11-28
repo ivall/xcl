@@ -120,17 +120,35 @@ fn checked_span(start: u64, bytes: usize) -> Result<(usize, usize), String> {
     Ok((start, end))
 }
 
-pub fn uma_bytes(t: &Image, cfg: PipeConfig) -> Result<&'static [u8], String> {
+/// Copy texture bytes out of UMA without borrowing guest-writable memory.
+pub fn uma_bytes(t: &Image, cfg: PipeConfig) -> Result<Vec<u8>, String> {
     let p = placement(t, cfg)?;
     let u = super::uma::get().ok_or("no UMA")?;
     let (a, end) = checked_span(p.start, p.bytes)?;
-    if !u.contains(a) || !u.contains(end - 1) {
-        return Err(format!("texture {a:#x}+{:#x} outside UMA", p.bytes));
-    }
-    // SAFETY: inside the UMA reservation, which lives for the whole process
-    Ok(unsafe { std::slice::from_raw_parts(a as *const u8, p.bytes) })
+    copy_uma_bytes(u, a, end)
 }
 
+fn copy_uma_bytes(u: &super::uma::Uma, a: usize, end: usize) -> Result<Vec<u8>, String> {
+    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    let len = end.checked_sub(a).filter(|&n| n != 0).ok_or("empty texture memory span")?;
+    let window = u.window_of(a).ok_or("texture outside UMA")?;
+    if u.window_of(end - 1) != Some(window) || !super::shader::readable(a, len) {
+        return Err("texture memory is outside a readable UMA window".into());
+    }
+    let mut out = Vec::new();
+    out.try_reserve_exact(len).map_err(|_| "texture copy allocation failed")?;
+    out.resize(len, 0);
+    let mut read = 0;
+    // SAFETY: the destination is writable; ReadProcessMemory handles a source that is
+    // unmapped after the readability check without dereferencing it in Rust.
+    let ok = unsafe { ReadProcessMemory(GetCurrentProcess(), a as *const _, out.as_mut_ptr() as *mut _, len, &mut read) };
+    if ok == 0 || read != len {
+        return Err("texture memory could not be read".into());
+    }
+    Ok(out)
+}
 fn err(x: windows::core::Error) -> String {
     format!("{x}")
 }
@@ -764,6 +782,21 @@ mod tests {
         assert!(checked_span(u64::MAX, 2).unwrap_err().contains("address"));
         assert!(checked_span((usize::MAX - 1) as u64, 2).unwrap_err().contains("overflows"));
         assert_eq!(checked_span((usize::MAX - 1) as u64, 1).unwrap(), (usize::MAX - 1, usize::MAX));
+    }
+
+    #[test]
+    fn uma_copy_is_owned_and_rejects_uncommitted_memory() {
+        let u = super::super::uma::Uma::new(16 << 20).unwrap();
+        let src = u.alloc(65536, 65536).unwrap();
+        unsafe { std::ptr::copy_nonoverlapping([1u8, 2, 3, 4].as_ptr(), src, 4) };
+        let copied = copy_uma_bytes(&u, src as usize, src as usize + 4).unwrap();
+        unsafe { *src = 9 };
+        assert_eq!(copied, [1, 2, 3, 4]);
+        assert!(copy_uma_bytes(&u, src as usize, src as usize).is_err());
+        let sparse = u.base() + (1usize << 32);
+        assert!(u.contains(sparse));
+        assert!(copy_uma_bytes(&u, sparse, sparse + 4).is_err());
+        assert!(copy_uma_bytes(&u, src as usize, sparse + 4).is_err());
     }
 
     #[test]
