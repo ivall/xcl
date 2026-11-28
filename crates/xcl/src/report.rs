@@ -316,8 +316,21 @@ pub fn write_final(crash: Option<String>) {
     let Some(boot) = crate::state::boot() else { return };
     let r = build();
     if let Ok(s) = serde_json::to_string_pretty(&r) {
-        let _ = std::fs::write(boot.report_path(), s);
+        // said once on stderr: a report that is not there would otherwise look like a silent
+        // crash, and its log may be missing for the same reason (#2277)
+        if let Err(e) = save(&boot.report_path(), &s) {
+            if !WRITE_FAILED.swap(true, Ordering::Relaxed) {
+                crate::log::warn(&e);
+            }
+        }
     }
+}
+
+static WRITE_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Write the report text to `path`; the error names the path and the OS error.
+fn save(path: &std::path::Path, text: &str) -> Result<(), String> {
+    std::fs::write(path, text).map_err(|e| format!("cannot write the report {}: {e}", path.display()))
 }
 
 pub fn load(path: &std::path::Path) -> Option<Report> {
@@ -469,5 +482,19 @@ mod tests {
         writer.join().unwrap();
         assert_eq!(CRASH.lock().unwrap().as_deref(), Some("boom"));
         *CRASH.lock().unwrap() = None;
+    }
+
+    #[test]
+    fn a_report_that_cannot_be_written_names_its_path() {
+        let dir = std::env::temp_dir().join(format!("xcl-report-save-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let blocker = dir.join("not-a-folder");
+        std::fs::write(&blocker, "x").unwrap();
+        let e = save(&blocker.join("report.json"), "{}").unwrap_err();
+        assert!(e.starts_with("cannot write the report ") && e.contains("not-a-folder"), "{e}");
+        let good = dir.join("report.json");
+        save(&good, "{}").unwrap();
+        assert_eq!(std::fs::read_to_string(&good).unwrap(), "{}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
