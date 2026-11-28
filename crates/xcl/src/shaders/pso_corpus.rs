@@ -160,7 +160,10 @@ impl Corpus {
                         if crate::gpu::shader::fnv64(&code) != *key || !super::is_compute_container(&code) {
                             return Err("Compute shader identity or stage differs from the staged recipe".into());
                         }
-                        pipelines.prepare_compute(&code, self.windows)?;
+                        // the title's pipeline would leave it out too (`gpu::rt_leave_out`)
+                        if !crate::gpu::rt_leave_out::left_out(&code) {
+                            pipelines.prepare_compute(&code, self.windows)?;
+                        }
                         let mut done = completed.lock().unwrap();
                         *done += 1;
                         progress.complete_corpus(*done)

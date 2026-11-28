@@ -292,6 +292,14 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   configuration for offline preparation and play so the driver can reuse the results.
   Graphics state combinations absent from the supplied recipes and local history can still
   require a first-use compile during play.
+- **`XCL_RT_LEAVE_OUT=<fragment>[,<fragment>…]`** (off by default): compute programs whose shader
+  container holds one of the fragments (at least 6 bytes each; a program name from the
+  container's debug data, found with `xcl rpf <pack> --find`) are left out: the title's pipeline
+  gets a dummy program, its dispatches are skipped, and the preparation and `--precompile` pass
+  them over. Meant for a title's ray-tracing hit-shading and ray-start programs while it builds
+  no acceleration structure (every ray misses). XCL warns once in the log when a structure a
+  view names gets a root node; from then on rays can hit, and the setting should be removed.
+  Ported from Vice-Tay (see `THIRD_PARTY.md`).
 - For compute shaders that XCL can split, the runtime first tries the saved driver blob for
   the whole shader. A usable blob lets the GPU run it in one dispatch. If the blob is missing
   or the driver rejects it, XCL builds the split pieces.

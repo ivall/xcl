@@ -2752,6 +2752,7 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
         let va = v.Anonymous.RaytracingAccelerationStructure.Location;
         let in_uma = va != 0 && crate::gpu::uma::get().is_some_and(|u| u.contains(va as usize));
         if in_uma {
+            crate::gpu::rt_leave_out::note_structure(va);
             let w = crate::gpu::desc::bvh_words(va, true);
             return super::console_heap::write(&slot, &[w[0], w[1], w[2], w[3], 0, 0, 0, 0]);
         }
@@ -7658,10 +7659,27 @@ unsafe fn note_translated_compute(hr: HRESULT, ppv: *mut *mut c_void) {
     }
 }
 
+/// Whether `desc`'s console compute program is one `XCL_RT_LEAVE_OUT` leaves out.
+unsafe fn rt_left_out(desc: *const c_void) -> bool {
+    if !crate::gpu::rt_leave_out::enabled() || !crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_COMPUTE_PIPELINE_STATE_DESC>()) {
+        return false;
+    }
+    let d = &*(desc as *const D3D12_COMPUTE_PIPELINE_STATE_DESC);
+    shader_bytes(&d.CS).is_some_and(|cs| crate::gpu::recomp::pso::is_console(cs) && crate::gpu::rt_leave_out::left_out(cs))
+}
+
 unsafe extern "system" fn dev_create_compute_pso(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     super::null::capture_compute_desc(desc as *const u8);
     let f: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreateComputePipelineState")));
-    let (mut console, missed) = if super::pso_async::enabled() { attempt(|| translated_compute_pso(this, f, desc, riid, ppv)) } else { (translated_compute_pso(this, f, desc, riid, ppv), false) };
+    // `XCL_RT_LEAVE_OUT`: not translated or built; the dummy program below, its dispatches skipped
+    let left_out = rt_left_out(desc);
+    let (mut console, missed) = if left_out {
+        (Some(Err(())), false)
+    } else if super::pso_async::enabled() {
+        attempt(|| translated_compute_pso(this, f, desc, riid, ppv))
+    } else {
+        (translated_compute_pso(this, f, desc, riid, ppv), false)
+    };
     if missed {
         if let Some(hr) = own_compute(desc).and_then(|o| go_background(this, f, desc, riid, ppv, true, o, standin_compute, compute_key, build_compute)) {
             // a console program the worker is translating (its root signature comes with it);
@@ -7688,8 +7706,18 @@ unsafe extern "system" fn dev_create_compute_pso(this: *mut c_void, desc: *const
     let mut copy: D3D12_COMPUTE_PIPELINE_STATE_DESC = std::ptr::read(desc as *const D3D12_COMPUTE_PIPELINE_STATE_DESC);
     copy.CS = bytecode(&dummy().cs);
     copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
+    // a program left out of a desc without a root signature (its console container carries its
+    // own): the dummy, which binds nothing, gets XCL's ABI root signature – the driver refuses a
+    // compute pipeline without one
+    if left_out && std::mem::transmute_copy::<_, usize>(&copy.pRootSignature) == 0 {
+        if let Some(rs) = abi_rs_for(this, &[]) {
+            copy.pRootSignature = std::mem::transmute::<*mut c_void, std::mem::ManuallyDrop<Option<ID3D12RootSignature>>>(rs);
+        }
+    }
     let hr2 = finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv);
-    note_fallback("compute PSO", hr, hr2 >= 0);
+    if !left_out || hr2 < 0 {
+        note_fallback("compute PSO", hr, hr2 >= 0);
+    }
     if console.is_some() {
         note_console_compute(hr2, ppv);
     }

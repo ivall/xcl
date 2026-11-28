@@ -3344,6 +3344,11 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                 // a compute program as a title's pipeline translates it (`pso::console_to_dxil_in`):
                 // into the translation cache too, so the title does not translate it again
                 if sh.fssm.iter().any(|f| matches!(recomp::interface(&blob, &sh, f), Some(recomp::Mode::Compute(_)))) {
+                    // the title's pipeline would leave it out too (`gpu::rt_leave_out`)
+                    if crate::gpu::rt_leave_out::left_out(&blob) {
+                        record_done();
+                        continue;
+                    }
                     if let Some(coverage) = coverage {
                         match coverage.covers(i, &blob) {
                             Ok(true) => { record_done(); continue; }
@@ -3480,6 +3485,9 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
         skipped.into_inner(),
         t0.elapsed().as_secs_f64()
     );
+    if crate::gpu::rt_leave_out::enabled() {
+        println!("compute programs passed over (XCL_RT_LEAVE_OUT): {}", crate::gpu::rt_leave_out::left_out_count());
+    }
     if let Some(p) = pipelines {
         if startup.is_none() {
             make_pipelines(p, pipeline_jobs.into_inner().unwrap());

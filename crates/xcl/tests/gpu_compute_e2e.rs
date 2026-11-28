@@ -412,6 +412,114 @@ fn mirror_program_through_the_hook(dev: &ID3D12Device) {
     }
 }
 
+/// The fragment `rt_leave_out_skips_the_named_program_and_builds_the_other` names its program by.
+const LEAVE_OUT_MARK: &[u8; 16] = b"XCLTEST_LEAVEOUT";
+
+/// The mirror program's container with `LEAVE_OUT_MARK` in its XDAT hash entry (16 bytes no
+/// translation reads): the same program, now holding the fragment.
+fn named_for_leave_out() -> Vec<u8> {
+    let mut blob = console_cs(&program(), 2 << 1 | 1 << 7 | 1 << 8 | 1 << 11, [16, 8, 1]);
+    let at = blob.windows(16).position(|w| w == [0x5a; 16]).expect("the XDAT hash entry");
+    blob[at..at + 16].copy_from_slice(LEAVE_OUT_MARK);
+    blob
+}
+
+/// The CreateComputePipelineState hook with the mirror program's root layout (or, `with_rs`
+/// false, no root signature in the desc, as a title whose containers carry theirs passes it);
+/// the pipeline after a background build.
+fn compute_pso_through_the_hook(dev: &ID3D12Device, blob: &[u8], with_rs: bool) -> usize {
+    let game_rs: ID3D12RootSignature = unsafe {
+        let mut ser = None;
+        D3D12SerializeRootSignature(&D3D12_ROOT_SIGNATURE_DESC::default(), D3D_ROOT_SIGNATURE_VERSION_1, &mut ser, None).unwrap();
+        let ser = ser.unwrap();
+        dev.CreateRootSignature(0, std::slice::from_raw_parts(ser.GetBufferPointer() as *const u8, ser.GetBufferSize())).unwrap()
+    };
+    let mut desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+        pRootSignature: std::mem::ManuallyDrop::new(with_rs.then_some(game_rs)),
+        CS: D3D12_SHADER_BYTECODE { pShaderBytecode: blob.as_ptr() as _, BytecodeLength: blob.len() },
+        ..Default::default()
+    };
+    let pso: Result<ID3D12PipelineState, _> = unsafe { dev.CreateComputePipelineState(&desc) };
+    unsafe { std::mem::ManuallyDrop::drop(&mut desc.pRootSignature) };
+    let pso = pso.expect("CreateComputePipelineState through the backend hook");
+    let resolved = xcl::hle::d3d12x::pso_async::resolve_wait(pso.as_raw() as usize);
+    std::mem::forget(pso); // kept for the process, as a title keeps its pipelines
+    resolved
+}
+
+/// `XCL_RT_LEAVE_OUT` (#3011, C3) on the paths it changes. Of two console compute programs, the
+/// one whose container holds the fragment is left out:
+/// - in the CreateComputePipelineState hook it gets the dummy program a console shader that
+///   cannot be translated gets (a console compute pipeline, not a translated one), and is not
+///   translated, also from a desc without a root signature;
+/// - `xcl shaders --precompile --pipelines` passes it over.
+/// The other program is translated and built as without the switch. The switch is read once
+/// per process, so each path runs in a child process that has it set.
+#[test]
+fn rt_leave_out_skips_the_named_program_and_builds_the_other() {
+    use std::{fs, process::Command};
+    let fragment = std::str::from_utf8(LEAVE_OUT_MARK).unwrap();
+    if std::env::var("XCL_TEST_RT_LEAVE_OUT").is_ok_and(|v| v == "hook") {
+        assert_eq!(std::env::var("XCL_RT_LEAVE_OUT").as_deref(), Ok(fragment));
+        assert_eq!(xcl::hle::d3d12x::backend(), xcl::hle::d3d12x::Backend::Real);
+        let raw = real::device_raw();
+        let dev = unsafe { ID3D12Device::from_raw_borrowed(&raw) }.unwrap().clone();
+        let named = named_for_leave_out();
+        let plain = console_cs(&program(), 2 << 1 | 1 << 7 | 1 << 8 | 1 << 11, [16, 8, 1]);
+        assert!(xcl::gpu::rt_leave_out::holds_any(&named, &xcl::gpu::rt_leave_out::fragments_of(fragment)));
+        assert!(!xcl::gpu::rt_leave_out::holds_any(&plain, &xcl::gpu::rt_leave_out::fragments_of(fragment)));
+
+        let before = real::stats();
+        let left = compute_pso_through_the_hook(&dev, &named, true);
+        let after_named = real::stats();
+        assert_eq!(xcl::gpu::rt_leave_out::left_out_count(), 1, "the named program is left out");
+        assert_eq!(after_named.translated_pipelines, before.translated_pipelines, "the named program was translated");
+        assert!(real::is_console_compute(left), "the named program's pipeline is a console compute pipeline");
+        assert!(!real::is_translated_compute(left), "the named program's pipeline is the dummy, not a translated one");
+        // a desc without a root signature: the dummy gets one of XCL's, the driver refuses none
+        let left_bare = compute_pso_through_the_hook(&dev, &named, false);
+        assert_eq!(xcl::gpu::rt_leave_out::left_out_count(), 2, "the named program is left out without a root signature too");
+        assert!(real::is_console_compute(left_bare) && !real::is_translated_compute(left_bare));
+
+        let built = compute_pso_through_the_hook(&dev, &plain, true);
+        let after_plain = real::stats();
+        assert_eq!(xcl::gpu::rt_leave_out::left_out_count(), 2, "the other program is not left out");
+        assert_eq!(after_plain.translated_pipelines, before.translated_pipelines + 1, "the other program was not translated: {:?}", after_plain.translation_errors);
+        assert!(real::is_translated_compute(built), "the other program's pipeline is a translated one");
+        return;
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    if xcl::gpu::recomp::dxc::location().is_err() {
+        return runner::skip_test("no DXC");
+    }
+    if runner::wave64_programs_supported() != Ok(true) {
+        return runner::skip_test("no GPU with 32- or 64-lane waves");
+    }
+    let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let dir = std::env::temp_dir().join(format!("xcl-rt-leave-out-{}-{nonce}", std::process::id()));
+    let input = dir.join("input");
+    fs::create_dir_all(&input).unwrap();
+    fs::write(input.join("named.bin"), named_for_leave_out()).unwrap();
+    fs::write(input.join("plain.bin"), console_cs(&program(), 2 << 1 | 1 << 7 | 1 << 8 | 1 << 11, [16, 8, 1])).unwrap();
+
+    // the precompile: one pipeline made, one program passed over
+    let out = Command::new(env!("CARGO_BIN_EXE_xcl")).arg("shaders").arg(&input).args(["--precompile", "--pipelines"])
+        .env("XCL_DXIL_CACHE", dir.join("cache-precompile")).env("XCL_PSO_DISK_CACHE", "0")
+        .env("XCL_RT_LEAVE_OUT", fragment).env("TMP", &dir).env("TEMP", &dir).output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(out.status.success(), "{text}\n{}", String::from_utf8_lossy(&out.stderr));
+    assert!(text.contains("pipelines made on the GPU 1, refused 0"), "{text}");
+    assert!(text.contains("compute programs passed over (XCL_RT_LEAVE_OUT): 1"), "{text}");
+
+    // the hook, in a process of its own with the switch set and a cold DXIL cache
+    let out = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "rt_leave_out_skips_the_named_program_and_builds_the_other", "--nocapture"])
+        .env("XCL_TEST_RT_LEAVE_OUT", "hook").env("XCL_RT_LEAVE_OUT", fragment)
+        .env("XCL_DXIL_CACHE", dir.join("cache-hook")).env("XCL_PSO_DISK_CACHE", "0").output().unwrap();
+    assert!(out.status.success(), "{}\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// A driver that refuses a pipeline with heap windows (E_OUTOFMEMORY, as NVIDIA 616.92 does
 /// with some big retail programs, #156) gets the program again in the switch form, and the
 /// pipeline from it runs correctly. The refusals are injected (`real::inject_heap_window_oom`).
