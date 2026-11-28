@@ -1,0 +1,6 @@
+# Only the code owner reviews a change to the gate, its limits or the workflow that runs it.
+# Enable "Require review from Code Owners" in the branch protection of the default branch.
+/crates/xcl-gate/ @krigsexe
+/scripts/gate-limits.txt @krigsexe
+/.github/workflows/ @krigsexe
+/.github/CODEOWNERS @krigsexe

@@ -49,6 +49,24 @@ jobs:
           key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}-${{ hashFiles('**/Cargo.toml') }}
           restore-keys: cargo-${{ runner.os }}-
 
+      - name: Build gate
+        shell: pwsh
+        run: |
+          # A pull request is judged by the gate of its target branch, never by its own copy.
+          # The gate is restored and the guard is armed only once the target branch has the gate:
+          # the pull request that introduces it has nothing to restore from.
+          $guard = @()
+          $base = $env:GITHUB_BASE_REF
+          if ($base) {
+            git fetch --quiet --depth=1 origin $base
+            git cat-file -e "origin/${base}:crates/xcl-gate/Cargo.toml" 2>$null
+            if ($LASTEXITCODE -eq 0) {
+              git fetch --quiet --unshallow origin 2>$null
+              git checkout --quiet "origin/$base" -- crates/xcl-gate
+              $guard = @('--base', "origin/$base", '--protect', 'crates/xcl-gate', '--protect', '.github/workflows', '--protect', '.github/CODEOWNERS')
+            }
+          }
+          cargo run --quiet --release --manifest-path crates/xcl-gate/Cargo.toml -- --root . --config-file crates/xcl/src/config.rs --skip crates/xcl-gate --no-sync --limits scripts/gate-limits.txt @guard
       - name: Build and test
         shell: pwsh
         run: ./scripts/test.ps1 --nocapture --skip test_title_runs_and_game_folder_is_untouched

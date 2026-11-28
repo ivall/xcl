@@ -1,0 +1,13 @@
+[package]
+name = "xcl-gate"
+version = "0.2.0"
+edition = "2021"
+publish = false
+description = "Build gate for any Rust repository: the std, clippy, Cargo and rustup rules that a text scan can check."
+
+[workspace]
+# Standalone on purpose: the gate has no dependency and must build before the code it judges.
+
+[[bin]]
+name = "xcl-gate"
+path = "main.rs"
