@@ -2336,6 +2336,44 @@ fn gpu_ps_p0_reads_flat_integer_selectors() {
     }
 }
 
+/// LOD 0 plus one and LOD 1 minus one must select opposite mips. Bias zero is the control.
+#[test]
+fn gpu_ps_compare_mip_bias() {
+    if !gpu_ready() {
+        return;
+    }
+    let mut failures = Vec::new();
+    // At the final slope column zero supplies bias 0.25, its neighbor 0.75.
+    for (op, scale, bias, min_lod, mip, slope) in [
+        ("IMAGE_SAMPLE_C_B", 0.125f32, 0.0f32, 0.0f32, 0, 0.0f32),
+        ("IMAGE_SAMPLE_C_B", 0.125, 1.0, 0.0, 1, 0.0),
+        ("IMAGE_SAMPLE_C_B_CL", 0.25, -1.0, 0.0, 0, 0.0),
+        ("IMAGE_SAMPLE_C_B_O", 0.125, 1.0, 0.0, 1, 0.0),
+        ("IMAGE_SAMPLE_C_B_CL_O", 0.25, -1.0, 1.0, 1, 0.0),
+        ("IMAGE_SAMPLE_C_B", 0.125, 0.0, 0.0, 0, 0.5),
+    ] {
+        let ps = prog(&[
+            // Screen derivatives need coordinates from uncovered neighbors in a partial quad.
+            ("S_WQM_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 126)], None),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 8), ("SRC0", 255)], Some(bias.to_bits())),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 9), ("SRC0", 240)], None), // compare 0.5
+            ("V_MUL_F32", "ENC_VOP2", &[("VDST", 10), ("SRC0", 255), ("VSRC1", 2)], Some(scale.to_bits())),
+            ("V_MUL_F32", "ENC_VOP2", &[("VDST", 11), ("SRC0", 255), ("VSRC1", 3)], Some(scale.to_bits())),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 7), ("SRC0", 128)], None), // zero texel offset for _O
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 12), ("SRC0", 255)], Some(min_lod.to_bits())),
+            ("V_MUL_F32", "ENC_VOP2", &[("VDST", 16), ("SRC0", 255), ("VSRC1", 2)], Some(slope.to_bits())),
+            ("V_ADD_F32", "ENC_VOP2", &[("VDST", 8), ("SRC0", V + 16), ("VSRC1", 8)], None),
+            (op, "ENC_MIMG", &[("VDATA", 20), ("VADDR", if op.ends_with("_O") { 7 } else { 8 }), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 1), ("DIM", 1)], None),
+            ("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 1), ("VSRC0", 20), ("DONE", 1), ("VM", 1)], None),
+        ]);
+        let want = |x| if slope == 0.0 { mip } else { u32::from(x > 0) };
+        if let Err(error) = check_ps_depth_mip(&ps, scale, want) {
+            failures.push(format!("{op}, scale {scale}, slope {slope}: {error}"));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
 /// Draw console wave64 VS + PS (`vs` None: position and COLOR passed through; `ps` None:
 /// COLOR interpolated) with triangles given in pixels of a 16 × 16 target, cleared to -1.
 /// Translated for this adapter (`runner::options`: on a GPU with 32-lane waves only, the
@@ -2380,6 +2418,58 @@ fn draw_console_views(
         runner::VertexElement { semantic: "COLOR", index: 0, format: DXGI_FORMAT_R32G32B32A32_FLOAT, offset: 8 },
     ];
     runner::draw_views(&vsb, &psb, &layout, &verts, 24, sgprs, &[], textures, samplers, 16, [-1.0; 4]).unwrap()
+}
+
+/// Both depth mips contain a checkerboard, in opposite phases. Check the comparison result at
+/// each pixel so that selecting a neighbor's coordinates is distinguishable from selecting its mip.
+fn check_ps_depth_mip(ps: &[u8], coord_scale: f32, mip_at: impl Fn(usize) -> u32) -> Result<(), String> {
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_TYPELESS, DXGI_SAMPLE_DESC};
+    let mut data = Vec::new();
+    for level in 0..2 {
+        let size = 8 >> level;
+        for y in 0..size {
+            for x in 0..size {
+                let depth = if (x + y + level) % 2 == 0 { 0.25f32 } else { 0.75f32 };
+                data.extend_from_slice(&depth.to_le_bytes());
+            }
+        }
+    }
+    let res = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: 8, Height: 8, DepthOrArraySize: 1, MipLevels: 2,
+        Format: DXGI_FORMAT_R32_TYPELESS, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Flags: D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, ..Default::default()
+    };
+    let mut srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
+        Format: DXGI_FORMAT_R32_FLOAT, ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, ..Default::default()
+    };
+    srv.Anonymous.Texture2D = D3D12_TEX2D_SRV { MipLevels: 2, ..Default::default() };
+    let tex = runner::ViewTexture { res, srv, data, row_bytes: 8 * 4 };
+    // Clamp U/V/W, LESS_EQUAL, point min/mag/mip, LOD range 0..15.99.
+    let sampler = [2 | 2 << 3 | 2 << 6 | 3 << 12, 0xFFF << 12, 1 << 26, 0];
+    let mut sgprs = [0; 32];
+    sgprs[16..24].copy_from_slice(&tsharp(0, 77, 9));
+    sgprs[24..28].copy_from_slice(&sampler);
+    let samplers = [crate::gpu::desc::sampler_d3d12(&sampler, true)];
+    // The second triangle cuts through 2x2 quads. Its diagonal is 4*x + 3*y = 48;
+    // no pixel center lies exactly on it. Uncovered pixels must retain the clear value.
+    for (width, height) in [(32.0, 32.0), (12.0, 16.0)] {
+        let tri = [[0.0, 0.0], [0.0, height], [width, 0.0]];
+        let pixels = draw_console_views(None, Some(ps), &tri, &sgprs, std::slice::from_ref(&tex), &samplers);
+        for (i, pixel) in pixels.iter().enumerate() {
+            let (x, y) = (i % 16, i / 16);
+            let mip = mip_at(x);
+            let size = 8u32 >> mip;
+            let texel = |p: usize| (((p as f32 + 0.5) * coord_scale * size as f32) as u32).min(size - 1);
+            let covered = (x as f32 + 0.5) * height + (y as f32 + 0.5) * width < width * height;
+            let expected = if covered { ((texel(x) + texel(y) + mip) % 2) as f32 } else { -1.0 };
+            if pixel[0] != expected {
+                return Err(format!("{width}x{height} triangle, pixel ({x},{y}): {} instead of {expected} at mip {mip}", pixel[0]));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// `image_sample_o` in a pixel shader, implicit LOD between two mips (trilinear): the console

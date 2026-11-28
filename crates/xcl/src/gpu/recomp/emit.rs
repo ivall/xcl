@@ -2518,6 +2518,23 @@ impl Em {
 
     // ---------------------------------------------------------------- images (MIMG)
 
+    /// SM 6.6 has no comparison sample with gradients. For each pixel in a quad, build a
+    /// footprint centered at its coordinate and let SampleCmp do its usual filtering.
+    /// Evaluate all four samples before selecting so the texture derivatives see the whole quad.
+    fn sample_cmp_grad(&mut self, t: &str, ty: &str, coord: &str, dx: &str, dy: &str, args: &str) -> String {
+        self.line(&format!("int2 {t}_xy = int2(xi.xcl_pos.x > QuadReadAcrossX(xi.xcl_pos.x), xi.xcl_pos.y > QuadReadAcrossY(xi.xcl_pos.y));"));
+        self.line(&format!("float4 {t}_values; [unroll] for (uint {t}_q = 0; {t}_q < 4; ++{t}_q) {{"));
+        self.line(&format!("    int2 {t}_delta = {t}_xy - int2({t}_q & 1u, {t}_q >> 1);"));
+        self.line(&format!("    {ty} {t}_p = QuadReadLaneAt({coord}, {t}_q);"));
+        self.line(&format!("    {ty} {t}_dx = QuadReadLaneAt({dx}, {t}_q), {t}_dy = QuadReadLaneAt({dy}, {t}_q);"));
+        // Keep the coordinate on each stationary axis even for a nonfinite gradient (0 * inf is NaN).
+        self.line(&format!("    {t}_p = {t}_delta.x == 0 ? {t}_p : {t}_p + {t}_delta.x * {t}_dx;"));
+        self.line(&format!("    {t}_p = {t}_delta.y == 0 ? {t}_p : {t}_p + {t}_delta.y * {t}_dy;"));
+        self.line(&format!("    {t}_values[{t}_q] = {t}_T.SampleCmp({t}_S, {args});"));
+        self.line("}");
+        format!("{t}_values[{t}_xy.x + 2 * {t}_xy.y].xxxx")
+    }
+
     /// MIMG → SM 6.6 dynamic resources. XCL image descriptors (T#, 8 dwords) keep the GFX10
     /// layout, but BASE_ADDRESS (word 0) holds the index of the SRV in the CBV/SRV/UAV heap
     /// (UAV at +1); FORMAT (word 1 [28:20]) selects the typed view (float/uint/sint).
@@ -2822,6 +2839,15 @@ impl Em {
                 };
                 match (&cmp, &grads, &lod, &bias) {
                     (Some(z), _, _, _) if has_lz || !ps => format!("float4({t}_T.SampleCmpLevelZero({t}_S, {coord}, {z}).xxxx)"),
+                    (Some(z), _, _, Some(b)) => {
+                        // Bias is added to log2(footprint), so scale both screen derivatives by 2^bias.
+                        // A texel offset moves the lookup, not its footprint. Cubes use direction space.
+                        let unmoved = if dim == 3 { &coord } else { &coord0 };
+                        let ty = ["float", "float2", "float3", "float4", "float2", "float3"][dim as usize];
+                        let dx = format!("(ddx({unmoved}) * exp2({b}))");
+                        let dy = format!("(ddy({unmoved}) * exp2({b}))");
+                        self.sample_cmp_grad(&t, ty, &coord, &dx, &dy, &tail(format!("{t}_p, {z}")))
+                    }
                     (Some(z), _, _, _) => format!("float4({t}_T.SampleCmp({t}_S, {}).xxxx)", tail(format!("{coord}, {z}"))),
                     // cube maps: RDNA takes face-space 2D gradients, HLSL wants direction-space 3D
                     // ones (and has no clamp form) – the LOD from the gradients and the face size
