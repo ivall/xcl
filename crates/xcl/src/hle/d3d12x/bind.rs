@@ -273,13 +273,7 @@ fn budget_two_pass_cap(non_two_pass_used: u64, local_budget: u64) -> u64 {
 /// Most bytes of two-pass buffers alive at once (`XCL_TWO_PASS_MB`, else DXGI budget headroom
 /// via `budget_two_pass_cap` cached for 250 ms).
 fn two_pass_cap() -> u64 {
-    static ENV_CAP: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
-    if let Some(cap) = *ENV_CAP.get_or_init(|| {
-        std::env::var("XCL_TWO_PASS_MB")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .map(|mb| mb.saturating_mul(1 << 20))
-    }) {
+    if let Some(cap) = env_two_pass_cap() {
         return cap;
     }
     static CACHED: Mutex<Option<(std::time::Instant, u64)>> = Mutex::new(None);
@@ -299,6 +293,66 @@ fn two_pass_cap() -> u64 {
         *g = Some((now, cap));
     }
     cap
+}
+
+/// `XCL_TWO_PASS_MB` in bytes, if set.
+fn env_two_pass_cap() -> Option<u64> {
+    static ENV_CAP: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *ENV_CAP.get_or_init(|| {
+        std::env::var("XCL_TWO_PASS_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map(|mb| mb.saturating_mul(1 << 20))
+    })
+}
+
+/// How far past the headroom cap `cap` a buffer a draw cannot go without may still be made, for
+/// a local budget of `local_budget` bytes (0: unknown): `budget_two_pass_cap`'s ceiling
+/// (`min(local_budget / 4, 2048 MiB)`), never below `cap`. Skipping the draw instead can leave
+/// the title's later queue waits on work that never ran: a retail title on a 12 GB card stopped
+/// for good in `Wait64BitValueX` a second after its first two-pass ExecuteIndirect was skipped at
+/// a 340 MiB headroom cap, and ran on with 794 MiB of two-pass buffers alive.
+fn draw_two_pass_ceiling(cap: u64, local_budget: u64) -> u64 {
+    if local_budget == 0 {
+        return cap.max(1024 << 20);
+    }
+    (local_budget / 4).min(2048 << 20).max(cap)
+}
+
+/// A buffer of `bytes` for a draw the headroom cap `cap` refused: made within
+/// `draw_two_pass_ceiling` (an `XCL_TWO_PASS_MB` cap is kept as it is), else the error that skips
+/// the draw.
+unsafe fn make_two_pass_past_cap(dev: &ID3D12Device, bytes: u64, what: &str, cap: u64) -> Result<TwoPassBuf, String> {
+    make_two_pass_past_cap_with(bytes, what, cap, |ceiling| TwoPassBuf::try_make_with_cap(dev, bytes, what, ceiling))
+}
+
+/// `make_two_pass_past_cap` with the attempt at the ceiling given as `make`: the record buffer
+/// walks its smaller buckets there too, as it does under the headroom cap.
+unsafe fn make_two_pass_past_cap_with(
+    bytes: u64,
+    what: &str,
+    cap: u64,
+    make: impl FnOnce(u64) -> Result<Option<TwoPassBuf>, String>,
+) -> Result<TwoPassBuf, String> {
+    let ceiling = match env_two_pass_cap() {
+        Some(_) => cap,
+        None => draw_two_pass_ceiling(cap, super::real::video_memory().map_or(0, |(_, _, budget)| budget)),
+    };
+    if ceiling > cap {
+        if let Some(b) = make(ceiling)? {
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 8 {
+                crate::xlog_info!(
+                    "D3D12.X: a {what} of {} KiB goes past the {} MiB headroom cap of the two-pass buffers (up to {} MiB) instead of skipping its draw",
+                    b.bytes >> 10,
+                    cap >> 20,
+                    ceiling >> 20
+                );
+            }
+            return Ok(b);
+        }
+    }
+    Err(refuse_two_pass(what, bytes, ceiling))
 }
 
 /// `bytes` more counted in `alive` if it stays within `cap` (whether it did).
@@ -2583,7 +2637,9 @@ unsafe fn ensure_res_buffer_with_cap(this: *mut c_void, need_bytes: u64, min_fit
                     return Ok((buf, va, cur_cap));
                 }
             }
-            return Err(refuse_two_pass("two-pass res buffer", need, budget_cap));
+            make_two_pass_past_cap_with(need, "two-pass res buffer", budget_cap, |ceiling| {
+                acquire_res_buf_with_cap(&dev, need, min_fit_bytes, existing_cap, ceiling, std::time::Duration::ZERO)
+            })?
         }
     };
     Ok(install_res_buffer(this, entry))
@@ -2778,8 +2834,10 @@ unsafe fn scratch_args(this: *mut c_void, dev: &ID3D12Device, bytes: u64) -> Res
         return Err(format!("its rewritten arguments are past {} MiB this recording", SCRATCH_CAP >> 20));
     }
     let cap = two_pass_cap();
-    let block = acquire_two_pass_buf_with_cap(dev, size, remaining, remaining, "two-pass argument scratch", cap, FENCE_WAIT_LIMIT)?
-        .ok_or_else(|| refuse_two_pass("two-pass argument scratch", size, cap))?;
+    let block = match acquire_two_pass_buf_with_cap(dev, size, remaining, remaining, "two-pass argument scratch", cap, FENCE_WAIT_LIMIT)? {
+        Some(b) => b,
+        None => make_two_pass_past_cap(dev, size, "two-pass argument scratch", cap)?,
+    };
     let b = block.res.clone();
     with(this, |s| {
         mark_two_pass_tracking(this, &mut s.res_untracked);
@@ -7529,6 +7587,56 @@ void ms(uint3 g : SV_GroupID) { o.Store((v * 16u + g.x) * 4u, rec.Load(g.x * 4u)
         assert_eq!(budget_two_pass_cap(15_000 * mib, 31_419 * mib), 2048 * mib);
         assert_eq!(budget_two_pass_cap(28_000 * mib, 31_419 * mib), (3419 * mib) / 4);
         assert_eq!(budget_two_pass_cap(30_000 * mib, 31_419 * mib), 512 * mib);
+    }
+
+    #[test]
+    fn draw_two_pass_ceiling_is_the_budget_ceiling_never_below_the_cap() {
+        let mib = 1u64 << 20;
+        // a 12 GB card near its budget: 340 MiB of headroom cap, 2 GiB for a draw's buffer
+        assert_eq!(draw_two_pass_ceiling(340 * mib, 10_918 * mib), 2048 * mib);
+        assert_eq!(draw_two_pass_ceiling(200 * mib, 800 * mib), 200 * mib);
+        assert_eq!(draw_two_pass_ceiling(256 * mib, 3500 * mib), 875 * mib);
+        assert_eq!(draw_two_pass_ceiling(2048 * mib, 31_419 * mib), 2048 * mib);
+        assert_eq!(draw_two_pass_ceiling(300 * mib, 0), 1024 * mib);
+        assert_eq!(draw_two_pass_ceiling(1500 * mib, 0), 1500 * mib);
+    }
+
+    /// A buffer a draw needs, refused by the headroom cap, is made up to the draw ceiling instead
+    /// of skipping the draw (with no `XCL_TWO_PASS_MB`).
+    #[test]
+    fn a_draw_buffer_refused_by_the_headroom_cap_is_made_past_it() {
+        let _warp_guard = lock_warp_tests();
+        if env_two_pass_cap().is_some() {
+            return println!("SKIPPED a_draw_buffer_refused_by_the_headroom_cap_is_made_past_it: XCL_TWO_PASS_MB is set");
+        }
+        let Some(dev) = warp_device_for_test() else { return };
+        let key = dev.as_raw() as usize;
+        while FREE_RES.lock().unwrap().take(key, 0, u64::MAX).is_some() {}
+        let cap = TWO_PASS[TP_ALIVE].load(Ordering::Relaxed);
+        assert!(unsafe { TwoPassBuf::try_make_with_cap(&dev, RECORD_MIN, "full cap", cap) }.unwrap().is_none(), "the headroom cap is full");
+        let buf = unsafe { make_two_pass_past_cap(&dev, RECORD_MIN, "argument scratch", cap) }.expect("made past the headroom cap");
+        assert_eq!(buf.bytes, RECORD_MIN);
+    }
+
+    #[test]
+    fn a_record_buffer_past_the_headroom_cap_shrinks_to_what_fits_under_the_ceiling() {
+        let _warp_guard = lock_warp_tests();
+        if env_two_pass_cap().is_some() {
+            return println!("SKIPPED a_record_buffer_past_the_headroom_cap_shrinks_to_what_fits_under_the_ceiling: XCL_TWO_PASS_MB is set");
+        }
+        let Some(dev) = warp_device_for_test() else { return };
+        let key = dev.as_raw() as usize;
+        while FREE_RES.lock().unwrap().take(key, 0, u64::MAX).is_some() {}
+        let alive = TWO_PASS[TP_ALIVE].load(Ordering::Relaxed);
+        // room for 48 MiB under the ceiling, not for the 64 MiB the draw prefers
+        let room = alive + (56 << 20);
+        let buf = unsafe {
+            make_two_pass_past_cap_with(64 << 20, "two-pass res buffer", alive, |ceiling| {
+                acquire_res_buf_with_cap(&dev, 64 << 20, RECORD_MIN, 0, ceiling.min(room), std::time::Duration::ZERO)
+            })
+        }
+        .expect("a smaller bucket fits under the ceiling");
+        assert_eq!(buf.bytes, 48 << 20);
     }
 
     #[test]
