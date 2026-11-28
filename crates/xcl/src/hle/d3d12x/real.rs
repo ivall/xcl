@@ -1776,7 +1776,9 @@ fn title_buffer_window(u: &crate::gpu::uma::Uma, va: usize, bytes: usize) -> Opt
         return (k..=last).all(|j| u.is_view_window(j)).then_some((k, true));
     }
     if va - base + bytes > size {
-        return None;
+        // a title's reservation may run across sparse windows (`sparse_reserve`): so may its buffer
+        let last = u.window_of(va.checked_add(bytes - 1)?)?;
+        return (u.is_sparse_window(k) && (k..=last).all(|j| u.is_sparse_window(j))).then_some((k, true));
     }
     Some((k, u.is_sparse_window(k)))
 }
@@ -10665,13 +10667,29 @@ mod gpu_view_tests {
         assert_eq!(title_buffer_window(&u, end - 0x1_0000, 0x2_0000), None, "past the view windows");
         // sparse and coherent windows as before: whole in their window
         assert_eq!(title_buffer_window(&u, u.base() + 0x1_0000, 0x100), Some((0, true)));
-        assert_eq!(title_buffer_window(&u, u.base() + WINDOW - 0x1_0000, 0x2_0000), None, "across a sparse window's end");
+        assert_eq!(title_buffer_window(&u, u.base() + WINDOW - 0x1_0000, 0x2_0000), Some((0, true)), "across a sparse window's end");
         let coh = u.committed_window().unwrap();
         let (c, c_len) = u.window(coh);
         assert_eq!(title_buffer_window(&u, c + 0x1_0000, 0x100), Some((coh, false)));
         assert_eq!(title_buffer_window(&u, c + c_len - 0x100, 0x200), None);
         assert_eq!(title_buffer_window(&u, end + 0x1_0000, 0x100), None, "an empty window");
         assert_eq!(u.view_release(g), Some(2 * WINDOW));
+    }
+
+    /// A buffer over the end of a sparse window runs on into the next sparse window (a title's
+    /// reservation may straddle them); into a window that is not sparse it stays refused. It fell
+    /// back to a committed buffer and every view of it was empty.
+    #[test]
+    fn a_buffer_may_run_on_into_the_next_sparse_window() {
+        let (u, g) = sixteen_with_view(WINDOW);
+        let w1 = u.base() + WINDOW;
+        assert!(u.is_sparse_window(1) && u.is_sparse_window(2));
+        assert_eq!(title_buffer_window(&u, w1 + WINDOW - 0x3_0000, 0x54_6000), Some((1, true)));
+        // past the last sparse window, into a view window or an empty one
+        let sparse_last = (0..MAX_HEAP_WINDOWS).rfind(|&j| u.is_sparse_window(j)).unwrap();
+        let end = u.base() + (sparse_last + 1) * WINDOW;
+        assert_eq!(title_buffer_window(&u, end - 0x1_0000, 0x2_0000), None, "into a window that is no sparse window");
+        assert_eq!(u.view_release(g), Some(WINDOW));
     }
 }
 
