@@ -12,9 +12,10 @@
 
 use std::collections::BTreeSet;
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Once, RwLock};
 
-use windows_sys::Win32::Foundation::{EXCEPTION_ACCESS_VIOLATION, NTSTATUS};
+use windows_sys::Win32::Foundation::{GetLastError, EXCEPTION_ACCESS_VIOLATION, NTSTATUS};
 use windows_sys::Win32::System::Diagnostics::Debug::{AddVectoredExceptionHandler, EXCEPTION_POINTERS};
 use windows_sys::Win32::System::Memory::{
     VirtualAlloc, VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
@@ -28,6 +29,11 @@ const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
 /// pages (64 KiB) mapped but not committed yet
 static LAZY: RwLock<BTreeSet<usize>> = RwLock::new(BTreeSet::new());
 
+/// Failed `MEM_COMMIT` attempts (no logging inside the vectored handler – atomics only).
+static FAIL_COUNT: AtomicU32 = AtomicU32::new(0);
+static LAST_FAIL_PAGE: AtomicUsize = AtomicUsize::new(0);
+static LAST_FAIL_ERROR: AtomicU32 = AtomicU32::new(0);
+
 fn install() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| unsafe {
@@ -35,13 +41,39 @@ fn install() {
     });
 }
 
-/// Commit `page` if it is a lazy one (true: it was).
+fn record_fail(page: usize, err: u32) {
+    FAIL_COUNT.fetch_add(1, Ordering::Relaxed);
+    LAST_FAIL_PAGE.store(page, Ordering::Relaxed);
+    LAST_FAIL_ERROR.store(err, Ordering::Relaxed);
+}
+
+/// For the crash line / diagnostics: `None` if no commit has failed yet.
+pub fn fail_summary() -> Option<String> {
+    let n = FAIL_COUNT.load(Ordering::Relaxed);
+    if n == 0 {
+        return None;
+    }
+    let page = LAST_FAIL_PAGE.load(Ordering::Relaxed);
+    let err = LAST_FAIL_ERROR.load(Ordering::Relaxed);
+    Some(format!("lazy commit failed {n} times, last {page:#x} ({err})"))
+}
+
+/// Commit `page` if it is a lazy one (true: it was and the commit succeeded).
+///
+/// The page stays in `LAZY` when `VirtualAlloc(MEM_COMMIT)` fails so a later fault / `ensure`
+/// can retry instead of turning into a bare `0xc0000005` on still-reserved memory (#467).
 unsafe fn commit(page: usize) -> bool {
     let mut g = LAZY.write().unwrap_or_else(|e| e.into_inner());
-    if !g.remove(&page) {
+    if !g.contains(&page) {
         return false;
     }
-    !VirtualAlloc(page as *const c_void, PAGE, MEM_COMMIT, PAGE_READWRITE).is_null()
+    let ok = !VirtualAlloc(page as *const c_void, PAGE, MEM_COMMIT, PAGE_READWRITE).is_null();
+    if ok {
+        g.remove(&page);
+    } else {
+        record_fail(page, GetLastError());
+    }
+    ok
 }
 
 unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
@@ -84,20 +116,25 @@ pub(super) fn unmark(page: usize) -> bool {
 }
 
 /// The lazy pages of `[p, p + len)` committed – memory a kernel call or XCL writes.
-pub fn ensure(p: usize, len: usize) {
+/// Returns `false` if any still-lazy page could not be committed (commit limit, etc.).
+pub fn ensure(p: usize, len: usize) -> bool {
     if len == 0 {
-        return;
+        return true;
     }
     let pages: Vec<usize> = {
         let g = LAZY.read().unwrap_or_else(|e| e.into_inner());
         if g.is_empty() {
-            return;
+            return true;
         }
         g.range(p & !(PAGE - 1)..p.saturating_add(len)).copied().collect()
     };
+    let mut ok = true;
     for page in pages {
-        unsafe { commit(page) };
+        if !unsafe { commit(page) } {
+            ok = false;
+        }
     }
+    ok
 }
 
 #[cfg(test)]
@@ -117,7 +154,7 @@ mod tests {
             std::ptr::write_volatile((r + 8) as *mut u32, 7);
             assert_eq!(std::ptr::read_volatile((r + 8) as *const u32), 7);
             assert!(!unmark(r), "used: no longer lazy");
-            ensure(r + PAGE + 4, 4);
+            assert!(ensure(r + PAGE + 4, 4));
             assert!(!LAZY.read().unwrap().contains(&(r + PAGE)));
             assert!(crate::gpu::shader::readable(r + PAGE, 4));
             VirtualFree(r as *mut c_void, 0, MEM_RELEASE);
@@ -154,6 +191,30 @@ mod tests {
                 }
             }
             VirtualFree(r as *mut c_void, 0, MEM_RELEASE);
+        }
+    }
+
+    /// #467: a failed `MEM_COMMIT` must leave the page lazy so the next fault / `ensure` can retry.
+    #[test]
+    fn failed_commit_keeps_page_lazy_and_records_error() {
+        unsafe {
+            let r = VirtualAlloc(std::ptr::null(), PAGE, MEM_RESERVE, PAGE_READWRITE) as usize;
+            assert_ne!(r, 0);
+            // Release the reservation so MEM_COMMIT on that address fails.
+            assert_ne!(VirtualFree(r as *mut c_void, 0, MEM_RELEASE), 0);
+            let before = FAIL_COUNT.load(Ordering::Relaxed);
+            mark(r);
+            assert!(LAZY.read().unwrap().contains(&r));
+            assert!(!commit(r), "commit must fail without a reservation");
+            assert!(LAZY.read().unwrap().contains(&r), "page must stay lazy after a failed commit");
+            assert!(FAIL_COUNT.load(Ordering::Relaxed) > before);
+            assert_eq!(LAST_FAIL_PAGE.load(Ordering::Relaxed), r);
+            assert_ne!(LAST_FAIL_ERROR.load(Ordering::Relaxed), 0);
+            let summary = fail_summary().expect("fail_summary after a recorded failure");
+            assert!(summary.contains("lazy commit failed"), "{summary}");
+            assert!(summary.contains(&format!("{r:#x}")), "{summary}");
+            // Clean the set so other tests are not affected by this fake address.
+            assert!(unmark(r));
         }
     }
 }

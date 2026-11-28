@@ -815,7 +815,11 @@ pub(crate) unsafe fn read_own(at: usize, out: *mut u8, len: usize) -> bool {
 /// Whether `n` bytes at `p` are committed, writable memory.
 fn writable(p: usize, n: usize) -> bool {
     let Some(end) = p.checked_add(n) else { return false };
-    crate::hle::kernelx::lazy::ensure(p, n);
+    // #467: if a lazy destination page cannot be committed, refuse the request instead of
+    // writing into still-reserved memory (or crashing on the next touch).
+    if !crate::hle::kernelx::lazy::ensure(p, n) {
+        return false;
+    }
     if crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(p, n)) {
         return true;
     }
