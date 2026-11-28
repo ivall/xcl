@@ -115,3 +115,62 @@ fn rpf_rejects_unknown_options_missing_values_and_invalid_numbers() {
 
     std::fs::remove_file(&archive).unwrap();
 }
+
+#[test]
+fn probe_rejects_file_without_rpf9_header() {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let archive = std::env::temp_dir().join(format!("xcl-rpf-garbage-{}-{nonce}.rpf", std::process::id()));
+    std::fs::write(&archive, vec![0u8; 0x860]).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_xcl"))
+        .arg("rpf")
+        .arg(&archive)
+        .arg("--probe")
+        .output();
+    std::fs::remove_file(&archive).unwrap();
+
+    let output = output.unwrap();
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("is not an RPF9 package"),
+        "stderr did not mention the RPF9 rejection: {stderr:?}"
+    );
+    assert!(
+        !stdout.contains("RPF9 archives"),
+        "probe printed a header summary for a non-RPF9 file: {stdout:?}"
+    );
+}
+
+#[test]
+fn probe_rejects_missing_file() {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let archive = std::env::temp_dir().join(format!("xcl-rpf-missing-{}-{nonce}.rpf", std::process::id()));
+    assert!(!archive.exists());
+
+    let output = Command::new(env!("CARGO_BIN_EXE_xcl"))
+        .arg("rpf")
+        .arg(&archive)
+        .arg("--probe")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains(&*archive.to_string_lossy()),
+        "stderr did not name the missing path: {stderr:?}"
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        !stdout.contains("RPF9 archives"),
+        "probe printed a summary for a missing path: {stdout:?}"
+    );
+}
