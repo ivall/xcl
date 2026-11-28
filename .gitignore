@@ -39,6 +39,7 @@ resources.pri
 # XCL's run output (logs, reports, frame dumps, shader dumps)
 *.log
 report.json
+report.prev.json
 frame_*.bmp
 
 # Python bytecode of the scripts
