@@ -9416,6 +9416,31 @@ fn gpu_sdwa_f16_inline_constants() {
 }
 
 #[test]
+fn gpu_cmp_class_f16_honours_opsel1() {
+    for wave64 in gpu_waves() {
+        let p = prog(&[
+            // v0 = +1.0h (class bit 8 = 0x0100), v1 = 0x0100_0000 (class mask in high 16 bits), OP_SEL=2 (op_sel[1]=1) -> true
+            ("V_CMP_CLASS_F16", "ENC_VOP3", &[("VDST", 0), ("SRC0", V + 0), ("SRC1", V + 1), ("OP_SEL", 2)], None),
+            // same v0, v1 with OP_SEL=0 (low 16 bits = 0) -> false
+            ("V_CMP_CLASS_F16", "ENC_VOP3", &[("VDST", 2), ("SRC0", V + 0), ("SRC1", V + 1), ("OP_SEL", 0)], None),
+            // both OP_SEL=3: high half of v2 (+1.0h) tested against high half of v1 (1 << 8) -> true
+            ("V_CMP_CLASS_F16", "ENC_VOP3", &[("VDST", 4), ("SRC0", V + 2), ("SRC1", V + 1), ("OP_SEL", 3)], None),
+        ]);
+        let mut st = KernelState::default();
+        for r in st.vgpr.iter_mut() {
+            r[0] = 0x0000_3C00; // lo = +1.0h
+            r[1] = 0x0100_0000; // hi = 1 << 8 (+normal), lo = 0
+            r[2] = 0x3C00_0000; // hi = +1.0h, lo = +0.0h
+        }
+        let (r, lanes) = run_wave(&p, &st, wave64);
+        let all = (u32::MAX, if wave64 { u32::MAX } else { 0 });
+        assert_eq!((r.sgpr[0], r.sgpr[1]), all, "wave{lanes} v_cmp_class_f16 OP_SEL[1]=1 reads high half of SRC1");
+        assert_eq!((r.sgpr[2], r.sgpr[3]), (0, 0), "wave{lanes} v_cmp_class_f16 OP_SEL[1]=0 reads low half of SRC1");
+        assert_eq!((r.sgpr[4], r.sgpr[5]), all, "wave{lanes} v_cmp_class_f16 OP_SEL=3 reads high halves of SRC0 and SRC1");
+    }
+}
+
+#[test]
 fn fspx_compute_user_sgprs_from_rsrc2() {
     use crate::gpu::xbox::tests::container;
 
