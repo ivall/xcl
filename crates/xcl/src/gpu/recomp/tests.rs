@@ -1238,6 +1238,94 @@ fn gpu_valu_float_and_int() {
     }
 }
 
+#[test]
+fn gpu_f32_and_f16_transcendentals() {
+    if !gpu_ready() {
+        return;
+    }
+    let p = prog(&[
+        // f32 VOP1 transcendentals
+        ("V_EXP_F32", "ENC_VOP1", &[("VDST", 10), ("SRC0", V + 1)], None),
+        ("V_LOG_F32", "ENC_VOP1", &[("VDST", 11), ("SRC0", V)], None),
+        ("V_SQRT_F32", "ENC_VOP1", &[("VDST", 12), ("SRC0", V)], None),
+        ("V_RSQ_F32", "ENC_VOP1", &[("VDST", 13), ("SRC0", V)], None),
+        ("V_RCP_F32", "ENC_VOP1", &[("VDST", 14), ("SRC0", V)], None),
+        ("V_RCP_IFLAG_F32", "ENC_VOP1", &[("VDST", 15), ("SRC0", V + 2)], None),
+        // f32 VOP3 input/output modifiers
+        ("V_SQRT_F32", "ENC_VOP3", &[("VDST", 16), ("SRC0", V + 2), ("ABS", 1), ("CLAMP", 1)], None),
+        ("V_EXP_F32", "ENC_VOP3", &[("VDST", 17), ("SRC0", V + 1), ("NEG", 1), ("CLAMP", 1)], None),
+        // f16 VOP1 transcendentals (write low half, preserve high half)
+        ("V_EXP_F16", "ENC_VOP1", &[("VDST", 20), ("SRC0", V + 4)], None),
+        ("V_LOG_F16", "ENC_VOP1", &[("VDST", 21), ("SRC0", V + 3)], None),
+        ("V_SQRT_F16", "ENC_VOP1", &[("VDST", 22), ("SRC0", V + 3)], None),
+        ("V_RSQ_F16", "ENC_VOP1", &[("VDST", 23), ("SRC0", V + 3)], None),
+        ("V_RCP_F16", "ENC_VOP1", &[("VDST", 24), ("SRC0", V + 3)], None),
+        // f16 VOP3: high-half source & destination (OP_SEL=0b1001), ABS/NEG + CLAMP, preserve low half
+        ("V_SQRT_F16", "ENC_VOP3", &[("VDST", 25), ("SRC0", V + 3), ("OP_SEL", 0b1001), ("ABS", 1), ("CLAMP", 1)], None),
+        ("V_RCP_F16", "ENC_VOP3", &[("VDST", 26), ("SRC0", V + 3), ("OP_SEL", 0b1001), ("NEG", 1), ("CLAMP", 1)], None),
+    ]);
+    // Exact powers of two so every result is exact in both binary32 and binary16.
+    let cases: &[(f32, f32)] = &[
+        // (pos, exp_in)
+        (0.25, -2.0),
+        (1.0, 0.0),
+        (4.0, 2.0),
+        (16.0, 3.0),
+    ];
+    let h = half_bits;
+    let mut st = KernelState::default();
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        let (pos, exp_in) = cases[l % cases.len()];
+        r[0] = f(pos);
+        r[1] = f(exp_in);
+        r[2] = f(-pos);
+        // v3: low = +pos, high = -pos; v4: low = exp_in, high = sentinel 7.5
+        r[3] = h(pos) | (h(-pos) << 16);
+        r[4] = h(exp_in) | (h(7.5) << 16);
+        r[20] = 0xBEEF << 16;
+        r[21] = 0xCAFE << 16;
+        r[22] = 0xA55A << 16;
+        r[23] = 0x5AA5 << 16;
+        r[24] = 0x1337 << 16;
+        r[25] = 0xF00D;
+        r[26] = 0x0DD0;
+    }
+    let r = runner::run_program(&p, &st, &[]).unwrap().0;
+    let close_f32 = |got: u32, want: f32, msg: &str| {
+        let g = f32::from_bits(got);
+        assert!((g - want).abs() <= 1e-5, "{msg}: got {g} ({got:#010x}), want {want}");
+    };
+    let close_f16_lo = |got: u32, want: f64, hi_sentinel: u32, msg: &str| {
+        assert_eq!(got >> 16, hi_sentinel, "{msg}: high half clobbered");
+        let g = f16_to_f64((got & 0xFFFF) as u16);
+        assert!((g - want).abs() <= 1e-3, "{msg}: got {g} (bits {:#06x}), want {want}", got & 0xFFFF);
+    };
+    let close_f16_hi = |got: u32, want: f64, lo_sentinel: u32, msg: &str| {
+        assert_eq!(got & 0xFFFF, lo_sentinel, "{msg}: low half clobbered");
+        let g = f16_to_f64((got >> 16) as u16);
+        assert!((g - want).abs() <= 1e-3, "{msg}: got {g} (bits {:#06x}), want {want}", got >> 16);
+    };
+    for l in 0..64usize {
+        let (pos, exp_in) = cases[l % cases.len()];
+        let v = &r.vgpr[l];
+        close_f32(v[10], exp_in.exp2(), &format!("lane {l} v_exp_f32"));
+        close_f32(v[11], pos.log2(), &format!("lane {l} v_log_f32"));
+        close_f32(v[12], pos.sqrt(), &format!("lane {l} v_sqrt_f32"));
+        close_f32(v[13], pos.sqrt().recip(), &format!("lane {l} v_rsq_f32"));
+        close_f32(v[14], pos.recip(), &format!("lane {l} v_rcp_f32"));
+        close_f32(v[15], (-pos).recip(), &format!("lane {l} v_rcp_iflag_f32"));
+        close_f32(v[16], pos.sqrt().clamp(0.0, 1.0), &format!("lane {l} v_sqrt_f32 abs+clamp"));
+        close_f32(v[17], (-exp_in).exp2().clamp(0.0, 1.0), &format!("lane {l} v_exp_f32 neg+clamp"));
+        close_f16_lo(v[20], (exp_in as f64).exp2(), 0xBEEF, &format!("lane {l} v_exp_f16"));
+        close_f16_lo(v[21], (pos as f64).log2(), 0xCAFE, &format!("lane {l} v_log_f16"));
+        close_f16_lo(v[22], (pos as f64).sqrt(), 0xA55A, &format!("lane {l} v_sqrt_f16"));
+        close_f16_lo(v[23], (pos as f64).sqrt().recip(), 0x5AA5, &format!("lane {l} v_rsq_f16"));
+        close_f16_lo(v[24], (pos as f64).recip(), 0x1337, &format!("lane {l} v_rcp_f16"));
+        close_f16_hi(v[25], (pos as f64).sqrt().clamp(0.0, 1.0), 0xF00D, &format!("lane {l} v_sqrt_f16 op_sel+abs+clamp"));
+        close_f16_hi(v[26], (pos as f64).recip().clamp(0.0, 1.0), 0x0DD0, &format!("lane {l} v_rcp_f16 op_sel+neg+clamp"));
+    }
+}
+
 /// Output modifiers each instruction kind applies: omod on f64 (clamp stays in double
 /// precision) and on the f64 → f32 / f32 → f16 conversions, and the integer clamp (saturation) of the
 /// unsigned adds, the packed 16-bit adds and the integer dot products.
