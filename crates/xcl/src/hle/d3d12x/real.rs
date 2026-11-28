@@ -2851,6 +2851,16 @@ fn cube_as_cube_array(v: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> Option<D3D12_SHADE
     })
 }
 
+/// The PC part of a view-by-address resource desc, as `resource_at` keys its textures: the flags
+/// (@0x30) are its last dword, padding follows; and the padding after the dimension (@4, before
+/// the 8-byte alignment) holds whatever the title's stack held there. Without zeroing it the same
+/// texture at the same address was made again for each: 19,780 of 65,536 in a retail title's world.
+fn view_desc_key(mut x: [u8; 0x38]) -> [u8; 0x38] {
+    x[4..8].fill(0);
+    x[0x34..].fill(0);
+    x
+}
+
 /// The texture a view by address describes: `desc` (a resource desc) placed at `va`, made once
 /// per address and desc – titles make views of the same memory again and again.
 unsafe fn resource_at(this: *mut c_void, desc: *const u8, va: u64) -> *mut c_void {
@@ -2859,9 +2869,7 @@ unsafe fn resource_at(this: *mut c_void, desc: *const u8, va: u64) -> *mut c_voi
     if desc.is_null() || va == 0 || !crate::gpu::shader::readable(desc as usize, 0x38) {
         return std::ptr::null_mut();
     }
-    // the PC part of the desc; the flags (@0x30) are its last dword, padding follows
-    let mut x: [u8; 0x38] = (desc as *const [u8; 0x38]).read_unaligned();
-    x[0x34..].fill(0);
+    let x = view_desc_key((desc as *const [u8; 0x38]).read_unaligned());
     if let Some(&r) = MADE.lock().unwrap().get_or_insert_with(HashMap::new).get(&(va, x)) {
         return r as *mut c_void;
     }
@@ -2876,6 +2884,28 @@ unsafe fn resource_at(this: *mut c_void, desc: *const u8, va: u64) -> *mut c_voi
     }
     MADE.lock().unwrap().get_or_insert_with(HashMap::new).insert((va, x), r as usize);
     r
+}
+
+#[cfg(test)]
+mod view_desc_key_tests {
+    use super::view_desc_key;
+
+    /// Descs that differ only in padding (after the dimension, after the flags) key the same
+    /// texture; a field that matters (the width) keys another.
+    #[test]
+    fn view_desc_padding_does_not_change_the_key() {
+        let mut a = [0u8; 0x38];
+        a[0..4].copy_from_slice(&3u32.to_le_bytes()); // D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        a[0x10..0x18].copy_from_slice(&256u64.to_le_bytes()); // Width
+        a[0x30..0x34].copy_from_slice(&4u32.to_le_bytes()); // Flags
+        let mut b = a;
+        b[4..8].copy_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+        b[0x34..].copy_from_slice(&[0x11, 0x22, 0x33, 0x44]);
+        assert_eq!(view_desc_key(a), view_desc_key(b));
+        let mut c = a;
+        c[0x10] = 0x80;
+        assert_ne!(view_desc_key(a), view_desc_key(c));
+    }
 }
 
 /// device #70 (a retail game): a shader resource view of memory, without a resource object:
