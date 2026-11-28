@@ -2174,8 +2174,8 @@ impl Em {
         let t = self.t();
         let is_store = small.map_or(matches!(kind, BufKind::Store | BufKind::FormatStore), |(_, _, s)| s);
         self.line(&format!("uint {t}_stride = ({d1} >> 16) & 0x3FFFu;"));
+        self.line(&format!("uint64_t {t}_off = (uint64_t){voff} + (uint64_t){}u;", f("OFFSET")));
         if self.opt.mem_windows > 1 {
-            self.line(&format!("uint64_t {t}_off = (uint64_t){voff} + (uint64_t){}u;", f("OFFSET")));
             self.line(&format!(
                 "uint64_t {t}_ea = ((((uint64_t)({d1} & 0xFFFFu)) << 32) | (uint64_t){d0}) + (uint64_t){soff} + {t}_off + (uint64_t){t}_stride * (uint64_t){index};"
             ));
@@ -2186,17 +2186,11 @@ impl Em {
             }
             self.line(&format!("uint {t}_a = (uint){t}_ea;"));
         } else {
-            self.line(&format!("uint {t}_off = {voff} + {}u;", f("OFFSET")));
-            self.line(&format!("uint {t}_a = {d0} + {soff} + {t}_off + {t}_stride * {index};"));
+            self.line(&format!("uint {t}_a = {d0} + {soff} + (uint){t}_off + {t}_stride * {index};"));
         }
         let act = self.act();
-        let multi = self.opt.mem_windows > 1;
         let in_range = |bytes: String| {
-            if multi {
-                format!("select({t}_stride == 0u, {t}_off + (uint64_t)({bytes}) <= (uint64_t){d2}, {index} < {d2})")
-            } else {
-                format!("select({t}_stride == 0u, {t}_off + {bytes} <= {d2}, {index} < {d2})")
-            }
+            format!("select({t}_stride == 0u, {t}_off + (uint64_t)({bytes}) <= (uint64_t){d2}, {index} < {d2})")
         };
         if let Some((n, signed, store)) = small {
             let ok = in_range(format!("{n}u"));
@@ -4334,19 +4328,17 @@ impl Em {
         let op = op.trim_end_matches("_x2");
         let bytes = if x2 { 8 } else { 4 };
         self.line(&format!("uint {t}_stride = ({d1} >> 16) & 0x3FFFu;"));
+        self.line(&format!("uint64_t {t}_off = (uint64_t){voff} + (uint64_t){}u;", f("OFFSET")));
         if self.opt.mem_windows > 1 {
-            self.line(&format!("uint64_t {t}_off = (uint64_t){voff} + (uint64_t){}u;", f("OFFSET")));
             self.line(&format!(
                 "uint64_t {t}_ea = ((((uint64_t)({d1} & 0xFFFFu)) << 32) | (uint64_t){d0}) + (uint64_t){soff} + {t}_off + (uint64_t){t}_stride * (uint64_t){index};"
             ));
             self.window_write(&format!("(uint)({t}_ea >> 32)"));
             self.line(&format!("uint {t}_a = (uint){t}_ea & ~{}u;", bytes - 1));
-            self.line(&format!("bool {t}_ok = select({t}_stride == 0u, {t}_off + (uint64_t){bytes}u <= (uint64_t){d2}, {index} < {d2});"));
         } else {
-            self.line(&format!("uint {t}_off = {voff} + {}u;", f("OFFSET")));
-            self.line(&format!("uint {t}_a = ({d0} + {soff} + {t}_off + {t}_stride * {index}) & ~{}u;", bytes - 1));
-            self.line(&format!("bool {t}_ok = select({t}_stride == 0u, {t}_off + {bytes}u <= {d2}, {index} < {d2});"));
+            self.line(&format!("uint {t}_a = ({d0} + {soff} + (uint){t}_off + {t}_stride * {index}) & ~{}u;", bytes - 1));
         }
+        self.line(&format!("bool {t}_ok = select({t}_stride == 0u, {t}_off + (uint64_t){bytes}u <= (uint64_t){d2}, {index} < {d2});"));
         let act = self.act();
         if x2 {
             return self.atomic64(op, &format!("{t}_a"), vdata, vdata + 2, f("GLC") == 1, vdata, &format!("and({act}, {t}_ok)"));
@@ -4389,8 +4381,8 @@ impl Em {
         let voff = if offen { self.vreg(vaddr + idxen as u64) } else { "0u".into() };
         let t = self.t();
         self.line(&format!("uint {t}_stride = ({d1} >> 16) & 0x3FFFu;"));
+        self.line(&format!("uint64_t {t}_off = (uint64_t){voff} + (uint64_t){}u;", f("OFFSET")));
         if self.opt.mem_windows > 1 {
-            self.line(&format!("uint64_t {t}_off = (uint64_t){voff} + (uint64_t){}u;", f("OFFSET")));
             self.line(&format!(
                 "uint64_t {t}_ea = ((((uint64_t)({d1} & 0xFFFFu)) << 32) | (uint64_t){d0}) + (uint64_t){soff} + {t}_off + (uint64_t){t}_stride * (uint64_t){index};"
             ));
@@ -4401,14 +4393,9 @@ impl Em {
             }
             self.line(&format!("uint {t}_a = (uint){t}_ea;"));
         } else {
-            self.line(&format!("uint {t}_off = {voff} + {}u;", f("OFFSET")));
-            self.line(&format!("uint {t}_a = {d0} + {soff} + {t}_off + {t}_stride * {index};"));
+            self.line(&format!("uint {t}_a = {d0} + {soff} + (uint){t}_off + {t}_stride * {index};"));
         }
-        let ok = if self.opt.mem_windows > 1 {
-            format!("select({t}_stride == 0u, {t}_off + (uint64_t){n}u <= (uint64_t){d2}, {index} < {d2})")
-        } else {
-            format!("select({t}_stride == 0u, {t}_off + {n}u <= {d2}, {index} < {d2})")
-        };
+        let ok = format!("select({t}_stride == 0u, {t}_off + (uint64_t){n}u <= (uint64_t){d2}, {index} < {d2})");
         let act = self.act();
         let v = self.vreg(vdata);
         if store {

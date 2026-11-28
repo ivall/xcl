@@ -447,7 +447,7 @@ fn atomic_fcmpswap_x2_uses_ieee_64_bit_cas() {
     assert!(t.hlsl.contains("_cmp = (uint64_t)v26 | ((uint64_t)v27 << 32);"), "{}", t.hlsl);
     // 8-byte alignment of all three cells; the buffer form's bounds check reads records in dwords
     assert_eq!(t.hlsl.matches("& ~7u;").count(), 3, "{}", t.hlsl);
-    assert!(t.hlsl.contains("_off + 8u <= s10"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("_off + (uint64_t)8u <= (uint64_t)s10"), "{}", t.hlsl);
     // GLC returns the old u64 as a low / high dword pair – in place in VDATA for the buffer
     // form, into VDST for flat / global
     assert_eq!(t.hlsl.matches("_old >> 32").count(), 3, "{}", t.hlsl);
@@ -9413,6 +9413,50 @@ fn gpu_sdwa_f16_inline_constants() {
         assert_eq!((r.sgpr[20], r.sgpr[21]), (0, 0), "wave{lanes} v_cmp_lt_f16_sdwa 1.0 < 0.5");
         assert_eq!((r.sgpr[22], r.sgpr[23]), all, "wave{lanes} v_cmp_lt_f16_sdwa 0.5 < 1.0");
     }
+}
+
+#[test]
+fn gpu_mubuf_raw_bounds_do_not_wrap_32bit() {
+    if !gpu_ready() {
+        return;
+    }
+    let p = prog(&[
+        // voff = 0xFFFF_FFFC, OFFSET = 0: t_off + 4 wraps to 0 in 32-bit uint
+        ("BUFFER_LOAD_DWORD", "ENC_MUBUF", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SOFFSET", 128), ("OFFEN", 1), ("OFFSET", 0)], None),
+        // voff = 0xFFFF_FFF0, OFFSET = 16: voff + OFFSET wraps to 0 in 32-bit uint
+        ("BUFFER_LOAD_DWORD", "ENC_MUBUF", &[("VDATA", 11), ("VADDR", 1), ("SRSRC", 4), ("SOFFSET", 128), ("OFFEN", 1), ("OFFSET", 16)], None),
+        // wrapping store must not touch mem[base - 4]
+        ("BUFFER_STORE_DWORD", "ENC_MUBUF", &[("VDATA", 4), ("VADDR", 0), ("SRSRC", 4), ("SOFFSET", 128), ("OFFEN", 1), ("OFFSET", 0)], None),
+        // wrapping atomic must not touch mem[base - 4]
+        ("BUFFER_ATOMIC_ADD", "ENC_MUBUF", &[("VDATA", 5), ("VADDR", 0), ("SRSRC", 4), ("SOFFSET", 128), ("OFFEN", 1), ("OFFSET", 0)], None),
+        // wrapping d16 load (voff = 0xFFFF_FFFE, bytes = 2) must return 0 in low 16 bits
+        ("BUFFER_LOAD_SHORT_D16", "ENC_MUBUF", &[("VDATA", 12), ("VADDR", 2), ("SRSRC", 4), ("SOFFSET", 128), ("OFFEN", 1), ("OFFSET", 0)], None),
+        // control: in-bounds load at offset 0 still reads mem[base]
+        ("BUFFER_LOAD_DWORD", "ENC_MUBUF", &[("VDATA", 13), ("VADDR", 3), ("SRSRC", 4), ("SOFFSET", 128), ("OFFEN", 1), ("OFFSET", 0)], None),
+    ]);
+    let mut st = KernelState::default();
+    // V# at s[16:19]: base = 0x100, stride = 0 (raw), num_records = 64
+    st.sgpr[16..20].copy_from_slice(&[0x100, 0, 64, 0]);
+    for r in st.vgpr.iter_mut() {
+        r[0] = 0xFFFF_FFFC;
+        r[1] = 0xFFFF_FFF0;
+        r[2] = 0xFFFF_FFFE;
+        r[3] = 0;
+        r[4] = 0x1111_2222;
+        r[5] = 1;
+        r[10] = 0xAAAA_AAAA;
+        r[11] = 0xBBBB_BBBB;
+        r[12] = 0x1234_5678;
+    }
+    let mut mem = vec![0u32; 0x80];
+    mem[0xFC / 4] = 0xDEAD_BEEF;
+    mem[0x100 / 4] = 0xCAFE_BABE;
+    let r = runner::run_code(&p, &st, &mem).unwrap();
+    assert_eq!(r.vgpr[0][10], 0, "BUFFER_LOAD_DWORD with voff=0xFFFFFFFC must be OOB (0)");
+    assert_eq!(r.vgpr[0][11], 0, "BUFFER_LOAD_DWORD with voff+OFFSET wrapping to 0 must be OOB (0)");
+    assert_eq!(r.vgpr[0][12], 0x1234_0000, "BUFFER_LOAD_USHORT_D16 with voff=0xFFFFFFFE must be OOB (0 in low half)");
+    assert_eq!(r.vgpr[0][13], 0xCAFE_BABE, "in-bounds control load");
+    assert_eq!(r.mem[0xFC / 4], 0xDEAD_BEEF, "wrapping store/atomic must not modify mem[base - 4]");
 }
 
 #[test]
