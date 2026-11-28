@@ -1238,6 +1238,94 @@ fn gpu_valu_float_and_int() {
     }
 }
 
+/// The 32-bit VOP3 bit-field, byte-permute, funnel-shift and three-operand min / max / med3
+/// instructions against their RDNA2 definitions computed on the CPU, over operands that reach
+/// the sign bit, shift counts of 0, 31 and above 31, and every v_perm_b32 selector kind.
+#[test]
+fn gpu_vop3_integer_bit_and_minmax3() {
+    for wave64 in gpu_waves() {
+        vop3_integer_bit_and_minmax3(wave64);
+    }
+}
+
+fn vop3_integer_bit_and_minmax3(wave64: bool) {
+    const OPS: [&str; 11] = [
+        "V_BFI_B32", "V_BFM_B32", "V_PERM_B32", "V_ALIGNBIT_B32", "V_ALIGNBYTE_B32",
+        "V_MIN3_U32", "V_MAX3_U32", "V_MED3_U32", "V_MIN3_I32", "V_MAX3_I32", "V_MED3_I32",
+    ];
+    // v0, v1, v2 = the operands; results from v3. v_perm_b32 byte selectors: 0..7 pick a byte,
+    // 8..11 the sign of a 16-bit half, 12 is 0x00 and 13 and above 0xFF.
+    const EDGES: [u32; 15] = [
+        0, 1, 31, 32, 33, 0x7FFF_FFFF, 0x8000_0000, 0xFFFF_FFFF, 0x1234_5678, 0xDEAD_BEEF,
+        0x0302_0100, 0x0706_0504, 0x0B0A_0908, 0xFF0E_0D0C, 0x8001_7FFF,
+    ];
+    let fields: Vec<[(&str, u64); 4]> =
+        (0..OPS.len() as u64).map(|i| [("VDST", 3 + i), ("SRC0", V), ("SRC1", V + 1), ("SRC2", V + 2)]).collect();
+    let code: Vec<_> = OPS.iter().zip(&fields).map(|(&name, f)| (name, "ENC_VOP3", &f[..], None)).collect();
+    let (dxil, mem) = kernel_wave(&prog(&code), wave64);
+    let lanes = if wave64 { 64 } else { 32 };
+    // operand triples: edge values and arbitrary words, mixed by a fixed LCG, 32 rounds of a wave
+    let mut seed = 0x2545_F491u32;
+    let mut next = || {
+        seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        if seed >> 31 != 0 { EDGES[(seed >> 16) as usize % EDGES.len()] } else { seed.rotate_left(13) ^ (seed >> 7) }
+    };
+    let mut bad = Vec::new();
+    for _ in 0..32 {
+        let mut st = KernelState::default();
+        for r in st.vgpr.iter_mut() {
+            (r[0], r[1], r[2]) = (next(), next(), next());
+        }
+        let r = runner::run(&dxil, &st, &mem).unwrap();
+        for (v, o) in r.vgpr.iter().zip(&st.vgpr).take(lanes) {
+            check_vop3_integer_bit_and_minmax3(&OPS, (o[0], o[1], o[2]), &v[3..3 + OPS.len()], &mut bad);
+        }
+    }
+    bad.sort();
+    bad.dedup();
+    assert!(bad.is_empty(), "wave{lanes}:\n{}", bad.join("\n"));
+}
+
+fn check_vop3_integer_bit_and_minmax3(ops: &[&str], (a, b, c): (u32, u32, u32), got: &[u32], bad: &mut Vec<String>) {
+    let perm = |s0: u32, s1: u32, sel: u32| -> u32 {
+        let bytes = ((s0 as u64) << 32 | s1 as u64).to_le_bytes();
+        let sign = |x: u32, bit: u32| if x >> bit & 1 != 0 { 0xFF } else { 0 };
+        (0..4).fold(0u32, |acc, i| {
+            let b = match sel >> (8 * i) & 0xFF {
+                k @ 0..=7 => bytes[k as usize] as u32,
+                8 => sign(s1, 15),
+                9 => sign(s1, 31),
+                10 => sign(s0, 15),
+                11 => sign(s0, 31),
+                12 => 0,
+                _ => 0xFF,
+            };
+            acc | b << (8 * i)
+        })
+    };
+    let funnel = |s0: u32, s1: u32, n: u32| (((s0 as u64) << 32 | s1 as u64) >> n) as u32;
+    let med3 = |a: i64, b: i64, c: i64| a.max(b).min(a.min(b).max(c));
+    let (ai, bi, ci) = (a as i32 as i64, b as i32 as i64, c as i32 as i64);
+    let want: [u32; 11] = [
+        (a & b) | (!a & c),
+        ((1u32 << (a & 31)) - 1) << (b & 31),
+        perm(a, b, c),
+        funnel(a, b, c & 31),
+        funnel(a, b, (c & 3) * 8),
+        a.min(b).min(c),
+        a.max(b).max(c),
+        med3(a as i64, b as i64, c as i64) as u32,
+        ai.min(bi).min(ci) as u32,
+        ai.max(bi).max(ci) as u32,
+        med3(ai, bi, ci) as u32,
+    ];
+    for ((name, want), got) in ops.iter().zip(want).zip(got) {
+        if *got != want {
+            bad.push(format!("{name}({a:#010x}, {b:#010x}, {c:#010x}) = {got:#010x}, want {want:#010x}"));
+        }
+    }
+}
+
 /// Output modifiers each instruction kind applies: omod on f64 (clamp stays in double
 /// precision) and on the f64 → f32 / f32 → f16 conversions, and the integer clamp (saturation) of the
 /// unsigned adds, the packed 16-bit adds and the integer dot products.
