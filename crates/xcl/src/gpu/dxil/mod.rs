@@ -9,8 +9,10 @@
 //!   entry-point metadata, shader flags;
 //! * [`container`] — the DXBC container (`SFI0`, signatures, `PSV0`,
 //!   `DXIL`) and its digest, so no SDK DLL is needed at run time;
-//! * [`validate`] — `dxil.dll` validator and DXC disassembler as test oracles.
+//! * [`validate`] — `dxil.dll` validator and DXC disassembler as test oracles;
+//! * [`bitreader`] — reading DXIL bitcode back (abbreviations included).
 
+pub mod bitreader;
 pub mod bitstream;
 pub mod cfg;
 mod compact;
