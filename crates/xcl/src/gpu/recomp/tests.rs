@@ -9416,6 +9416,24 @@ fn gpu_sdwa_f16_inline_constants() {
 }
 
 #[test]
+fn gpu_s_bfm_b64_accepts_32bit_ssrc0() {
+    for wave64 in gpu_waves() {
+        let p = prog(&[
+            // SSRC0 = m0 (124, 32-bit), SSRC1 = 128 (0) -> 4-bit mask at bit 0 = 0x0F
+            ("S_BFM_B64", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 124), ("SSRC1", 128)], None),
+            // SSRC0 = s105 (32-bit register at end of SGPR bank, not a valid 64-bit pair), SSRC1 = 160 (32) -> 8-bit mask at bit 32
+            ("S_BFM_B64", "ENC_SOP2", &[("SDST", 2), ("SSRC0", 105), ("SSRC1", 160)], None),
+        ]);
+        let mut st = KernelState::default();
+        st.sgpr[124] = 4;
+        st.sgpr[105] = 8;
+        let (r, lanes) = run_wave(&p, &st, wave64);
+        assert_eq!((r.sgpr[0], r.sgpr[1]), (0xF, 0), "wave{lanes} s_bfm_b64 with m0");
+        assert_eq!((r.sgpr[2], r.sgpr[3]), (0, 0xFF), "wave{lanes} s_bfm_b64 with s105");
+    }
+}
+
+#[test]
 fn fspx_compute_user_sgprs_from_rsrc2() {
     use crate::gpu::xbox::tests::container;
 

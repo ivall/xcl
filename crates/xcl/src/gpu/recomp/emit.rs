@@ -1812,22 +1812,16 @@ impl Em {
     }
 
     fn salu64(&mut self, d: &Decoded, name: &str, dst: &Dst, ins: &[&Operand]) -> Result<(), &'static str> {
-        let a = match ins.first() {
-            Some(o) => Some(self.read64(d, o, false).ok_or("op")?),
-            None => None,
-        };
-        let b = match ins.get(1) {
-            Some(o) => {
-                // shift amounts / bfe controls are 32-bit
-                if o.size == 32 {
-                    let v = self.read(d, o, false).ok_or("op")?;
-                    Some((v, "0u".into()))
-                } else {
-                    Some(self.read64(d, o, false).ok_or("op")?)
-                }
+        let read_op = |this: &mut Self, o: &Operand| -> Result<(String, String), &'static str> {
+            // 32-bit controls / shift amounts / s_bfm_b64 width and offset
+            if o.size == 32 {
+                Ok((this.read(d, o, false).ok_or("op")?, "0u".into()))
+            } else {
+                this.read64(d, o, false).ok_or("op")
             }
-            None => None,
         };
+        let a = ins.first().map(|o| read_op(self, o)).transpose()?;
+        let b = ins.get(1).map(|o| read_op(self, o)).transpose()?;
         let (al, ah) = a.clone().unwrap_or_default();
         let (bl, bh) = b.clone().unwrap_or_default();
         let (t0, t1) = (self.t(), self.t());
