@@ -32,6 +32,7 @@ if ($PSBoundParameters.ContainsKey('Title')) {
 }
 
 if (-not (Test-Path $Xcl)) { throw "no $Xcl - build it first (cargo build --release -p xcl)" }
+$Xcl = (Resolve-Path -LiteralPath $Xcl).ProviderPath
 $root = Split-Path $PSScriptRoot -Parent
 $commit = (git -C $root rev-parse HEAD).Trim()
 $dirty = [bool](git -C $root status --porcelain --untracked-files=no -- crates Cargo.toml Cargo.lock)
