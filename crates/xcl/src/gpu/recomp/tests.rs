@@ -1582,6 +1582,57 @@ fn gpu_grouped_loads_bounds_and_inactive_lanes() {
     }
 }
 
+/// Unsigned 16-bit min3, max3 and med3 as VOP3, against their RDNA2 definitions computed on the CPU.
+/// Every source has non-zero bits in its high half, which the instructions must ignore. Only the
+/// low 16 bits of the destination are compared: for op_sel[3] = 0 the AMD machine-readable RDNA2
+/// spec (ENC_VOP3 OP_SEL field) says the high half is set to zero, while LLVM's
+/// `GCNSubtarget::zeroesHigh16BitsOfDest` says "On gfx10, all 16-bit instructions preserve the
+/// high bits", so the high half is left unchecked here.
+#[test]
+fn gpu_valu_16_bit_unsigned_min3_max3_med3() {
+    for wave64 in gpu_waves() {
+        valu_16_bit_unsigned_min3_max3_med3(wave64);
+    }
+}
+
+fn valu_16_bit_unsigned_min3_max3_med3(wave64: bool) {
+    // v0, v1, v2 = the operands, results in v3, v4, v5
+    const OPS: [&str; 3] = ["V_MAX3_U16", "V_MIN3_U16", "V_MED3_U16"];
+    // low halves: the ends and middle of u16, and values one apart so ties and near-ties come up
+    const EDGES: [u16; 10] = [0, 1, 2, 0x7FFE, 0x7FFF, 0x8000, 0x8001, 0xFFFE, 0xFFFF, 0x00F1];
+    let fields: Vec<Vec<(&str, u64)>> =
+        (0..OPS.len()).map(|i| vec![("VDST", 3 + i as u64), ("SRC0", V), ("SRC1", V + 1), ("SRC2", V + 2)]).collect();
+    let code: Vec<_> = OPS.iter().zip(&fields).map(|(&name, f)| (name, "ENC_VOP3", &f[..], None)).collect();
+    let (dxil, mem) = kernel_wave(&prog(&code), wave64);
+    let lanes = if wave64 { 64 } else { 32 };
+    let mut rng = Rng(0x0016_B175_0000_0019);
+    let pick = |rng: &mut Rng| -> u32 {
+        let lo = if rng.below(2) == 0 { EDGES[rng.below(EDGES.len() as u64) as usize] } else { rng.next() as u16 };
+        ((1 + rng.below(0xFFFF) as u32) << 16) | lo as u32 // non-zero garbage in the high half
+    };
+    let (mut bad, mut wrong) = (Vec::new(), [0usize; 3]);
+    for _ in 0..32 {
+        let mut st = KernelState::default();
+        for r in st.vgpr.iter_mut() {
+            (r[0], r[1], r[2]) = (pick(&mut rng), pick(&mut rng), pick(&mut rng));
+        }
+        let r = runner::run(&dxil, &st, &mem).unwrap();
+        for (l, (v, o)) in r.vgpr.iter().zip(&st.vgpr).enumerate().take(lanes) {
+            let mut sorted = [o[0] as u16, o[1] as u16, o[2] as u16];
+            sorted.sort();
+            let want: [u16; 3] = [sorted[2], sorted[0], sorted[1]];
+            for (k, ((&name, want), &got)) in OPS.iter().zip(want).zip(&v[3..3 + OPS.len()]).enumerate() {
+                if got as u16 != want {
+                    wrong[k] += 1;
+                    bad.push(format!("lane {l} {name}({:#010x}, {:#010x}, {:#010x}) = {got:#010x}, want low half {want:#06x}", o[0], o[1], o[2]));
+                }
+            }
+        }
+    }
+    let per_op: Vec<String> = OPS.iter().zip(wrong).filter(|(_, n)| *n > 0).map(|(&name, n)| format!("{name}: {n}")).collect();
+    assert!(bad.is_empty(), "wave{lanes}, {} wrong ({}):\n{}", bad.len(), per_op.join(", "), bad[..bad.len().min(24)].join("\n"));
+}
+
 /// A real console vertex shader from the retail pack, run on the PC GPU
 /// (needs XCL_SAMPLE_RPF=…\shaders.rpf).
 #[test]
