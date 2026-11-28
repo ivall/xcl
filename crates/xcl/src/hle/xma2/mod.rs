@@ -75,29 +75,22 @@ impl StreamConfig {
         let stream_channels = if extradata.len() == 34 {
             // Standard XMA2WAVEFORMATEX (cbSize == 34): NumStreams u16 LE @ 0.
             let raw_streams = u16::from_le_bytes([extradata[0], extradata[1]]) as usize;
+            let ch = channels as usize;
             let num_streams = if raw_streams == 0 {
-                (channels as usize).div_ceil(2)
+                ch.div_ceil(MAX_CHANNELS_PER_STREAM)
             } else {
                 raw_streams
             };
             if num_streams == 0 || num_streams > MAX_STREAMS {
                 return Err(format!("invalid XMA2 stream count {num_streams}"));
             }
-            if num_streams == channels as usize {
-                // Explicit 1-channel-per-stream configuration.
-                vec![1u8; num_streams]
-            } else {
-                let mut sc = Vec::with_capacity(num_streams);
-                for i in 0..num_streams {
-                    let ch = if (i + 1) * MAX_CHANNELS_PER_STREAM > channels as usize { 1 } else { 2 };
-                    sc.push(ch);
-                }
-                let total: usize = sc.iter().map(|&c| c as usize).sum();
-                if total != channels as usize {
-                    return Err(format!("XMA2 stream count {num_streams} does not match {channels} channels"));
-                }
-                sc
+            if ch < num_streams || ch > num_streams * MAX_CHANNELS_PER_STREAM {
+                return Err(format!("XMA2 stream count {num_streams} does not match {channels} channels"));
             }
+            // Every stream carries 1 or 2 channels, so `ch - num_streams` streams are stereo
+            // (2 ch) and the remaining streams are mono (1 ch).
+            let stereo = ch - num_streams;
+            (0..num_streams).map(|i| if i < stereo { 2u8 } else { 1u8 }).collect()
         } else if extradata.len() >= 2 {
             // Legacy XMA2WAVEFORMAT: rev @ 0 (3 or 4), num_streams @ 1.
             let rev = extradata[0];
@@ -2225,6 +2218,83 @@ pub(crate) mod tests {
 
         assert!(StreamConfig::from_xma2_wfx(0, 48_000, &extra).is_err());
         assert!(StreamConfig::from_xma2_wfx(17, 48_000, &extra).is_err());
+    }
+
+    #[test]
+    fn stream_config_xma2_wfx_assigns_mixed_stereo_and_mono_streams() {
+        let make_extra = |streams: u16| {
+            let mut extra = [0u8; 34];
+            extra[0..2].copy_from_slice(&streams.to_le_bytes());
+            extra
+        };
+
+        // Valid mixed stereo + mono layouts where ceil(ch/2) < num_streams < ch (XCL-BT-015),
+        // plus standard packed, all-mono, and NumStreams == 0 default controls.
+        let valid: &[(u16, u16, &[u8])] = &[
+            (1, 0, &[1]),
+            (1, 1, &[1]),
+            (2, 1, &[2]),
+            (2, 2, &[1, 1]),
+            (4, 3, &[2, 1, 1]),
+            (5, 3, &[2, 2, 1]),
+            (5, 4, &[2, 1, 1, 1]),
+            (6, 0, &[2, 2, 2]),
+            (6, 3, &[2, 2, 2]),
+            (6, 4, &[2, 2, 1, 1]),
+            (6, 5, &[2, 1, 1, 1, 1]),
+            (6, 6, &[1, 1, 1, 1, 1, 1]),
+            (7, 5, &[2, 2, 1, 1, 1]),
+            (8, 5, &[2, 2, 2, 1, 1]),
+            (8, 6, &[2, 2, 1, 1, 1, 1]),
+            (8, 7, &[2, 1, 1, 1, 1, 1, 1]),
+            (15, 8, &[2, 2, 2, 2, 2, 2, 2, 1]),
+            (16, 8, &[2, 2, 2, 2, 2, 2, 2, 2]),
+        ];
+        for &(channels, num_streams, expected) in valid {
+            let extra = make_extra(num_streams);
+            let cfg = StreamConfig::from_xma2_wfx(channels, 48_000, &extra)
+                .unwrap_or_else(|e| panic!("channels={channels} streams={num_streams}: {e}"));
+            assert_eq!(cfg.stream_channels, expected, "channels={channels} streams={num_streams}");
+            let dec = Decoder::new(cfg).unwrap_or_else(|e| panic!("Decoder::new({channels}, {num_streams}): {e}"));
+            assert_eq!(dec.channels(), channels);
+        }
+
+        // Invalid stream counts: too few (ch > 2*streams), too many (ch < streams), or > MAX_STREAMS.
+        for &(channels, num_streams) in &[(1, 2), (2, 3), (6, 2), (8, 3), (9, 9)] {
+            let extra = make_extra(num_streams);
+            assert!(
+                StreamConfig::from_xma2_wfx(channels, 48_000, &extra).is_err(),
+                "expected error for channels={channels} streams={num_streams}"
+            );
+        }
+
+        // End-to-end 5.1 4-stream ([2, 2, 1, 1]) decode from XMA2WAVEFORMATEX extradata:
+        // streams 0 & 1 carry stereo packets and streams 2 & 3 carry mono packets.
+        let mut stereo_ref = Decoder::new(StreamConfig::from_xma2_wfx(2, 48_000, &make_extra(1)).unwrap()).unwrap();
+        let ref_s = stereo_ref.decode_packets_f32(&pad_packet(STEREO_MS_PREFIX), true).unwrap();
+        let mut mono_ref = Decoder::new(StreamConfig::from_xma2_wfx(1, 48_000, &make_extra(1)).unwrap()).unwrap();
+        let ref_m = mono_ref.decode_packets_f32(&pad_packet(MONO_48K_PREFIX), true).unwrap();
+
+        let mut interleaved = Vec::with_capacity(4 * PACKET_SIZE);
+        for prefix in [STEREO_MS_PREFIX, STEREO_MS_PREFIX, MONO_48K_PREFIX, MONO_48K_PREFIX] {
+            let mut pkt = pad_packet(prefix);
+            pkt[3] = 3; // skip 3 packets between successive packets of the same stream
+            interleaved.extend_from_slice(&pkt);
+        }
+        let cfg_51_4s = StreamConfig::from_xma2_wfx(6, 48_000, &make_extra(4)).unwrap();
+        let mut dec_51_4s = Decoder::new(cfg_51_4s).unwrap();
+        let out = dec_51_4s.decode_packets_f32(&interleaved, true).unwrap();
+        assert_eq!(out.len() % 6, 0);
+        let frames = out.len() / 6;
+        assert!(frames >= 3500, "unexpectedly few decoded 5.1 frames: {frames}");
+        for f in [0, 500, 1500, 3000] {
+            assert_eq!(out[f * 6], ref_s[f * 2], "frame {f} ch 0");
+            assert_eq!(out[f * 6 + 1], ref_s[f * 2 + 1], "frame {f} ch 1");
+            assert_eq!(out[f * 6 + 2], ref_s[f * 2], "frame {f} ch 2");
+            assert_eq!(out[f * 6 + 3], ref_s[f * 2 + 1], "frame {f} ch 3");
+            assert_eq!(out[f * 6 + 4], ref_m[f], "frame {f} ch 4");
+            assert_eq!(out[f * 6 + 5], ref_m[f], "frame {f} ch 5");
+        }
     }
 
     #[test]
