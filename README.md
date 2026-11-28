@@ -389,9 +389,9 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   failures, receipts discarded on tracker contention and pending receipts evicted at the capacity
   bound. They are the correlation foundation for GPU timestamp durations, not GPU timing samples.
 - **Diagnostics for a bug report** (all off by default; set them in the environment of `xcl run`):
-  - `XCL_RUN_SECONDS=n`: the title ends itself after `n` seconds, with the GPU drained and
-    `xcl.log` and `report.json` written, so a run of a fixed length can be attached. A value that
-    is not a whole number is ignored.
+  - `XCL_RUN_SECONDS=n`: the host starts the timer after shader preparation and before loading
+    the game's executable. When it expires, XCL writes `report.json` and flushes `xcl.log`,
+    then attempts to drain the GPU before terminating. Use a nonnegative whole number of seconds.
   - `XCL_ACTIVITY=1` (any value turns it on): every 2 seconds `xcl.log` gets an `activity (2 s)`
     line with what the title did in that time (presents, submits, draws, dispatches, frame-event
     waits, DirectStorage requests), a `memory:` line with the process's commit and video memory in
