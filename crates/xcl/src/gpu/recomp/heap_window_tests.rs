@@ -325,7 +325,10 @@ fn gpu_heap_flat_reads_match_guarded_and_root_output() {
                 let v = &output.vgpr[lane as usize];
                 let active = lane > 32;
                 assert_eq!(v[7], if active { 1000 * windows as u32 + lane } else { OLD }, "{wave}, {windows} windows, lane {lane}: buffer load");
+                // One root UAV has no window check (`Lw::windowed`): like the scalar `outside`
+                // read above, an outside-UMA address aliases window 0.
                 let global = match lane % 8 {
+                    7 if windows == 1 => 1000 + lane,
                     6 | 7 => 0,
                     _ => (lane % windows as u32 + 1) * 1000 + lane,
                 };
