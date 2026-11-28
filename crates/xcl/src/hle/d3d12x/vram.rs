@@ -764,6 +764,11 @@ unsafe fn arena_heap(dev: &ID3D12Device, va: usize, size: usize, align: usize) -
     if n < 16 || n.is_power_of_two() {
         crate::xlog_info!("D3D12.X: video-memory arena #{n} for title addresses {va:#x}..{:#x} ({made} bytes of arenas made so far)", va + size);
     }
+    if super::real::dred_on() {
+        if let Some(ref h) = heap {
+            super::real::name_heap(h.as_raw(), &format!("xcl vram arena va={va:#x}"));
+        }
+    }
     heap
 }
 
@@ -1358,6 +1363,11 @@ unsafe fn alloc_pool_heap(dev: &ID3D12Device) -> Option<ID3D12Heap> {
     if let Err(e) = super::title_textures::own_work(|| dev.CreateHeap(&desc, &mut heap)) {
         crate::xlog_warn!("D3D12.X: no video memory for more pages of title textures ({e})");
         return None;
+    }
+    if super::real::dred_on() {
+        if let Some(ref h) = heap {
+            super::real::name_heap(h.as_raw(), "xcl vram tile_pool");
+        }
     }
     heap
 }

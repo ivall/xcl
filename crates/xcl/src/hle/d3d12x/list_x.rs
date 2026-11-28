@@ -3481,6 +3481,11 @@ unsafe fn make_copy_scratch(list: *mut c_void, bytes: u64) -> Option<ID3D12Resou
     device_of(list)?
         .CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut b)
         .ok()?;
+    if super::real::dred_on() {
+        if let Some(ref r) = b {
+            super::real::name_resource(r.as_raw(), "xcl list_x copy_scratch");
+        }
+    }
     b
 }
 
@@ -3532,6 +3537,9 @@ unsafe fn pattern_buffer(list: *mut c_void, pat: [u8; 16], n: u64) -> Option<usi
         chunk.copy_from_slice(&pat);
     }
     b.Unmap(0, None);
+    if super::real::dred_on() {
+        super::real::name_resource(b.as_raw(), "xcl list_x pattern_buf");
+    }
     let raw = b.as_raw() as usize;
     cache.push((pat, b, len));
     Some(raw)
@@ -4401,6 +4409,9 @@ unsafe fn predication_buffer(list: *mut c_void) -> Option<usize> {
     let mut buf: Option<ID3D12Resource> = None;
     dev.CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut buf).ok()?;
     let buf = buf?;
+    if super::real::dred_on() {
+        super::real::name_resource(buf.as_raw(), "xcl list_x pred_buf");
+    }
     let (raw, extra) = {
         let mut g = LISTS.lock().unwrap();
         let s = g.get_or_insert_with(HashMap::new).entry(list as usize).or_default();
