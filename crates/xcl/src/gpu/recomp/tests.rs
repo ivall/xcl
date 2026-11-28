@@ -1687,6 +1687,107 @@ fn gpu_sdwa_dpp_and_cross_lane() {
     }
 }
 
+/// The `v_fma_mix` family against a CPU reference: which sources are f16 (`OP_SEL_HI`), which
+/// half of a packed pair each one takes (`OP_SEL`), `NEG`, `NEG_HI` — which in this family is
+/// `abs`, not a negation of the high half — `CLAMP`, and the half of the destination that the
+/// f16 forms must leave alone. `V_FMA_MIXHI_F16` had no test before this one.
+///
+/// Every operand is a small dyadic value, so each product and sum is exact in f32 and every
+/// result is representable in f16: the expectations do not depend on the f16 rounding mode,
+/// which the rounding tests cover on their own.
+#[test]
+fn gpu_fma_mix_halves_modifiers_clamp_and_preserved_half() {
+    if !gpu_ready() {
+        return;
+    }
+    const LO: [f32; 4] = [1.5, -1.5, 0.5, -0.5];
+    const HI: [f32; 4] = [-2.5, 2.0, 3.0, -0.25];
+    const W: [f32; 4] = [0.25, -0.25, 2.0, 1.5];
+    const MARK: u32 = 0xA5A5_5A5A;
+    // (OP_SEL, OP_SEL_HI | OP_SEL_HI_2 << 2, NEG, NEG_HI, CLAMP)
+    const CASES: [(u64, u64, u64, u64, u64); 12] = [
+        (0b000, 0b000, 0b000, 0b000, 0), // all three sources f32
+        (0b010, 0b011, 0b000, 0b000, 0), // src0 f16 low, src1 f16 high, src2 f32
+        (0b010, 0b111, 0b000, 0b000, 0), // all f16: low, high, low
+        (0b111, 0b111, 0b000, 0b000, 0), // all f16, every source its high half
+        (0b000, 0b111, 0b001, 0b000, 0), // NEG src0
+        (0b000, 0b111, 0b000, 0b001, 0), // NEG_HI src0: abs, not a negation
+        (0b000, 0b111, 0b001, 0b001, 0), // both, in order: -abs(src0)
+        (0b000, 0b111, 0b111, 0b000, 0), // NEG on all three
+        (0b000, 0b111, 0b000, 0b111, 0), // abs on all three
+        (0b000, 0b000, 0b000, 0b000, 1), // CLAMP, result above 1 in two lane groups
+        (0b000, 0b000, 0b100, 0b000, 1), // CLAMP, result below 0 in two lane groups
+        (0b001, 0b000, 0b000, 0b000, 0), // OP_SEL on a source that is not f16 is ignored
+    ];
+    const OPS: [&str; 3] = ["V_FMA_MIX_F32", "V_FMA_MIXLO_F16", "V_FMA_MIXHI_F16"];
+    let dst = |o: usize, c: usize| 16 + o * 16 + c;
+
+    let mut code = Vec::new();
+    for (o, op) in OPS.iter().enumerate() {
+        for (c, &(sel, hi2, neg, abs, clamp)) in CASES.iter().enumerate() {
+            let src = |i: usize| V + if hi2 >> i & 1 == 1 { 1 + i as u64 } else { 4 + i as u64 };
+            let fields = [
+                ("VDST", dst(o, c) as u64),
+                ("SRC0", src(0)),
+                ("SRC1", src(1)),
+                ("SRC2", src(2)),
+                ("OP_SEL", sel),
+                ("OP_SEL_HI", hi2 & 3),
+                ("OP_SEL_HI_2", hi2 >> 2),
+                ("NEG", neg),
+                ("NEG_HI", abs),
+                ("CLAMP", clamp),
+            ];
+            code.extend(encode(op, "ENC_VOP3P", &fields, None).unwrap_or_else(|x| panic!("{op}: {x}")));
+        }
+    }
+    code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+
+    // the f16 operands are exact, so the reference below can use the f32 values directly
+    for k in 0..4 {
+        assert_eq!(f16_to_f64(half_bits(LO[k]) as u16) as f32, LO[k], "LO[{k}] is not exact in f16");
+        assert_eq!(f16_to_f64(half_bits(HI[k]) as u16) as f32, HI[k], "HI[{k}] is not exact in f16");
+    }
+
+    let mut st = KernelState::default();
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        for i in 0..3 {
+            let k = (l % 4 + i) % 4;
+            r[1 + i] = half_bits(LO[k]) | half_bits(HI[k]) << 16;
+            r[4 + i] = f(W[k]);
+        }
+        for o in 0..OPS.len() {
+            for c in 0..CASES.len() {
+                r[dst(o, c)] = MARK;
+            }
+        }
+    }
+
+    let r = runner::run_code(&code, &st, &[]).unwrap();
+    for l in 0..64usize {
+        for (c, &(sel, hi2, neg, abs, clamp)) in CASES.iter().enumerate() {
+            let operand = |i: usize| {
+                let k = (l % 4 + i) % 4;
+                let v = if hi2 >> i & 1 == 1 {
+                    if sel >> i & 1 == 1 { HI[k] } else { LO[k] }
+                } else {
+                    W[k]
+                };
+                let v = if abs >> i & 1 == 1 { v.abs() } else { v };
+                if neg >> i & 1 == 1 { -v } else { v }
+            };
+            let mut e = operand(0) * operand(1) + operand(2);
+            if clamp == 1 {
+                e = e.clamp(0.0, 1.0);
+            }
+            let want = [e.to_bits(), (MARK & 0xFFFF_0000) | half_bits(e), (MARK & 0xFFFF) | half_bits(e) << 16];
+            for (o, op) in OPS.iter().enumerate() {
+                assert_eq!(r.vgpr[l][dst(o, c)], want[o], "lane {l} case {c} {op}: expected {e}");
+            }
+        }
+    }
+}
+
 #[test]
 fn buffer_format_table_matches_llvm() {
     // every BUF_FMT_* in LLVM's gfx10 MTBUF tests must decode to the same name
