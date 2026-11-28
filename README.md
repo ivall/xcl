@@ -248,6 +248,9 @@ next to `xcl.exe`, directly next to `xcl.exe`, in `%LOCALAPPDATA%\XCL\D3D12\`, o
   split-wave64 programs that access LDS stay on the HLSL path to preserve instruction order
   between their two hardware wave32 halves.
   Test results on other GPUs: [#42](https://github.com/ivall/xcl/issues/42).
+- **CPU:** the console's Zen 2 instruction sets (SSE4.2, POPCNT, AVX, AVX2, FMA, F16C, BMI1,
+  BMI2, LZCNT, MOVBE). `xcl run` refuses a CPU that lacks any of them, since the game would
+  stop with an illegal instruction; set `XCL_SKIP_CPU_CHECK=1` to run anyway.
 
 ```powershell
 cargo build --release --workspace          # target\release\xcl.exe
