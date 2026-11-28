@@ -9,6 +9,15 @@
 # -Title prints the given label instead. Use the same one for the main and the PR run.
 #
 # Networking is off (XCL_NETWORK=0). Build first: cargo build --release -p xcl
+
+<#
+.PARAMETER OutDir
+Saves stdout.txt and stderr.txt, replacing both after each launcher run. Use a
+fresh directory for each run. If the launcher exits before printing a log path,
+a reused directory can still contain manifest.json, xcl.log and report.json
+from the previous run. Check for script errors and verify the launcher exit
+code in the current xcl-smoke block before using the artifacts.
+#>
 param(
     [Parameter(Mandatory = $true)][string]$Game,
     [int]$Seconds = 60,
@@ -67,8 +76,16 @@ if (-not $p.WaitForExit(($Seconds + $StartupTimeoutSeconds) * 1000)) {
 }
 $p.WaitForExit()
 $stdout = $stdoutTask.Result
-$null = $stderrTask.Result
+$stderr = $stderrTask.Result
 Remove-Item Env:XCL_RUN_SECONDS, Env:XCL_ACTIVITY
+
+if ($OutDir) {
+    if (-not (Test-Path $OutDir)) {
+        $null = New-Item -ItemType Directory -Path $OutDir -Force
+    }
+    Set-Content -LiteralPath (Join-Path $OutDir 'stdout.txt') -Value $stdout -Encoding utf8 -NoNewline
+    Set-Content -LiteralPath (Join-Path $OutDir 'stderr.txt') -Value $stderr -Encoding utf8 -NoNewline
+}
 
 $logLine = ($stdout -split "`n" | Where-Object { $_ -match '^Log:\s+(.+)$' } | Select-Object -Last 1)
 if (-not $logLine) { throw "XCL printed no log path; its output:`n$stdout" }
@@ -93,9 +110,6 @@ if (-not $gpu) { $gpu = (Get-CimInstance Win32_VideoController | Where-Object { 
 $code = if ($timedOut) { 'killed (no exit)' } else { '0x{0:x}' -f $p.ExitCode }
 
 if ($OutDir) {
-    if (-not (Test-Path $OutDir)) {
-        $null = New-Item -ItemType Directory -Path $OutDir -Force
-    }
     Copy-Item -LiteralPath $log -Destination (Join-Path $OutDir 'xcl.log') -Force
     $destReport = Join-Path $OutDir 'report.json'
     if (Test-Path $report) {
