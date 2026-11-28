@@ -82,14 +82,36 @@ def builds_runtime(path):
     return path.startswith("crates/xcl/data/") or path in RUNTIME_BUILD
 
 
+def heading(names):
+    """A heading of one of `names`, in either case: `**Tested**` as in the template, or a markdown
+    heading on a line of its own (`## Tested`, `### **Tested**`)."""
+    alt = "|".join(re.escape(n) for n in names)
+    return (r"(?im:\*\*(?:" + alt + r")\*\*|^[ \t]*#{1,6}[ \t]+(?:\*\*)?(?:" + alt
+            + r")(?:\*\*)?[ \t]*#*[ \t]*$)")
+
+
+def mask_fences(body):
+    """`body` with each line inside a fenced code block (``` or ~~~) replaced by as many backticks,
+    so a heading quoted in a fence is no heading, while the fence still counts as a section's text
+    and every offset stays where it was."""
+    out, fence = [], None
+    for line in body.split("\n"):
+        m = re.match(r"[ ]{0,3}(`{3,}|~{3,})", line)
+        if fence is None:
+            if m and not (m.group(1)[0] == "`" and "`" in line[m.end():]):
+                fence = m.group(1)
+            out.append(line)
+        elif m and m.group(1)[0] == fence[0] and len(m.group(1)) >= len(fence) and not line[m.end():].strip():
+            fence = None
+            out.append(line)
+        else:
+            out.append("`" * len(line))
+    return "\n".join(out)
+
+
 def section_has_content(body, section):
-    """True when `**section**` exists and has at least one non-placeholder line."""
-    next_heading = "|".join(re.escape(h) for h in HEADINGS)
-    m = re.search(
-        r"\*\*" + re.escape(section) + r"\*\*[ \t]*\n(.*?)(?=\n\*\*(?:" + next_heading + r")\*\*|\Z)",
-        body,
-        re.S,
-    )
+    """True when the `**section**` heading exists and has at least one non-placeholder line."""
+    m = re.search(heading([section]) + r"[ \t]*\n(.*?)(?=\n" + heading(HEADINGS) + r"|\Z)", body, re.S)
     if not m:
         return False
     text = re.sub(r"<!--.*?-->", "", m.group(1), flags=re.S)
@@ -105,13 +127,18 @@ def check(body, head, files, is_main_ancestor, *, test_only=False):
     size) with `size` a function giving the file's bytes; `is_main_ancestor(sha)`: whether the
     commit is on main."""
     body = body.replace("\r\n", "\n")
+    masked = mask_fences(body)
     problems = []
     for section in SECTIONS:
-        if not section_has_content(body, section):
+        if not section_has_content(masked, section):
             problems.append(f"the **{section}** section is missing or empty")
 
-    ai = re.search(r"\*\*AI use\*\*(.*?)(\n\*\*|\Z)", body, re.S)
-    banned = re.findall(BANNED_MODELS, ai.group(1), re.I) if ai else []
+    # the **AI use** text runs to the next section of the template, not to a sub-heading of its own
+    # (`### Tools`); a fence in it is read as written
+    banned = []
+    for ai in re.finditer(heading(["AI use"]), masked):
+        end = re.compile(r"\n" + heading(HEADINGS)).search(masked, ai.end())
+        banned += re.findall(BANNED_MODELS, body[ai.end():end.start() if end else len(body)], re.I)
     if banned:
         problems.append("**AI use** names a model this repository does not accept for code ("
                         + ", ".join(sorted({b.lower() for b in banned})) + "): see CONTRIBUTING.md")
