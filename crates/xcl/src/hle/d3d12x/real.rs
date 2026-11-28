@@ -5067,7 +5067,7 @@ unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_voi
 }
 
 unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<Result<HRESULT, ()>> {
-    use crate::gpu::recomp::pso::{console_to_dxil_for, is_console, Stage};
+    use crate::gpu::recomp::pso::{console_to_dxil_in, is_console, mem_windows, Stage};
     if !crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_COMPUTE_PIPELINE_STATE_DESC>()) {
         return None;
     }
@@ -5080,7 +5080,8 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
     if super::pso_async::lazy() && crate::gpu::recomp::dxc::defer() {
         return Some(Err(()));
     }
-    let compiled = match console_to_dxil_for(cs, Stage::Compute, 0, wave32_only(this)) {
+    let (wave32, windows) = (wave32_only(this), mem_windows());
+    let compiled = match console_to_dxil_in(cs, Stage::Compute, 0, wave32, windows) {
         Ok(b) => b,
         Err(e) => {
             note_translation_error(format!("CS: {e}"));
@@ -5114,7 +5115,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
         (result.0 >= 0).then_some((rs, result))
     });
     if let Some(plan) = compiled.dispatch_chain.filter(|_| warm.is_none()) {
-        if let Some(rs) = dispatch_chain::build(this, f, d, riid, ppv, record, &dxil, &compiled.samplers, plan) {
+        if let Some(rs) = dispatch_chain::build(this, f, d, riid, ppv, record, cs, wave32, windows, &compiled.samplers, plan) {
             LAST_COMPUTE_RS.with(|c| c.set(rs));
             note_pso_rs(*ppv, rs as *mut c_void);
             super::dred::label(*ppv as usize, &[("cs", Some(cs))]);

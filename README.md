@@ -246,7 +246,9 @@ Fill the reusable DXIL cache ahead of a run with the read-only package wrapper. 
   processed records. The timer counts seconds since one finished (or preparation started);
   five seconds without progress counts as a stall, and the window shows when the last one ended.
   XCL prepares supported shader stages and compute pipelines, including
-  split pieces and their whole fallback. Graphics pipelines are created during play the first
+  split pieces and their whole fallback. Split compute pipelines retain the smaller console
+  source for any later whole-form build, preserving the original memory-window and wave mode.
+  Graphics pipelines are created during play the first
   time; the ones a run used are recorded with their state (`used-graphics-pipelines.bin` beside
   the shader cache, or `-lockhart` variants under Series S `lockhart`, at most `XCL_GFX_RECORDS_MB`, default 64) and built before the title starts
   on the next launch, with their driver blobs kept, so the title makes them from those in
