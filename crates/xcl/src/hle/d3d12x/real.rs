@@ -10768,6 +10768,10 @@ mod queue_tests {
     unsafe extern "system" fn fake_fence_completed(_: *mut c_void) -> u64 {
         u64::MAX
     }
+    /// `SYNC_GRAPH` takes its own reference on a title fence: the fake has no lifetime to count.
+    unsafe extern "system" fn fake_fence_ref(_: *mut c_void) -> u32 {
+        1
+    }
 
     #[repr(C)]
     struct FakeFence {
@@ -10808,6 +10812,8 @@ mod queue_tests {
         // `SYNC_GRAPH.title_fences` before `Cleanup::drop` runs, `GetCompletedValue` succeeds
         // cleanly instead of dereferencing an unmapped sentinel address.
         let mut fence_vtbl = [0usize; size_of::<ID3D12Fence_Vtbl>() / SLOT];
+        fence_vtbl[1] = fake_fence_ref as usize; // AddRef
+        fence_vtbl[2] = fake_fence_ref as usize; // Release
         fence_vtbl[offset_of!(ID3D12Fence_Vtbl, GetCompletedValue) / SLOT] = fake_fence_completed as usize;
         let fake_fence = FakeFence { vtable: fence_vtbl.as_ptr() };
         let fence = (&fake_fence as *const FakeFence) as usize;

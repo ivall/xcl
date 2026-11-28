@@ -2021,6 +2021,9 @@ unsafe impl Send for SyncCell {}
 /// exact cycle detection sees mixed cycles involving both `Wait64BitValueX` and title fences.
 #[derive(Default)]
 struct TitleFenceSync {
+    /// Our own reference on the title's fence, so the pointer in `title_fences` stays valid
+    /// after the title releases its reference. `None` only for entries built by hand in tests.
+    fence: Option<ID3D12Fence>,
     waits: Vec<(u64, usize, u64)>,   // (val, waiting_queue, wait_seq)
     signals: Vec<SubmittedSignal>,   // (val, signaling_queue, sig_seq)
 }
@@ -2030,6 +2033,8 @@ struct SyncGraph {
     cells: HashMap<u64, SyncCell>,
     title_fences: HashMap<usize, TitleFenceSync>,
     queue_seq: HashMap<usize, u64>,
+    /// Where the next `sweep_completed_title_fences` starts in `title_fences`.
+    sweep_cursor: usize,
 }
 
 impl SyncGraph {
@@ -2262,12 +2267,11 @@ unsafe fn prune_completed_waits(cell: &mut SyncCell) -> u64 {
 }
 
 /// Prune completed waits/signals from a tracked title `ID3D12Fence`.
-unsafe fn prune_title_fence(fence_raw: usize, tf: &mut TitleFenceSync) {
+unsafe fn prune_title_fence(tf: &mut TitleFenceSync) {
     if tf.waits.is_empty() && tf.signals.is_empty() {
         return;
     }
-    let p = fence_raw as *mut c_void;
-    let Some(f) = ID3D12Fence::from_raw_borrowed(&p) else { return };
+    let Some(f) = tf.fence.as_ref() else { return };
     let completed = f.GetCompletedValue();
     if completed == u64::MAX {
         tf.waits.clear();
@@ -2276,6 +2280,68 @@ unsafe fn prune_title_fence(fence_raw: usize, tf: &mut TitleFenceSync) {
         tf.waits.retain(|&(val, _, _)| val > completed);
         tf.signals.retain(|s| s.val > completed);
     }
+}
+
+/// Take the fence reference of the entry for `fence_raw` out of `title_fences` once it has no
+/// waits or signals left. The caller drops the returned reference after releasing `SYNC_GRAPH`:
+/// `Release` can run the fence's destructor and must not run under the global lock.
+fn take_idle_title_fence(graph: &mut SyncGraph, fence_raw: usize) -> Option<ID3D12Fence> {
+    let tf = graph.title_fences.get(&fence_raw)?;
+    if !(tf.waits.is_empty() && tf.signals.is_empty()) {
+        return None;
+    }
+    graph.title_fences.remove(&fence_raw).and_then(|tf| tf.fence)
+}
+
+/// Remove every entry without waits or signals, returning their fence references (see
+/// `take_idle_title_fence`). Does not call into any fence.
+fn take_idle_title_fences(graph: &mut SyncGraph) -> Vec<ID3D12Fence> {
+    let mut released = Vec::new();
+    graph.title_fences.retain(|_, tf| {
+        let idle = tf.waits.is_empty() && tf.signals.is_empty();
+        if idle {
+            released.extend(tf.fence.take());
+        }
+        !idle
+    });
+    released
+}
+
+/// Entries inspected per `sweep_completed_title_fences` call.
+const TITLE_FENCE_SWEEP: usize = 8;
+
+/// Query the completion of up to `TITLE_FENCE_SWEEP` entries other than `keep`, resuming where the
+/// last sweep stopped, and remove those left without waits or signals. Without this a fence that
+/// is signalled once, completes and is released by the title keeps its entry (and our reference)
+/// for good, because only the fence being signalled or waited on is ever pruned. Returns the
+/// fence references; the caller drops them after releasing `SYNC_GRAPH`.
+unsafe fn sweep_completed_title_fences(graph: &mut SyncGraph, keep: usize) -> Vec<ID3D12Fence> {
+    let start = if graph.sweep_cursor >= graph.title_fences.len() { 0 } else { graph.sweep_cursor };
+    let mut visited = 0;
+    let mut idle = Vec::new();
+    for (&raw, tf) in graph.title_fences.iter_mut().skip(start).take(TITLE_FENCE_SWEEP) {
+        visited += 1;
+        if raw == keep {
+            continue;
+        }
+        prune_title_fence(tf);
+        if tf.waits.is_empty() && tf.signals.is_empty() {
+            idle.push(raw);
+        }
+    }
+    // Removed entries shift the unvisited ones down, so only the kept ones move the cursor.
+    graph.sweep_cursor = start + visited - idle.len();
+    idle.into_iter().filter_map(|raw| graph.title_fences.remove(&raw)).filter_map(|tf| tf.fence).collect()
+}
+
+/// The entry for `fence`, created with our own reference on the title's fence.
+unsafe fn title_fence_entry(graph: &mut SyncGraph, fence: usize) -> &mut TitleFenceSync {
+    let tf = graph.title_fences.entry(fence).or_default();
+    if tf.fence.is_none() {
+        let p = fence as *mut c_void;
+        tf.fence = ID3D12Fence::from_raw_borrowed(&p).cloned();
+    }
+    tf
 }
 
 /// Exact `(queue, seq)` cycle detection BEFORE emitting `sig_q.Signal(&cell_va_fence, sig_val)`.
@@ -2324,8 +2390,8 @@ unsafe fn would_signal_close_cycle(graph: &mut SyncGraph, sig_q: usize, target_v
             }
         }
     }
-    for (&tf_raw, tf) in graph.title_fences.iter_mut() {
-        prune_title_fence(tf_raw, tf);
+    for tf in graph.title_fences.values_mut() {
+        prune_title_fence(tf);
         for &(val, wq, wseq) in &tf.waits {
             if let Some(s) = tf.signals.iter().find(|s| s.val >= val) {
                 edges.push((wq, wseq, s.queue, s.seq));
@@ -2369,12 +2435,18 @@ pub(super) unsafe fn note_title_queue_wait(queue: usize, fence: usize, value: u6
     if once(&LOGGED, 8) {
         crate::xlog_info!("D3D12.X: title ID3D12CommandQueue::Wait on q{} fence {fence:#x} >= {value:#x}", queue_id(queue));
     }
-    let mut g = SYNC_GRAPH.lock().unwrap();
-    let graph = g.get_or_insert_with(SyncGraph::default);
-    let seq = graph.next_seq(queue);
-    let tf = graph.title_fences.entry(fence).or_default();
-    prune_title_fence(fence, tf);
-    tf.waits.push((value, queue, seq));
+    let released = {
+        let mut g = SYNC_GRAPH.lock().unwrap();
+        let graph = g.get_or_insert_with(SyncGraph::default);
+        let seq = graph.next_seq(queue);
+        let tf = title_fence_entry(graph, fence);
+        prune_title_fence(tf);
+        tf.waits.push((value, queue, seq));
+        let mut released = sweep_completed_title_fences(graph, fence);
+        released.extend(take_idle_title_fences(graph));
+        released
+    };
+    drop(released);
 }
 
 /// Record a title `ID3D12CommandQueue::Signal(fence, value)` in the exact sync graph.
@@ -2382,12 +2454,18 @@ pub(super) unsafe fn note_title_queue_signal(queue: usize, fence: usize, value: 
     if queue == 0 || fence == 0 || value == 0 {
         return;
     }
-    let mut g = SYNC_GRAPH.lock().unwrap();
-    let graph = g.get_or_insert_with(SyncGraph::default);
-    let seq = graph.next_seq(queue);
-    let tf = graph.title_fences.entry(fence).or_default();
-    prune_title_fence(fence, tf);
-    tf.signals.push(SubmittedSignal { val: value, queue, seq });
+    let released = {
+        let mut g = SYNC_GRAPH.lock().unwrap();
+        let graph = g.get_or_insert_with(SyncGraph::default);
+        let seq = graph.next_seq(queue);
+        let tf = title_fence_entry(graph, fence);
+        prune_title_fence(tf);
+        tf.signals.push(SubmittedSignal { val: value, queue, seq });
+        let mut released = sweep_completed_title_fences(graph, fence);
+        released.extend(take_idle_title_fences(graph));
+        released
+    };
+    drop(released);
 }
 
 /// Publish a cycle-broken `Write64` value into title memory (`fetch_max`) so CPU polling and
@@ -2430,11 +2508,14 @@ pub(super) unsafe fn break_cycles_before_title_signal(sig_q: usize, title_fence:
     if sig_q == 0 || title_fence == 0 || sig_val == 0 {
         return;
     }
+    let mut idle_fences: Vec<ID3D12Fence> = Vec::new();
     let to_release: Vec<(u64, u64, ID3D12Fence)> = {
         let mut g = SYNC_GRAPH.lock().unwrap();
         let Some(graph) = g.as_mut() else { return };
         let Some(tf) = graph.title_fences.get_mut(&title_fence) else { return };
-        prune_title_fence(title_fence, tf);
+        prune_title_fence(tf);
+        idle_fences.extend(take_idle_title_fence(graph, title_fence));
+        let Some(tf) = graph.title_fences.get_mut(&title_fence) else { return };
         let target_waiters: Vec<(usize, u64)> = tf.waits.iter().filter(|&&(v, _, _)| v <= sig_val).map(|&(_, wq, wseq)| (wq, wseq)).collect();
         if target_waiters.is_empty() {
             return;
@@ -2459,7 +2540,7 @@ pub(super) unsafe fn break_cycles_before_title_signal(sig_q: usize, title_fence:
             if tf_raw == title_fence {
                 continue;
             }
-            prune_title_fence(tf_raw, other_tf);
+            prune_title_fence(other_tf);
             for &(val, wq, wseq) in &other_tf.waits {
                 if let Some(s) = other_tf.signals.iter().find(|s| s.val >= val) {
                     edges.push((wq, wseq, s.queue, s.seq, None));
@@ -2513,6 +2594,7 @@ pub(super) unsafe fn break_cycles_before_title_signal(sig_q: usize, title_fence:
         }
         out
     };
+    drop(idle_fences);
     for (va, val, fence) in to_release {
         publish_cpu_cycle_break(va, val);
         let _ = fence.Signal(val);
@@ -9170,7 +9252,7 @@ mod tests {
                 );
                 // Matches the `fetch_sub(removed)` performed by `break_cycles_before_title_signal`.
                 ARMED_GPU_WAITS.fetch_add(1, Ordering::AcqRel);
-                gr.title_fences.insert(tf_raw, TitleFenceSync { waits: vec![(1, qb, 1)], signals: Vec::new() });
+                gr.title_fences.insert(tf_raw, TitleFenceSync { waits: vec![(1, qb, 1)], ..Default::default() });
             }
             break_cycles_before_title_signal(qa, tf_raw, 1);
             assert_eq!(cell_m.load(Ordering::Acquire), 0x50, "mixed cycle break must publish released value to title memory");
@@ -10208,5 +10290,144 @@ mod tests {
             console_heap::unregister(go);
             assert!(got.iter().all(|&v| v == 0xDEAD_BEEF), "the UAV was not cleared: {:x?}", &got[..4]);
         }
+    }
+
+    /// A synthetic COM `ID3D12Fence` that counts references and notes any `GetCompletedValue`
+    /// made on it while no reference is held.
+    #[repr(C)]
+    struct MockFence {
+        vtable: *const usize,
+        refs: std::sync::atomic::AtomicU32,
+        completed: AtomicU64,
+        used_after_free: AtomicBool,
+    }
+
+    unsafe extern "system" fn mock_add_ref(this: *mut c_void) -> u32 {
+        (*(this as *const MockFence)).refs.fetch_add(1, Ordering::AcqRel) + 1
+    }
+    unsafe extern "system" fn mock_release(this: *mut c_void) -> u32 {
+        (*(this as *const MockFence)).refs.fetch_sub(1, Ordering::AcqRel) - 1
+    }
+    unsafe extern "system" fn mock_completed(this: *mut c_void) -> u64 {
+        let f = &*(this as *const MockFence);
+        if f.refs.load(Ordering::Acquire) == 0 {
+            f.used_after_free.store(true, Ordering::Release);
+        }
+        f.completed.load(Ordering::Acquire)
+    }
+
+    impl MockFence {
+        /// `vtable` must outlive the fence. Starts with the title's one reference.
+        fn new(vtable: &[usize]) -> Self {
+            MockFence { vtable: vtable.as_ptr(), refs: 1.into(), completed: 0.into(), used_after_free: false.into() }
+        }
+        fn raw(&self) -> usize {
+            self as *const MockFence as usize
+        }
+        fn refs(&self) -> u32 {
+            self.refs.load(Ordering::Acquire)
+        }
+    }
+
+    fn mock_fence_vtable() -> Vec<usize> {
+        const SLOT: usize = size_of::<usize>();
+        let mut vt = vec![0usize; size_of::<ID3D12Fence_Vtbl>() / SLOT];
+        vt[1] = mock_add_ref as usize;
+        vt[2] = mock_release as usize;
+        vt[std::mem::offset_of!(ID3D12Fence_Vtbl, GetCompletedValue) / SLOT] = mock_completed as usize;
+        vt
+    }
+
+    fn title_fence_tracked(fence: usize) -> bool {
+        SYNC_GRAPH.lock().unwrap().as_ref().is_some_and(|g| g.title_fences.contains_key(&fence))
+    }
+
+    fn forget_title_fence(fence: usize, queues: &[usize]) {
+        if let Some(g) = SYNC_GRAPH.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            g.title_fences.remove(&fence);
+            for q in queues {
+                g.queue_seq.remove(q);
+            }
+        }
+    }
+
+    /// The graph owns a reference while an entry has waits, so a title `Release` before the
+    /// next prune does not leave `GetCompletedValue` to run on a freed fence; once the fence
+    /// completes the entry is dropped and the reference released.
+    #[test]
+    fn title_fence_entry_outlives_the_titles_release_and_is_released_when_complete() {
+        let vt = mock_fence_vtable();
+        let fence = MockFence::new(&vt);
+        let (q_wait, q_sig) = (0xE101usize, 0xE102usize);
+        unsafe {
+            note_title_queue_wait(q_wait, fence.raw(), 5);
+            assert_eq!(fence.refs(), 2, "the graph takes its own reference");
+            assert!(title_fence_tracked(fence.raw()));
+
+            // The title drops its reference while the wait is still pending.
+            assert_eq!(mock_release(fence.raw() as *mut c_void), 1);
+            break_cycles_before_title_signal(q_sig, fence.raw(), 5);
+            assert!(!fence.used_after_free.load(Ordering::Acquire), "GetCompletedValue ran on a released fence");
+            assert!(title_fence_tracked(fence.raw()), "the wait on value 5 is still pending");
+            assert_eq!(fence.refs(), 1);
+
+            // The GPU reaches the wait value: the next prune removes the entry and releases it.
+            fence.completed.store(5, Ordering::Release);
+            break_cycles_before_title_signal(q_sig, fence.raw(), 5);
+        }
+        assert!(!title_fence_tracked(fence.raw()));
+        assert_eq!(fence.refs(), 0, "the graph's reference is released");
+        assert!(!fence.used_after_free.load(Ordering::Acquire));
+        forget_title_fence(fence.raw(), &[q_wait, q_sig]);
+    }
+
+    /// One-shot fences that complete and are released by the title are dropped by the sweep
+    /// during later queue activity, a few entries per call, without any further signal on them.
+    #[test]
+    fn completed_one_shot_title_fences_are_swept_by_later_queue_activity() {
+        let vt = mock_fence_vtable();
+        let fences: Vec<MockFence> = (0..64).map(|_| MockFence::new(&vt)).collect();
+        let trigger = MockFence::new(&vt);
+        let q = 0xE121usize;
+        unsafe {
+            for f in &fences {
+                note_title_queue_signal(q, f.raw(), 1);
+                f.completed.store(1, Ordering::Release);
+                assert_eq!(mock_release(f.raw() as *mut c_void), 1, "the title's release");
+            }
+            // Fresh fences keep signalling; each call inspects at most TITLE_FENCE_SWEEP entries.
+            let mut calls = 0;
+            while fences.iter().any(|f| f.refs() != 0 || title_fence_tracked(f.raw())) {
+                assert!(calls < 64, "the sweep did not reach every completed fence");
+                note_title_queue_signal(q, trigger.raw(), calls + 1);
+                calls += 1;
+            }
+        }
+        for f in &fences {
+            assert!(!f.used_after_free.load(Ordering::Acquire));
+        }
+        forget_title_fence(trigger.raw(), &[q]);
+        assert_eq!(trigger.refs(), 1, "forgetting the pending entry releases the graph's reference");
+    }
+
+    /// A device-removed fence (`u64::MAX`) clears the entry like a completed one.
+    #[test]
+    fn title_fence_entry_is_released_when_the_device_is_removed() {
+        let vt = mock_fence_vtable();
+        let fence = MockFence::new(&vt);
+        let (q_sig, q_wait) = (0xE111usize, 0xE112usize);
+        unsafe {
+            note_title_queue_signal(q_sig, fence.raw(), 7);
+            assert_eq!(fence.refs(), 2);
+            fence.completed.store(u64::MAX, Ordering::Release);
+            // Pruning on the next wait empties the signal list; the wait itself is then
+            // the only thing left on the entry.
+            note_title_queue_wait(q_wait, fence.raw(), 9);
+            assert!(title_fence_tracked(fence.raw()));
+            break_cycles_before_title_signal(q_sig, fence.raw(), 9);
+        }
+        assert!(!title_fence_tracked(fence.raw()));
+        assert_eq!(fence.refs(), 1, "only the title's reference is left");
+        forget_title_fence(fence.raw(), &[q_wait, q_sig]);
     }
 }
