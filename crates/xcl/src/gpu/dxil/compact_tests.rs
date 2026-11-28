@@ -421,3 +421,75 @@ fn gpu_nested_compact_matches_plain_and_flat() {
         .expect("nested budget GPU run");
     assert_eq!((got3.sgpr, got3.vgpr, got3.scc), (plain3.sgpr, plain3.vgpr, plain3.scc), "nested loop budget");
 }
+
+#[test]
+fn plan_splits_getpc_static_samplers_and_loop_headers() {
+    let i = |n: &str, e: &str, f: &[(&str, u64)]| encode(n, e, f, None).unwrap_or_else(|x| panic!("{n}: {x}"));
+    let plan_of = |code: &[u8], patch: &dyn Fn(&super::cfg::Cfg, &mut super::lower::Lw)| {
+        let cfg = super::cfg::Cfg::build(code).unwrap();
+        let leaders = cfg.blocks.iter().filter_map(|b| b.insts.first().map(|&k| cfg.insts[k].pc)).collect();
+        let o = KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 };
+        let mut lw = super::lower::Lw::new(&cfg.insts, &leaders, o, &super::kernel::Entry::Kernel);
+        patch(&cfg, &mut lw);
+        super::compact::plan(&cfg, &lw).unwrap()
+    };
+    let br = i("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0)]);
+    let end = i("S_ENDPGM", "ENC_SOPP", &[]);
+
+    // Identical `s_getpc_b64` blocks at distinct PCs materialize distinct addresses and split classes.
+    let gp = i("S_GETPC_B64", "ENC_SOP1", &[("SDST", 0)]);
+    let getpc = [gp.as_slice(), &br, &gp, &br, &end].concat();
+    let p = plan_of(&getpc, &|_, _| {});
+    assert_eq!(p.order.len(), 3);
+    assert_ne!(p.class[0], p.class[1]);
+
+    // Byte-identical MIMG blocks split on distinct constant `static_samplers` S# words and merge when equal.
+    let s = i("IMAGE_SAMPLE_LZ", "ENC_MIMG", &[("VDATA", 2), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0x1), ("DIM", 1)]);
+    let mimg = [s.as_slice(), &br, &s, &br, &s, &br, &end].concat();
+    let pm = plan_of(&mimg, &|cfg, lw| {
+        for (b, w0) in [(0, 1u32), (1, 2), (2, 1)] {
+            lw.static_samplers.insert(cfg.insts[cfg.blocks[b].insts[0]].pc, [w0, 0, 0, 0]);
+        }
+    });
+    assert_ne!(pm.class[0], pm.class[1]);
+    assert_eq!(pm.class[0], pm.class[2]);
+
+    // A natural loop header spends `VAR_BUDGET` and cannot merge with an identical non-header block.
+    let add = i("S_ADD_U32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 0), ("SSRC1", 129)]);
+    let back = i("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0xFFFE)]);
+    let ph = plan_of(&[add.as_slice(), &br, &add, &back, &end].concat(), &|_, _| {});
+    assert_ne!(ph.class[0], ph.class[1]);
+    assert_eq!(ph.words(), 8);
+}
+
+#[test]
+fn auto_nest_threshold_switches_at_512_classes_in_emitted_ir() {
+    use super::compact::{emit_with_nest, plan, Nest, AUTO_NEST_GROUP_SIZE, AUTO_NEST_MIN_CLASSES};
+    use super::module::{Block, InstInfo};
+
+    let stats = |extra: usize| -> (usize, usize, usize) {
+        let code = multi_class_program(extra, 2);
+        let cfg = super::cfg::Cfg::build(&code).unwrap();
+        let leaders = cfg.blocks.iter().filter_map(|b| b.insts.first().map(|&i| cfg.insts[i].pc)).collect();
+        let o = KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 };
+        let mut lw = super::lower::Lw::new(&cfg.insts, &leaders, o, &super::kernel::Entry::Kernel);
+        lw.setup_lanes();
+        let stride = lw.c((crate::gpu::recomp::KERNEL_VGPRS * 4) as u32);
+        let off = lw.mul(lw.lane, stride);
+        lw.init.vgpr_base = Some(lw.addc(off, (crate::gpu::recomp::KERNEL_SGPRS * 4) as u32));
+        let p = plan(&cfg, &lw).unwrap();
+        let (h0, exit) = (lw.block(None), lw.block(None));
+        lw.edge(Block(0), h0);
+        emit_with_nest(&mut lw, &cfg, &p, h0, exit, Nest::Auto).unwrap();
+        let m = &lw.s.m;
+        let fans: Vec<usize> = (0..m.block_count())
+            .filter_map(|b| match m.inst_info(*m.block_insts(Block(b as u32)).last()?) {
+                InstInfo::Term(Some(_), s) if s.len() > 2 => Some(s.len()),
+                _ => None,
+            })
+            .collect();
+        (p.rep.len(), fans.len(), fans.into_iter().max().unwrap_or(0))
+    };
+    assert_eq!(stats(AUTO_NEST_MIN_CLASSES - 3), (AUTO_NEST_MIN_CLASSES - 1, 1, AUTO_NEST_MIN_CLASSES - 1));
+    assert_eq!(stats(AUTO_NEST_MIN_CLASSES - 2), (AUTO_NEST_MIN_CLASSES, 1 + AUTO_NEST_MIN_CLASSES / AUTO_NEST_GROUP_SIZE, AUTO_NEST_GROUP_SIZE));
+}

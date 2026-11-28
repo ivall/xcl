@@ -6,7 +6,7 @@ use super::*;
 use crate::gpu::dxil::module::{BinOp, CastOp, Pred};
 use crate::gpu::dxil::validate;
 
-pub(super) fn part<'a>(c: &'a [u8], cc: &[u8; 4]) -> Option<&'a [u8]> {
+pub(in crate::gpu::dxil) fn part<'a>(c: &'a [u8], cc: &[u8; 4]) -> Option<&'a [u8]> {
     let n = u32::from_le_bytes(c[28..32].try_into().unwrap()) as usize;
     (0..n).find_map(|i| {
         let off = u32::from_le_bytes(c[32 + 4 * i..36 + 4 * i].try_into().unwrap()) as usize;
