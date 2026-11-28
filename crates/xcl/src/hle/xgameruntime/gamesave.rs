@@ -17,7 +17,6 @@ static NEXT_TMP: AtomicU64 = AtomicU64::new(0);
 pub const E_GS_INVALID_CONTAINER_NAME: HRESULT = 0x8083_0001u32 as i32;
 pub const E_GS_PROVIDED_BUFFER_TOO_SMALL: HRESULT = 0x8083_0007u32 as i32;
 pub const E_GS_BLOB_NOT_FOUND: HRESULT = 0x8083_0008u32 as i32;
-pub const E_GS_CONTAINER_NOT_FOUND: HRESULT = 0x8083_0010u32 as i32;
 /// quota reported to the title (the GDK default)
 pub const QUOTA: i64 = 256 << 20;
 
@@ -109,19 +108,27 @@ fn dec(file: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-fn blobs_of(dir: &Path) -> Vec<(String, PathBuf, u64)> {
-    let mut v: Vec<(String, PathBuf, u64)> = std::fs::read_dir(dir.join("b"))
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter(|e| {
-            e.file_type().is_ok_and(|t| t.is_file())
-                && !e.file_name().to_string_lossy().starts_with(TMP_PREFIX)
-        })
-        .map(|e| (dec(&e.file_name().to_string_lossy()), e.path(), e.metadata().map(|m| m.len()).unwrap_or(0)))
-        .collect();
+fn try_blobs_of(dir: &Path) -> std::io::Result<Vec<(String, PathBuf, u64)>> {
+    let rd = match std::fs::read_dir(dir.join("b")) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let mut v = Vec::new();
+    for entry in rd {
+        let e = entry?;
+        if e.file_type().is_ok_and(|t| t.is_file())
+            && !e.file_name().to_string_lossy().starts_with(TMP_PREFIX)
+        {
+            v.push((dec(&e.file_name().to_string_lossy()), e.path(), e.metadata().map(|m| m.len()).unwrap_or(0)));
+        }
+    }
     v.sort();
-    v
+    Ok(v)
+}
+
+fn blobs_of(dir: &Path) -> Vec<(String, PathBuf, u64)> {
+    try_blobs_of(dir).unwrap_or_default()
 }
 
 fn starts_with_ignore_ascii_case(s: &str, prefix: &str) -> bool {
@@ -319,8 +326,19 @@ pub unsafe extern "system" fn XGameSaveCloseContainer(c: *mut Container) {
 }
 
 /// Call `cb` for every stored container whose name starts with `prefix`.
-unsafe fn each_container(pr: &Provider, prefix: &str, exact: bool, ctx: *mut c_void, cb: ContainerCb) -> usize {
-    let mut dirs: Vec<PathBuf> = std::fs::read_dir(&pr.root).into_iter().flatten().flatten().filter(|e| e.path().is_dir()).map(|e| e.path()).collect();
+unsafe fn each_container(pr: &Provider, prefix: &str, exact: bool, ctx: *mut c_void, cb: ContainerCb) -> Result<usize, HRESULT> {
+    let rd = match std::fs::read_dir(&pr.root) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(_) => return Err(E_FAIL),
+    };
+    let mut dirs = Vec::new();
+    for entry in rd {
+        let e = entry.map_err(|_| E_FAIL)?;
+        if e.path().is_dir() {
+            dirs.push(e.path());
+        }
+    }
     dirs.sort();
     let mut n = 0;
     for d in dirs {
@@ -332,7 +350,7 @@ unsafe fn each_container(pr: &Provider, prefix: &str, exact: bool, ctx: *mut c_v
         } else if !starts_with_ignore_ascii_case(&name, prefix) {
             continue;
         }
-        let blobs = blobs_of(&d);
+        let blobs = try_blobs_of(&d).map_err(|_| E_FAIL)?;
         if blobs.is_empty() && !d.join("display").exists() {
             continue; // created but never written
         }
@@ -357,27 +375,26 @@ unsafe fn each_container(pr: &Provider, prefix: &str, exact: bool, ctx: *mut c_v
             break;
         }
     }
-    n
+    Ok(n)
 }
 
 pub unsafe extern "system" fn XGameSaveGetContainerInfo(p: *mut Provider, name: *const u8, ctx: *mut c_void, cb: Option<ContainerCb>) -> HRESULT {
     let (Some(pr), Some(n), Some(cb)) = (provider(p), from_cstr_ptr(name), cb) else { return E_INVALIDARG };
-    if each_container(pr, &n, true, ctx, cb) == 0 {
-        return E_GS_CONTAINER_NOT_FOUND;
+    if !valid_container_name_length(&n) {
+        return E_GS_INVALID_CONTAINER_NAME;
     }
-    S_OK
+    // A container that is not stored yet is not an error: the callback is just not called.
+    each_container(pr, &n, true, ctx, cb).map(|_| S_OK).unwrap_or_else(|hr| hr)
 }
 
 pub unsafe extern "system" fn XGameSaveEnumerateContainerInfo(p: *mut Provider, ctx: *mut c_void, cb: Option<ContainerCb>) -> HRESULT {
     let (Some(pr), Some(cb)) = (provider(p), cb) else { return E_INVALIDARG };
-    each_container(pr, "", false, ctx, cb);
-    S_OK
+    each_container(pr, "", false, ctx, cb).map(|_| S_OK).unwrap_or_else(|hr| hr)
 }
 
 pub unsafe extern "system" fn XGameSaveEnumerateContainerInfoByName(p: *mut Provider, prefix: *const u8, ctx: *mut c_void, cb: Option<ContainerCb>) -> HRESULT {
     let (Some(pr), Some(cb)) = (provider(p), cb) else { return E_INVALIDARG };
-    each_container(pr, &from_cstr_ptr(prefix).unwrap_or_default(), false, ctx, cb);
-    S_OK
+    each_container(pr, &from_cstr_ptr(prefix).unwrap_or_default(), false, ctx, cb).map(|_| S_OK).unwrap_or_else(|hr| hr)
 }
 
 unsafe fn each_blob(c: &Container, prefix: &str, ctx: *mut c_void, cb: BlobCb) {
@@ -923,7 +940,9 @@ mod tests {
             assert_eq!(q, QUOTA - 5);
             XGameSaveCloseContainer(c);
             assert_eq!(XGameSaveDeleteContainer(p, b"slot/1\0".as_ptr()), S_OK);
-            assert_eq!(XGameSaveGetContainerInfo(p, b"slot/1\0".as_ptr(), std::ptr::null_mut(), Some(count_containers)), E_GS_CONTAINER_NOT_FOUND);
+            let mut gone: Vec<(String, String, u32, u64)> = Vec::new();
+            assert_eq!(XGameSaveGetContainerInfo(p, b"slot/1\0".as_ptr(), &mut gone as *mut _ as *mut c_void, Some(count_containers)), S_OK);
+            assert!(gone.is_empty(), "{gone:?}");
             let root = (*p).root.clone();
             XGameSaveCloseProvider(p);
             let _ = std::fs::remove_dir_all(root);
@@ -1182,6 +1201,71 @@ mod tests {
         let (reads, mixed) = reader.join().unwrap();
         assert!(reads > 0, "the reader never enumerated blobs");
         assert_eq!(mixed, 0, "{mixed} of {reads} enumerations mixed submitted updates");
+    }
+
+    /// A container with no saved data is not an error: the call succeeds and the callback
+    /// is not called, as on the console (first launch).
+    #[test]
+    fn get_container_info_of_a_container_without_saved_data_succeeds_without_a_result() {
+        let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let cfg = format!("xcl-test-info-missing-{}\0", std::process::id());
+            let mut p = std::ptr::null_mut();
+            assert_eq!(XGameSaveInitializeProvider(std::ptr::null_mut(), cfg.as_ptr(), false, &mut p), S_OK);
+            let root = (*p).root.clone();
+            let mut info: Vec<(String, String, u32, u64)> = Vec::new();
+            let ctx = &mut info as *mut _ as *mut c_void;
+
+            // Never created.
+            assert_eq!(XGameSaveGetContainerInfo(p, b"missing\0".as_ptr(), ctx, Some(count_containers)), S_OK);
+            let longest = format!("{}\0", "a".repeat(256));
+            assert_eq!(XGameSaveGetContainerInfo(p, longest.as_ptr(), ctx, Some(count_containers)), S_OK);
+            assert!(info.is_empty(), "{info:?}");
+
+            // Created, but no update was ever submitted.
+            let mut c = std::ptr::null_mut();
+            assert_eq!(XGameSaveCreateContainer(p, b"fresh\0".as_ptr(), &mut c), S_OK);
+            assert_eq!(XGameSaveGetContainerInfo(p, b"fresh\0".as_ptr(), ctx, Some(count_containers)), S_OK);
+            assert!(info.is_empty(), "{info:?}");
+            XGameSaveCloseContainer(c);
+
+            // A name XGameSaveCreateContainer rejects is rejected here with the same error.
+            let overlong = format!("{}\0", "a".repeat(257));
+            assert_eq!(XGameSaveGetContainerInfo(p, b"\0".as_ptr(), ctx, Some(count_containers)), E_GS_INVALID_CONTAINER_NAME);
+            assert_eq!(XGameSaveGetContainerInfo(p, overlong.as_ptr(), ctx, Some(count_containers)), E_GS_INVALID_CONTAINER_NAME);
+            assert!(info.is_empty(), "{info:?}");
+
+            XGameSaveCloseProvider(p);
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn get_container_info_reports_storage_errors() {
+        unsafe {
+            let mut info: Vec<(String, String, u32, u64)> = Vec::new();
+            let ctx = &mut info as *mut _ as *mut c_void;
+
+            // Provider root is a file, not a directory.
+            let mut pr = Provider { magic: MAGIC_PROVIDER, root: std::env::current_exe().unwrap() };
+            let r = XGameSaveGetContainerInfo(&mut pr, b"slot\0".as_ptr(), ctx, Some(count_containers));
+            assert_eq!(r, E_FAIL);
+            assert!(info.is_empty(), "{info:?}");
+
+            // Container's `b` entry is a file instead of a directory.
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let root = std::env::temp_dir().join(format!("xcl-gamesave-err-{}-{nonce}", std::process::id()));
+            std::fs::create_dir_all(root.join("slot")).unwrap();
+            std::fs::write(root.join("slot").join("b"), b"not a directory").unwrap();
+            let mut pr = Provider { magic: MAGIC_PROVIDER, root: root.clone() };
+            let r = XGameSaveGetContainerInfo(&mut pr, b"slot\0".as_ptr(), ctx, Some(count_containers));
+            let _ = std::fs::remove_dir_all(&root);
+            assert_eq!(r, E_FAIL);
+            assert!(info.is_empty(), "{info:?}");
+        }
     }
 
 }
