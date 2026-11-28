@@ -8575,6 +8575,58 @@ mod tests {
         }
     }
 
+    fn heap_test_barrier(buf: &ID3D12Resource, before: D3D12_RESOURCE_STATES, after: D3D12_RESOURCE_STATES) -> D3D12_RESOURCE_BARRIER {
+        D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                Transition: ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                    // Borrow like gpu::texture's barriers: buf stays alive through recording and
+                    // the fence waits. A clone here would leak inside the ManuallyDrop field.
+                    pResource: unsafe { std::mem::transmute_copy(buf) },
+                    Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                    StateBefore: before,
+                    StateAfter: after,
+                }),
+            },
+        }
+    }
+
+    #[test]
+    fn imported_heap_test_barriers_do_not_retain_the_resource() {
+        #[repr(C)]
+        struct FakeResource {
+            vt: *const usize,
+            refs: AtomicUsize,
+        }
+        unsafe extern "system" fn add_ref(this: *mut c_void) -> u32 {
+            (*(this as *const FakeResource)).refs.fetch_add(1, Ordering::Relaxed) as u32 + 1
+        }
+        unsafe extern "system" fn release(this: *mut c_void) -> u32 {
+            (*(this as *const FakeResource)).refs.fetch_sub(1, Ordering::Relaxed) as u32 - 1
+        }
+        let mut vt = [0usize; 15];
+        vt[1] = add_ref as usize;
+        vt[2] = release as usize;
+        let fake = FakeResource { vt: vt.as_ptr(), refs: AtomicUsize::new(1) };
+        // Only IUnknown's reference-counting slots are called; the fake and vtable outlive buf.
+        let buf = unsafe { ID3D12Resource::from_raw(&fake as *const FakeResource as *mut c_void) };
+        for (before, after) in [(D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST),
+                                (D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON)].repeat(2) {
+            let barrier = heap_test_barrier(&buf, before, after);
+            unsafe {
+                let tr = &*barrier.Anonymous.Transition;
+                assert_eq!(tr.pResource.as_ref().unwrap().as_raw(), buf.as_raw());
+                assert_eq!((tr.StateBefore, tr.StateAfter), (before, after));
+                assert_eq!(tr.Subresource, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES);
+            }
+        }
+        let after_barriers = fake.refs.load(Ordering::Relaxed);
+        drop(buf);
+        assert_eq!((after_barriers, fake.refs.load(Ordering::Relaxed)), (1, 0),
+                   "barriers must borrow the resource so it can be released before VirtualFree");
+    }
+
     #[test]
     fn write_buffer_immediate_on_open_existing_heap_visible_to_cpu() {
         use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
@@ -8669,20 +8721,7 @@ mod tests {
             let dl: ID3D12GraphicsCommandList2 = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &da, None).unwrap();
             let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
 
-            let make_barrier = |before, after| D3D12_RESOURCE_BARRIER {
-                Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
-                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
-                Anonymous: D3D12_RESOURCE_BARRIER_0 {
-                    Transition: ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
-                        pResource: ManuallyDrop::new(Some(buf.clone())),
-                        Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
-                        StateBefore: before,
-                        StateAfter: after,
-                    }),
-                },
-            };
-
-            dl.ResourceBarrier(&[make_barrier(D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST)]);
+            dl.ResourceBarrier(&[heap_test_barrier(&buf, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST)]);
             let p_direct = [
                 D3D12_WRITEBUFFERIMMEDIATE_PARAMETER { Dest: gpu_va + 0x100, Value: 0x0000_0677 },
                 D3D12_WRITEBUFFERIMMEDIATE_PARAMETER { Dest: gpu_va + 0x104, Value: 0x0000_0000 },
@@ -8690,7 +8729,7 @@ mod tests {
             let m_direct = [D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT; 2];
             dl.WriteBufferImmediate(2, p_direct.as_ptr(), Some(m_direct.as_ptr()));
             dl.CopyBufferRegion(&buf, 0x200, &up, 0, 8);
-            dl.ResourceBarrier(&[make_barrier(D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON)]);
+            dl.ResourceBarrier(&[heap_test_barrier(&buf, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON)]);
             dl.Close().unwrap();
             let dcl: ID3D12CommandList = dl.cast().unwrap();
             dq.ExecuteCommandLists(&[Some(dcl)]);
@@ -8701,14 +8740,14 @@ mod tests {
             let cq: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_COMPUTE, ..Default::default() }).unwrap();
             let ca: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE).unwrap();
             let cl2: ID3D12GraphicsCommandList2 = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, &ca, None).unwrap();
-            cl2.ResourceBarrier(&[make_barrier(D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST)]);
+            cl2.ResourceBarrier(&[heap_test_barrier(&buf, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST)]);
             let p_comp = [
                 D3D12_WRITEBUFFERIMMEDIATE_PARAMETER { Dest: gpu_va + 0x180, Value: 0x0000_0677 },
                 D3D12_WRITEBUFFERIMMEDIATE_PARAMETER { Dest: gpu_va + 0x184, Value: 0x1122_3344 },
             ];
             let m_comp = [D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT; 2];
             cl2.WriteBufferImmediate(2, p_comp.as_ptr(), Some(m_comp.as_ptr()));
-            cl2.ResourceBarrier(&[make_barrier(D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON)]);
+            cl2.ResourceBarrier(&[heap_test_barrier(&buf, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON)]);
             cl2.Close().unwrap();
             let ccl: ID3D12CommandList = cl2.cast().unwrap();
             cq.ExecuteCommandLists(&[Some(ccl)]);
@@ -8742,7 +8781,7 @@ mod tests {
             drop(cl2);
             drop(buf);
             drop(heap);
-            VirtualFree(mem, 0, MEM_RELEASE);
+            assert_ne!(VirtualFree(mem, 0, MEM_RELEASE), 0);
 
             assert_eq!(cpu_direct, 0x677, "DIRECT WriteBufferImmediate must be visible to CPU (gpu={gpu_direct:#x})");
             assert_eq!(cpu_comp, 0x1122_3344_0000_0677, "COMPUTE WriteBufferImmediate must be visible to CPU (gpu={gpu_comp:#x})");
