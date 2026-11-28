@@ -71,7 +71,10 @@ $null = $stderrTask.Result
 Remove-Item Env:XCL_RUN_SECONDS, Env:XCL_ACTIVITY
 
 $logLine = ($stdout -split "`n" | Where-Object { $_ -match '^Log:\s+(.+)$' } | Select-Object -Last 1)
-if (-not $logLine) { throw "XCL printed no log path; its output:`n$stdout" }
+$code = if ($timedOut) { 'killed (no exit)' } else { '0x{0:x}' -f $p.ExitCode }
+if (-not $logLine) {
+    throw "XCL printed no log path (exit: $code).`nstdout:`n$stdout`nstderr:`n$($stderrTask.Result)"
+}
 $log = ($logLine -replace '^Log:\s+', '').Trim()
 $text = Get-Content $log -Raw -Encoding utf8
 
@@ -90,7 +93,6 @@ if (Test-Path $report) {
     try { $gpu = ((Get-Content $report -Raw -Encoding utf8 | ConvertFrom-Json).d3d12.adapter -replace '\s*\([^()]*VRAM\)$', '') } catch { }
 }
 if (-not $gpu) { $gpu = (Get-CimInstance Win32_VideoController | Where-Object { $_.Name -notmatch 'Basic' } | Select-Object -First 1).Name }
-$code = if ($timedOut) { 'killed (no exit)' } else { '0x{0:x}' -f $p.ExitCode }
 
 if ($OutDir) {
     if (-not (Test-Path $OutDir)) {
