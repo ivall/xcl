@@ -109,6 +109,8 @@ pub fn exports() -> Vec<(&'static str, usize)> {
 pub const MEM_GRAPHICS: u32 = 0x1000_0000;
 mod placeholders;
 pub mod lazy;
+#[allow(dead_code)] // used once physical pages alias (`XCL_PAGE_ALIAS`)
+pub mod sections;
 pub const MEM_TITLE: u32 = 0x4000_0000;
 const STD_ALLOC_MASK: u32 = 0x1000 | 0x2000 | 0x8_0000 | 0x10_0000 | 0x20_0000 | 0x100_0000;
 const STD_PROTECT_MASK: u32 = 0xFF | 0x100 | 0x200 | 0x400;
