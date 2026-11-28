@@ -113,6 +113,16 @@ fn map_image_ex(path: &Path, is_main: bool) -> Result<Arc<MappedModule>, String>
             Err(e) => return fail(format!("{name}: relocations: {e}")),
         };
         for r in relocs {
+            // the target comes from the file: one outside the mapping would patch memory that is
+            // not the image's
+            let width = match r.kind {
+                pe::IMAGE_REL_BASED_DIR64 => 8,
+                pe::IMAGE_REL_BASED_HIGHLOW => 4,
+                _ => 0,
+            };
+            if r.rva as usize + width > size {
+                return fail(format!("{name}: relocation at {:#x} outside the image", r.rva));
+            }
             let p = base + r.rva as usize;
             unsafe {
                 match r.kind {
@@ -521,5 +531,34 @@ mod tests {
             assert!(r.as_ref().is_err_and(|e| e.contains("import table")), "attempt {attempt}: {:?}", r.map(|m| m.base));
             assert!(modules::find_mapped_by_name(&key).is_none(), "attempt {attempt}: still registered");
         }
+    }
+
+    /// Relocation targets are checked against the image before they are patched (#106): one past
+    /// the end, or one whose 8 bytes straddle it, fails the load (before: written outside the
+    /// mapping). A target inside the image is still relocated.
+    #[test]
+    fn relocations_outside_the_image_are_errors() {
+        const BASE: u64 = 0x7E54_0000_0000;
+        // a DIR64 entry for `target` as the one block (10 bytes) of tiny_dll's relocation directory
+        let with_reloc = |target: u32| {
+            let mut f = tiny_dll(BASE, &[0xB8, 1, 0, 0, 0, 0xC3], None);
+            f[0x58 + 0x70 + 5 * 8 + 4..][..4].copy_from_slice(&10u32.to_le_bytes());
+            f[0x300..0x304].copy_from_slice(&(target & !0xFFF).to_le_bytes());
+            f[0x304..0x308].copy_from_slice(&10u32.to_le_bytes());
+            f[0x308..0x30A].copy_from_slice(&((pe::IMAGE_REL_BASED_DIR64 << 12) | (target & 0xFFF) as u16).to_le_bytes());
+            f
+        };
+        // the preferred address is taken, so the image is relocated
+        let blocker = unsafe { VirtualAlloc(BASE as *const c_void, 0x10000, MEM_RESERVE, PAGE_NOACCESS) };
+        assert!(!blocker.is_null());
+        for (target, name) in [(0x10_0000u32, "xcl_reloc_past_end.dll"), (0x1FFC, "xcl_reloc_straddles_end.dll")] {
+            let r = map_image(&write(name, &with_reloc(target)));
+            assert!(r.as_ref().is_err_and(|e| e.contains("outside the image")), "{target:#x}: {:?}", r.map(|m| m.base));
+        }
+        let m = map_image(&write("xcl_reloc_inside.dll", &with_reloc(0x1010))).unwrap();
+        assert_ne!(m.base as u64, BASE);
+        let patched = unsafe { ((m.base + 0x1010) as *const u64).read_unaligned() };
+        assert_eq!(patched, (m.base as u64).wrapping_sub(BASE));
+        unsafe { VirtualFree(blocker, 0, MEM_RELEASE) };
     }
 }
