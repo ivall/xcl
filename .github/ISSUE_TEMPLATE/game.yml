@@ -5,7 +5,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        Every run writes a report and a log to `%LOCALAPPDATA%\XCL\<title>\logs\` (`report.json`, `xcl.log`; the previous run's are `report.prev.json`, `xcl.prev.log`). They say most of what is needed – please attach both.
+        Every run writes a report and a log, normally to `%LOCALAPPDATA%\XCL\<title>\logs\` (`report.json`, `xcl.log`; the previous run's are `report.prev.json`, `xcl.prev.log`). XCL prints the actual `xcl.log` path on its `Log:` line; `report.json` is beside it. They say most of what is needed – please attach both.
 
         Do not attach or link game files, dumps or anything from a game package. XCL works only on unpacked games you own and does not help with DRM.
   - type: input
