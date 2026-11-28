@@ -9277,6 +9277,35 @@ fn gpu_cmp_class_f16_preserves_snan() {
     }
 }
 
+/// v_cmp_class_f32 takes abs / neg on the sign bit: denormals stay denormals and an sNaN stays
+/// signalling (#1281).
+#[test]
+fn gpu_cmp_class_f32_modifiers_keep_the_bits() {
+    for wave64 in gpu_waves() {
+        let p = prog(&[
+            // 0x80000001 (-denormal) with ABS against mask 1 << 7 (+denormal) -> true
+            ("V_CMP_CLASS_F32", "ENC_VOP3", &[("VDST", 0), ("SRC0", V + 0), ("SRC1", 255), ("ABS", 1)], Some(1 << 7)),
+            // 0x80000001 (-denormal) with NEG against mask 1 << 7 (+denormal) -> true
+            ("V_CMP_CLASS_F32", "ENC_VOP3", &[("VDST", 2), ("SRC0", V + 0), ("SRC1", 255), ("NEG", 1)], Some(1 << 7)),
+            // 0x7F800001 (sNaN) with NEG against mask 1 << 0 (sNaN) -> true
+            ("V_CMP_CLASS_F32", "ENC_VOP3", &[("VDST", 4), ("SRC0", V + 1), ("SRC1", 129), ("NEG", 1)], None),
+            // 0x7F800001 (sNaN) with ABS against mask 1 << 1 (qNaN) -> false
+            ("V_CMP_CLASS_F32", "ENC_VOP3", &[("VDST", 6), ("SRC0", V + 1), ("SRC1", 130), ("ABS", 1)], None),
+        ]);
+        let mut st = KernelState::default();
+        for r in st.vgpr.iter_mut() {
+            r[0] = 0x8000_0001;
+            r[1] = 0x7F80_0001;
+        }
+        let (r, lanes) = run_wave(&p, &st, wave64);
+        let all = (u32::MAX, if wave64 { u32::MAX } else { 0 });
+        assert_eq!((r.sgpr[0], r.sgpr[1]), all, "wave{lanes} abs(-denormal) matches +denormal");
+        assert_eq!((r.sgpr[2], r.sgpr[3]), all, "wave{lanes} neg(-denormal) matches +denormal");
+        assert_eq!((r.sgpr[4], r.sgpr[5]), all, "wave{lanes} neg(sNaN) matches sNaN");
+        assert_eq!((r.sgpr[6], r.sgpr[7]), (0, 0), "wave{lanes} abs(sNaN) does not match qNaN");
+    }
+}
+
 #[test]
 fn wave32_src_vccz_execz_and_saveexec_b32_hlsl() {
     let w32_code = prog(&[
