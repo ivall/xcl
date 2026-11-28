@@ -20,6 +20,8 @@
 #![allow(non_snake_case)]
 
 use std::ffi::c_void;
+use windows::Win32::UI::WindowsAndMessaging::WNDCLASSEXA;
+use windows_sys::Win32::UI::WindowsAndMessaging::MINMAXINFO;
 
 use crate::util::{from_ansi_ptr, wide};
 
@@ -69,9 +71,10 @@ unsafe fn name(p: *const u8, keep: &mut Vec<Vec<u16>>) -> *const u16 {
 
 pub unsafe extern "system" fn RegisterClassExA(c: *const WndClassEx<u8>) -> u16 {
     if c.is_null() {
+        windows_sys::Win32::Foundation::SetLastError(windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER);
         return 0;
     }
-    if (*c).cb_size != std::mem::size_of::<WndClassEx<u8>>() as u32 {
+    if (*c).cb_size != std::mem::size_of::<WNDCLASSEXA>() as u32 {
         windows_sys::Win32::Foundation::SetLastError(windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER);
         return 0;
     }
@@ -153,8 +156,8 @@ unsafe fn console_window(ex_style: u32, class: *const u16, title: *const u16, st
     let old = SetWindowLongPtrW(hwnd, GWLP_WNDPROC, console_wndproc as usize as isize);
     if old != 0 {
         PROCS.lock().unwrap().push((hwnd as usize, old));
-        // SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED
-        SetWindowPos(hwnd, std::ptr::null_mut(), 0, 0, 0, 0, 0x2 | 0x1 | 0x4 | 0x10 | 0x20);
+        // SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED
+        SetWindowPos(hwnd, std::ptr::null_mut(), 0, 0, CONSOLE_W, CONSOLE_H, 0x2 | 0x4 | 0x10 | 0x20);
     }
     crate::xlog_info!("user: the title's window {hwnd:p} is the console's screen ({CONSOLE_W}x{CONSOLE_H}, no frame, cloaked)");
     hwnd
@@ -170,12 +173,14 @@ unsafe extern "system" fn console_wndproc(hwnd: *mut c_void, msg: u32, wp: usize
         WM_NCCALCSIZE => 0,
         WM_GETMINMAXINFO => {
             let r = CallWindowProcW(orig, hwnd, msg, wp, lp);
-            // MINMAXINFO: ptMaxSize (+8), ptMaxTrackSize (+24)
-            if let Some(m) = (lp as *mut [i32; 10]).as_mut() {
-                m[2] = m[2].max(CONSOLE_W);
-                m[3] = m[3].max(CONSOLE_H);
-                m[6] = m[6].max(CONSOLE_W);
-                m[7] = m[7].max(CONSOLE_H);
+            // MINMAXINFO: ptMaxSize (+8), ptMinTrackSize (+24), ptMaxTrackSize (+32)
+            if let Some(m) = (lp as *mut MINMAXINFO).as_mut() {
+                m.ptMaxSize.x = m.ptMaxSize.x.max(CONSOLE_W);
+                m.ptMaxSize.y = m.ptMaxSize.y.max(CONSOLE_H);
+                m.ptMinTrackSize.x = m.ptMinTrackSize.x.max(CONSOLE_W);
+                m.ptMinTrackSize.y = m.ptMinTrackSize.y.max(CONSOLE_H);
+                m.ptMaxTrackSize.x = m.ptMaxTrackSize.x.max(CONSOLE_W);
+                m.ptMaxTrackSize.y = m.ptMaxTrackSize.y.max(CONSOLE_H);
             }
             r
         }
@@ -290,6 +295,152 @@ mod tests {
             VirtualFree(base, 0, MEM_RELEASE);
             assert_eq!(atom, 0);
             assert_eq!(error, windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER);
+        }
+    }
+
+    #[test]
+    fn register_class_rejects_null_descriptor() {
+        unsafe {
+            SetLastError(0x1234_5678);
+            let atom = RegisterClassExA(std::ptr::null());
+            assert_eq!(atom, 0);
+            assert_eq!(GetLastError(), windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER);
+        }
+    }
+
+    #[test]
+    fn console_window_enforces_frameless_1920x1080_sizing() {
+        unsafe {
+            use windows_sys::Win32::Foundation::RECT;
+            use windows_sys::Win32::UI::WindowsAndMessaging::{
+                DestroyWindow, GetClientRect, GetWindowRect, WS_OVERLAPPEDWINDOW,
+            };
+
+            let instance = GetModuleHandleW(std::ptr::null()) as usize;
+            let class_name = c"XclConsoleWindowSizingTest";
+            let wide_name = wide(class_name.to_str().unwrap());
+            let c = WndClassEx {
+                cb_size: std::mem::size_of::<WNDCLASSEXA>() as u32,
+                style: 0,
+                wnd_proc: DefWindowProcW as usize,
+                cls_extra: 0,
+                wnd_extra: 0,
+                instance,
+                icon: 0,
+                cursor: 0,
+                background: 0,
+                menu_name: std::ptr::null(),
+                class_name: class_name.as_ptr() as *const u8,
+                icon_small: 0,
+            };
+            let atom = RegisterClassExA(&c);
+            assert_ne!(atom, 0, "RegisterClassExA failed");
+
+            // Create window with arbitrary requested size (e.g. 800x600, overlapped)
+            let title = c"XclSizingTest";
+            let hwnd = CreateWindowExA(
+                0,
+                class_name.as_ptr() as *const u8,
+                title.as_ptr() as *const u8,
+                WS_OVERLAPPEDWINDOW,
+                100,
+                100,
+                800,
+                600,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                instance as *mut c_void,
+                std::ptr::null(),
+            );
+            assert!(!hwnd.is_null(), "CreateWindowExA failed");
+
+            let mut client_rc: RECT = std::mem::zeroed();
+            let mut window_rc: RECT = std::mem::zeroed();
+            assert_ne!(GetClientRect(hwnd as *mut _, &mut client_rc), 0);
+            assert_ne!(GetWindowRect(hwnd as *mut _, &mut window_rc), 0);
+
+            let client_w = client_rc.right - client_rc.left;
+            let client_h = client_rc.bottom - client_rc.top;
+            let window_w = window_rc.right - window_rc.left;
+            let window_h = window_rc.bottom - window_rc.top;
+
+            assert_eq!(client_w, CONSOLE_W, "client width must match console screen (1920)");
+            assert_eq!(client_h, CONSOLE_H, "client height must match console screen (1080)");
+            assert_eq!(window_w, CONSOLE_W, "frameless window width must match console screen (1920)");
+            assert_eq!(window_h, CONSOLE_H, "frameless window height must match console screen (1080)");
+
+            // Verify min/max tracking constraints enforced by console_wndproc
+            let mut min_max: MINMAXINFO = std::mem::zeroed();
+            console_wndproc(hwnd, WM_GETMINMAXINFO, 0, &mut min_max as *mut MINMAXINFO as isize);
+            assert!(min_max.ptMaxSize.x >= CONSOLE_W);
+            assert!(min_max.ptMaxSize.y >= CONSOLE_H);
+            assert!(min_max.ptMinTrackSize.x >= CONSOLE_W);
+            assert!(min_max.ptMinTrackSize.y >= CONSOLE_H);
+            assert!(min_max.ptMaxTrackSize.x >= CONSOLE_W);
+            assert!(min_max.ptMaxTrackSize.y >= CONSOLE_H);
+
+            assert_ne!(DestroyWindow(hwnd as *mut _), 0);
+            assert_ne!(UnregisterClassW(wide_name.as_ptr(), instance), 0);
+        }
+    }
+
+    #[test]
+    fn console_window_unicode_enforces_frameless_1920x1080_sizing() {
+        unsafe {
+            use windows_sys::Win32::Foundation::RECT;
+            use windows_sys::Win32::UI::WindowsAndMessaging::{
+                DestroyWindow, GetClientRect, GetWindowRect, WS_OVERLAPPEDWINDOW,
+            };
+
+            let instance = GetModuleHandleW(std::ptr::null()) as usize;
+            let class_name = c"XclUnicodeSizingTest";
+            let wide_name = wide(class_name.to_str().unwrap());
+            let c = WndClassEx {
+                cb_size: std::mem::size_of::<WNDCLASSEXA>() as u32,
+                style: 0,
+                wnd_proc: DefWindowProcW as usize,
+                cls_extra: 0,
+                wnd_extra: 0,
+                instance,
+                icon: 0,
+                cursor: 0,
+                background: 0,
+                menu_name: std::ptr::null(),
+                class_name: class_name.as_ptr() as *const u8,
+                icon_small: 0,
+            };
+            let atom = RegisterClassExA(&c);
+            assert_ne!(atom, 0, "RegisterClassExA failed");
+
+            let title_wide = wide("XclUnicodeTitle");
+            let hwnd = create_window_ex_w(
+                0,
+                wide_name.as_ptr(),
+                title_wide.as_ptr(),
+                WS_OVERLAPPEDWINDOW,
+                0,
+                0,
+                640,
+                480,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                instance as *mut c_void,
+                std::ptr::null(),
+            );
+            assert!(!hwnd.is_null());
+
+            let mut client_rc: RECT = std::mem::zeroed();
+            let mut window_rc: RECT = std::mem::zeroed();
+            assert_ne!(GetClientRect(hwnd as *mut _, &mut client_rc), 0);
+            assert_ne!(GetWindowRect(hwnd as *mut _, &mut window_rc), 0);
+
+            assert_eq!(client_rc.right - client_rc.left, CONSOLE_W);
+            assert_eq!(client_rc.bottom - client_rc.top, CONSOLE_H);
+            assert_eq!(window_rc.right - window_rc.left, CONSOLE_W);
+            assert_eq!(window_rc.bottom - window_rc.top, CONSOLE_H);
+
+            assert_ne!(DestroyWindow(hwnd as *mut _), 0);
+            assert_ne!(UnregisterClassW(wide_name.as_ptr(), instance), 0);
         }
     }
 }
