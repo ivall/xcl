@@ -1,8 +1,9 @@
 import json
+import tempfile
 import unittest
 from pathlib import Path
 
-from coverage_gate import compare, sweep_json
+from coverage_gate import compare, main, sweep_json
 
 STAGES = {
     "CS": {"total": 100, "translated": 95, "unsupported": 5, "validator_failed": 0, "panicked": 0, "timeout": 0},
@@ -49,6 +50,26 @@ class CompareTests(unittest.TestCase):
         stages = {"stages": {"CS": STAGES["CS"]}}
         bad, _ = compare(self.baseline, stages)
         self.assertEqual(bad, [("PS", "stage missing from the sweep")])
+
+    def test_new_stage_with_validator_failure_panic_or_timeout_is_a_regression(self):
+        r = run()
+        r["stages"]["HS"] = {"total": 6, "translated": 0, "unsupported": 0, "validator_failed": 2, "panicked": 1, "timeout": 3}
+        bad, notes = compare(self.baseline, r)
+        self.assertEqual(
+            sorted(bad),
+            [
+                ("HS", "panicked 1 (stage not in baseline)"),
+                ("HS", "timeout 3 (stage not in baseline)"),
+                ("HS", "validator_failed 2 (stage not in baseline)"),
+            ],
+        )
+        self.assertEqual(notes, ["HS: new stage in the sweep"])
+        with tempfile.TemporaryDirectory() as tmp:
+            base_path = Path(tmp) / "baseline.json"
+            run_path = Path(tmp) / "run.json"
+            base_path.write_text(json.dumps(self.baseline), encoding="utf-8")
+            run_path.write_text(json.dumps(r), encoding="utf-8")
+            self.assertEqual(main(["--baseline", str(base_path), "--run-json", str(run_path)]), 1)
 
     def test_new_stage_is_a_note(self):
         r = run()

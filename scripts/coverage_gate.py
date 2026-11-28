@@ -47,6 +47,10 @@ def compare(baseline, run):
         if got["total"] != want["total"]:
             notes.append(f"{stage}: total {want['total']} -> {got['total']} (corpus changed)")
     for stage in sorted(set(run["stages"]) - set(baseline["stages"])):
+        got = run["stages"][stage]
+        for k in WORSEN:
+            if got[k] > 0:
+                bad.append((stage, f"{k} {got[k]} (stage not in baseline)"))
         notes.append(f"{stage}: new stage in the sweep")
     return bad, notes
 
