@@ -1315,6 +1315,8 @@ unsafe fn root_args_summary(this: *mut c_void, buffer_words: usize) -> String {
                     .map(|k| {
                         let at = u.base() + t + 32 * k;
                         let w = super::console_heap::words_at((t + 32 * k) as u32);
+                        let stale = if super::console_heap::stale_copy_at((t + 32 * k) as u32) { " (stale copy)" } else { "" };
+                        let k = format!("{k}{stale}");
                         match super::console_heap::resource_at(at) {
                             Some(r) => {
                                 if super::title_textures::address(r).is_some() {
