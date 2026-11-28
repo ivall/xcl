@@ -75,6 +75,13 @@ unsafe extern "system" fn unhandled_filter(info: *const EXCEPTION_POINTERS) -> i
                 _ => "?",
             };
             extra = format!(" ({op} at address {:#x})", rec.ExceptionInformation[1]);
+            // a title's own way to end itself: a write of a tag to address 0 (a retail game's GPU
+            // watchdog, "GPU Loc Sig", writes 0x4d8bd421; its thread's exit path writes 0)
+            if rec.ExceptionInformation[0] == 1 && rec.ExceptionInformation[1] == 0 && code_bytes_at(addr, 11) >= 11 {
+                if let Some(tag) = deliberate_null_write(std::slice::from_raw_parts(addr as *const u8, 11)) {
+                    extra += &format!(" – the title's own deliberate crash: mov dword ptr [0], {tag:#x}");
+                }
+            }
         }
         if rec.ExceptionCode as u32 == ILLEGAL_INSTRUCTION {
             extra = format!(" (code bytes: {})", code_at(addr));
@@ -360,6 +367,12 @@ fn is_writable(va: usize, bytes: usize) -> bool {
 const ILLEGAL_INSTRUCTION: u32 = 0xC000_001D;
 
 /// The first 16 code bytes at `rip`, as hex (as far as they are readable).
+/// The tag of `mov dword ptr [0], imm32` (C7 04 25 00 00 00 00 imm32), the instruction titles
+/// use to end themselves on purpose.
+fn deliberate_null_write(code: &[u8]) -> Option<u32> {
+    (code.len() >= 11 && code[..7] == [0xC7, 0x04, 0x25, 0, 0, 0, 0]).then(|| u32::from_le_bytes([code[7], code[8], code[9], code[10]]))
+}
+
 unsafe fn code_at(rip: usize) -> String {
     let n = (1..=16).rev().find(|&n| crate::gpu::shader::readable(rip, n)).unwrap_or(0);
     crate::insn::hex(std::slice::from_raw_parts(rip as *const u8, n))
@@ -1082,6 +1095,19 @@ pub fn start_probes() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_write_of_a_tag_to_address_0_is_named_a_deliberate_crash() {
+        // the two of a retail game's GPU watchdog: its tag, and 0 on its thread's exit path
+        let watchdog = [0xC7, 0x04, 0x25, 0, 0, 0, 0, 0x21, 0xD4, 0x8B, 0x4D, 0x48, 0x83];
+        assert_eq!(deliberate_null_write(&watchdog), Some(0x4D8B_D421));
+        assert_eq!(deliberate_null_write(&[0xC7, 0x04, 0x25, 0, 0, 0, 0, 0, 0, 0, 0, 0xCC]), Some(0));
+        let mut elsewhere = watchdog;
+        elsewhere[3] = 0x10; // mov dword ptr [0x10], imm32: an ordinary store
+        assert_eq!(deliberate_null_write(&elsewhere), None);
+        assert_eq!(deliberate_null_write(&[0x89, 0x04, 0x25, 0, 0, 0, 0]), None, "a register store");
+        assert_eq!(deliberate_null_write(&watchdog[..10]), None, "cut short");
+    }
 
     #[test]
     fn bounded_cstr_stops_at_nul_limit_and_unreadable_memory() {
