@@ -297,7 +297,7 @@ pub fn intersect_node(data: &[u8], node: u32, tmax: f32, o: [f32; 3], d: [f32; 3
                     let w = [0, 1, 2].map(|j| word(data, at + 16 + 12 * k + 4 * j));
                     ([half(w[0]), half(w[0] >> 16), half(w[1])], [half(w[1] >> 16), half(w[2]), half(w[2] >> 16)])
                 };
-                let valid = child != INVALID && (0..3).all(|a| mn[a] <= mx[a]);
+                let mut valid = child != INVALID && (0..3).all(|a| mn[a] <= mx[a]);
                 let (mut a, mut b) = (f32::NEG_INFINITY, f32::INFINITY);
                 for axis in 0..3 {
                     let (lo, hi) = if inv[axis].is_infinite() {
@@ -309,6 +309,10 @@ pub fn intersect_node(data: &[u8], node: u32, tmax: f32, o: [f32; 3], d: [f32; 3
                     } else {
                         let t1 = (mn[axis] - o[axis]) * inv[axis];
                         let t2 = (mx[axis] - o[axis]) * inv[axis];
+                        if t1.is_nan() || t2.is_nan() {
+                            valid = false;
+                            break;
+                        }
                         (t1.min(t2), t1.max(t2))
                     };
                     a = a.max(lo);
@@ -413,6 +417,9 @@ impl Bvh {
 
     /// bounds of everything below the root
     pub fn bounds(&self) -> Aabb {
+        if self.root == INVALID {
+            return ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]);
+        }
         let at = node_at(self.root);
         let kids = (0..4).filter(|&k| word(&self.data, at + 4 * k) != INVALID);
         bounds(kids.flat_map(|k| [vec3(&self.data, at + 16 + 24 * k), vec3(&self.data, at + 28 + 24 * k)]))
@@ -669,5 +676,25 @@ pub(crate) mod tests {
         // Type 3 must miss a ray aimed at type 0's interior (1.0, 0.5)
         let miss3 = intersect_node(&data, 3, 100.0, [1.0, 0.5, 0.0], d, inv, false).map(f32::from_bits);
         assert!(miss3[0].is_infinite());
+    }
+
+    #[test]
+    fn empty_bvh_bounds_does_not_panic() {
+        let empty = build(&[], 0);
+        assert_eq!(empty.bounds(), ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]));
+        let empty_top = build_top(&[]);
+        assert_eq!(empty_top.bounds(), ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]));
+    }
+
+    #[test]
+    fn nan_ray_misses_all_boxes() {
+        let mut data = vec![0u8; 256];
+        put(&mut data, 0, &[0x10, INVALID, INVALID, INVALID]);
+        let box_f = [0.0f32, 0.0, 0.0, 1.0, 1.0, 1.0].map(f32::to_bits);
+        put(&mut data, 16, &box_f);
+        let got = intersect_node(&data, BOX32, 100.0, [f32::NAN; 3], [f32::NAN; 3], [f32::NAN; 3], true);
+        assert_eq!(got, [INVALID; 4], "a NaN ray must miss all child AABBs");
+        let got_o = intersect_node(&data, BOX32, 100.0, [f32::NAN, 0.5, 0.5], [1.0, 0.0, 0.0], [1.0, f32::INFINITY, f32::INFINITY], true);
+        assert_eq!(got_o, [INVALID; 4], "a ray with NaN origin must miss");
     }
 }
