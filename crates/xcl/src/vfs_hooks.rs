@@ -531,10 +531,19 @@ unsafe extern "system" fn hk_remove_dir_w(n: *const u16) -> i32 {
 unsafe extern "system" fn hk_read_file(h: *mut c_void, buf: *mut c_void, n: u32, read: *mut u32, ov: *mut c_void) -> i32 {
     type F = unsafe extern "system" fn(*mut c_void, *mut c_void, u32, *mut u32, *mut c_void) -> i32;
     let orig = orig!(O_READ_FILE as F);
-    if !buf.is_null() {
-        crate::hle::kernelx::lazy::ensure(buf as usize, n as usize);
+    if buf.is_null() {
+        return orig(h, buf, n, read, ov);
     }
-    orig(h, buf, n, read, ov)
+    // (views of physical pages stay writable until the read is over: a synchronous one when it
+    // returns, an overlapped one – it writes after this returns – when its OVERLAPPED says done)
+    let open = crate::hle::kernelx::lazy::ensure(buf as usize, n as usize);
+    let r = orig(h, buf, n, read, ov);
+    if ov.is_null() {
+        drop(open);
+    } else {
+        crate::hle::kernelx::guards::open_until_done(open, ov as usize);
+    }
+    r
 }
 
 unsafe extern "system" fn hk_delete_file_w(n: *const u16) -> i32 {
