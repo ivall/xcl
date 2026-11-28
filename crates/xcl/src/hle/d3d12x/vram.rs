@@ -4479,8 +4479,7 @@ mod tests {
             queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
             let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
             queue.Signal(&fence, 1).unwrap();
-            // no event: returns when the fence has the value
-            fence.SetEventOnCompletion(1, windows::Win32::Foundation::HANDLE::default()).unwrap();
+            crate::gpu::fence::wait(&fence, 1, &dev, None, 10_000).unwrap();
             let mut p = std::ptr::null_mut();
             readback.Map(0, None, Some(&mut p)).unwrap();
             let bytes = std::slice::from_raw_parts(p as *const u8, total as usize);
