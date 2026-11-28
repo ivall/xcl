@@ -428,7 +428,8 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
     no word to add means), `all` for the system's functions too (short runs only), any other word
     is the start of a `dll!Function` name to add, and `-word` one to leave out; the name is the
     DLL's file name with its extension and case does not matter, so for example
-    `hle,-kernelx.dll!GetTickCount,gameinput`.
+    `hle,-kernelx.dll!VirtualAlloc,gameinput` excludes imports whose names start with
+    `VirtualAlloc` from `kernelx.dll` and also traces imports from `gameinput`.
   - `XCL_D3D12_TRACE=1` (any value): every call console code makes to a public D3D12.X method is
     logged with the interface and method name. Very verbose: use it for a short run.
 - Title data: `%LOCALAPPDATA%\XCL\<title>\` (`%XCL_DATA_ROOT%`): `xcl.toml`, `overlay\`, `saves\`,
