@@ -257,7 +257,8 @@ unsafe fn run_tls_callbacks(m: &MappedModule, reason: u32) {
 pub fn init_dll(m: &Arc<MappedModule>) -> Result<(), String> {
     unsafe {
         run_tls_callbacks(m, 1);
-        if m.entry_rva != 0 {
+        // an executable loaded as a library: Windows' loader does not call its entry point
+        if m.is_dll && m.entry_rva != 0 {
             let f: DllMain = std::mem::transmute(m.base + m.entry_rva as usize);
             crate::xlog_info!("DllMain({}, PROCESS_ATTACH)", m.name);
             if f(m.base as *mut c_void, 1, std::ptr::null_mut()) == 0 {
@@ -500,6 +501,19 @@ mod tests {
         let p = write("xcl_dllmain_true.dll", &tiny_dll(0x7E52_0000_0000, &[0xB8, 1, 0, 0, 0, 0xC3], None));
         let m = load_game_dll(&p).unwrap();
         assert!(m.initialized.load(Ordering::Acquire));
+        assert_eq!(load_game_dll(&p).unwrap().base, m.base);
+    }
+
+    /// An executable loaded as a library is mapped, its entry point is not called as a DllMain
+    /// (before: its mainCRTStartup ran with DllMain's arguments; here it returns 0, the load failed)
+    #[test]
+    fn an_exe_loaded_as_a_library_does_not_run_its_entry_point() {
+        // xor eax, eax; ret
+        let mut img = tiny_dll(0x7E54_0000_0000, &[0x31, 0xC0, 0xC3], None);
+        img[0x56..0x58].copy_from_slice(&0x0022u16.to_le_bytes()); // executable | large address aware, not a DLL
+        let p = write("xcl_exe_as_library.exe", &img);
+        let m = load_game_dll(&p).expect("an EXE loads as a library");
+        assert!(!m.is_dll);
         assert_eq!(load_game_dll(&p).unwrap().base, m.base);
     }
 
