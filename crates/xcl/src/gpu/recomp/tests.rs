@@ -5743,6 +5743,80 @@ fn gpu_global_atomics_and_sub_dword_access() {
     }
 }
 
+/// d16 LDS accesses: `ds_read_{u8,i8,u16}_d16(_hi)` load into one half of the VGPR (signed
+/// bytes sign-extended to 16 bits) and keep the other half; `ds_write_b{8,16}_d16_hi` store
+/// from the high half and leave the rest of the dword alone, also when neighbouring lanes
+/// write the other bytes of the same dword.
+#[test]
+fn gpu_ds_d16_loads_stores() {
+    let ds = |n: &'static str, f: &'static [(&'static str, u64)]| (n, "ENC_DS", f, None);
+    let p = prog(&[
+        // loads from P at 16 * lane, into v20..v25 (prefilled with K)
+        ds("DS_WRITE_B32", &[("ADDR", 1), ("DATA0", 10)]),
+        ds("DS_READ_U8_D16", &[("VDST", 20), ("ADDR", 1), ("OFFSET0", 1)]),
+        ds("DS_READ_U8_D16_HI", &[("VDST", 21), ("ADDR", 1), ("OFFSET0", 2)]),
+        ds("DS_READ_I8_D16", &[("VDST", 22), ("ADDR", 1), ("OFFSET0", 3)]),
+        ds("DS_READ_I8_D16_HI", &[("VDST", 23), ("ADDR", 1), ("OFFSET0", 1)]),
+        ds("DS_READ_U16_D16", &[("VDST", 24), ("ADDR", 1), ("OFFSET0", 2)]),
+        ds("DS_READ_U16_D16_HI", &[("VDST", 25), ("ADDR", 1)]),
+        // stores over Q at v2 = 0x400 + 16 * lane: byte 1, then bytes 2..3, from v12's high half
+        ds("DS_WRITE_B32", &[("ADDR", 2), ("DATA0", 11)]),
+        ds("DS_WRITE_B8_D16_HI", &[("ADDR", 2), ("DATA0", 12), ("OFFSET0", 1)]),
+        ds("DS_WRITE_B16_D16_HI", &[("ADDR", 2), ("DATA0", 12), ("OFFSET0", 2)]),
+        ds("DS_READ_B32", &[("VDST", 26), ("ADDR", 2)]),
+        // two lanes per dword (v3 = 0x800 + 2 * lane), four lanes per dword (v4 = 0xC00 + lane),
+        // read back from another lane of the same dword after the barrier
+        ds("DS_WRITE_B16_D16_HI", &[("ADDR", 3), ("DATA0", 12)]),
+        ds("DS_WRITE_B8_D16_HI", &[("ADDR", 4), ("DATA0", 13)]),
+        ("S_BARRIER", "ENC_SOPP", &[], None),
+        ds("DS_READ_U16_D16", &[("VDST", 27), ("ADDR", 5)]),
+        ds("DS_READ_U8_D16_HI", &[("VDST", 28), ("ADDR", 6)]),
+    ]);
+    let t = translate(&p, &Options::default()).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+
+    const K: u32 = 0xA5A5_5A5A;
+    // bytes with and without the sign bit in every lane: 0x01, 0xFE, 0x7F, 0x80 xor lane
+    let pat = |l: usize| 0x807F_FE01u32 ^ (l as u32 * 0x0101_0101);
+    let hi_data = |l: usize| ((0xC0DE ^ l as u32) << 16) | 0x0F0F;
+    let byte_data = |l: usize| ((0x40 + l as u32) << 16) | 0x00FF;
+    let lo = |v: u32| (K & 0xFFFF_0000) | (v & 0xFFFF);
+    let hi = |v: u32| (K & 0xFFFF) | (v << 16);
+    let sext8 = |b: u32| (b as u8 as i8 as i16 as u16) as u32;
+    for wave64 in gpu_waves() {
+        let mut st = KernelState::default();
+        for (l, r) in st.vgpr.iter_mut().enumerate() {
+            let l32 = l as u32;
+            r[1] = 16 * l32;
+            r[2] = 0x400 + 16 * l32;
+            r[3] = 0x800 + 2 * l32;
+            r[4] = 0xC00 + l32;
+            r[5] = 0x800 + 2 * (l32 ^ 1);
+            r[6] = 0xC00 + (l32 ^ 3);
+            r[10] = pat(l);
+            r[11] = !pat(l);
+            r[12] = hi_data(l);
+            r[13] = byte_data(l);
+            r[20..29].fill(K);
+        }
+        let (res, lanes) = run_wave(&p, &st, wave64);
+        for (l, v) in res.vgpr.iter().take(lanes).enumerate() {
+            let b = |i: u32| (pat(l) >> (8 * i)) & 0xFF;
+            assert_eq!(v[20], lo(b(1)), "wave{lanes} lane {l}: ds_read_u8_d16 offset:1");
+            assert_eq!(v[21], hi(b(2)), "wave{lanes} lane {l}: ds_read_u8_d16_hi offset:2");
+            assert_eq!(v[22], lo(sext8(b(3))), "wave{lanes} lane {l}: ds_read_i8_d16 offset:3");
+            assert_eq!(v[23], hi(sext8(b(1))), "wave{lanes} lane {l}: ds_read_i8_d16_hi offset:1");
+            assert_eq!(v[24], lo(b(2) | b(3) << 8), "wave{lanes} lane {l}: ds_read_u16_d16 offset:2");
+            assert_eq!(v[25], hi(b(0) | b(1) << 8), "wave{lanes} lane {l}: ds_read_u16_d16_hi");
+            let h = hi_data(l) >> 16;
+            let want = (!pat(l) & 0xFF) | (h & 0xFF) << 8 | h << 16;
+            assert_eq!(v[26], want, "wave{lanes} lane {l}: ds_write_b8_d16_hi offset:1 + ds_write_b16_d16_hi offset:2");
+            assert_eq!(v[27], lo(hi_data(l ^ 1) >> 16), "wave{lanes} lane {l}: neighbour's ds_write_b16_d16_hi");
+            assert_eq!(v[28], hi((byte_data(l ^ 3) >> 16) & 0xFF), "wave{lanes} lane {l}: ds_write_b8_d16_hi of lane {}", l ^ 3);
+        }
+    }
+}
+
 /// The instructions added for code outside the retail pack: global inc / dec / csub /
 /// 64-bit add, LDS signed min / max, cmpst, mskor, float add (CAS loops), global sub-dword
 /// and d16 accesses, scratch, SAD / lerp, the division helpers, saturating adds, packs, swap.
