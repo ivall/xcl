@@ -119,3 +119,51 @@ fn bc7_dictionary_indices_line_up() {
         assert!(ok, "entry {k}: {:?}", ix.ix);
     }
 }
+
+#[test]
+fn oversized_output_returns_allocation_error() {
+    // This aligned size cannot fit in a Vec on any supported platform.
+    let size = usize::MAX & !15;
+    for mode in [1, 3, 4, 5, 6, 7] {
+        assert_eq!(decode(mode, &[], size), Err(Error::Allocation), "mode {mode}");
+    }
+}
+
+#[test]
+fn output_allocation_refused_by_windows_returns_an_error() {
+    const CHILD: &str = "XCL_TEST_BCPACK_ALLOC_REFUSAL";
+    const TEST: &str = "hle::bcpack::tests::output_allocation_refused_by_windows_returns_an_error";
+    if std::env::var(CHILD).as_deref() != Ok("1") {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1").output().unwrap();
+        assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        print!("{}", String::from_utf8_lossy(&output.stdout));
+        return;
+    }
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError};
+    use windows_sys::Win32::System::JobObjects::*;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    const SIZE: usize = 128 << 20;
+    assert!(SIZE <= isize::MAX as usize, "exercise allocator refusal, not capacity overflow");
+    unsafe {
+        // The cap applies only to this isolated test child, not the parent or machine.
+        let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        assert!(!job.is_null(), "CreateJobObjectW: {}", GetLastError());
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_PROCESS_MEMORY;
+        info.ProcessMemoryLimit = 64 << 20;
+        assert_ne!(SetInformationJobObject(job, JobObjectExtendedLimitInformation,
+            &info as *const _ as *const _, std::mem::size_of_val(&info) as u32), 0, "SetInformationJobObject: {}", GetLastError());
+        assert_ne!(AssignProcessToJobObject(job, GetCurrentProcess()), 0, "AssignProcessToJobObject: {}", GetLastError());
+        for mode in [1, 3, 4, 5, 6, 7] {
+            match decode(mode, &[], SIZE) {
+                Err(Error::Allocation) => {}
+                Err(other) => panic!("mode {mode}: expected allocation refusal, got {other}"),
+                Ok(bytes) => panic!("mode {mode}: unexpectedly allocated {} bytes", bytes.len()),
+            }
+        }
+        assert_ne!(CloseHandle(job), 0);
+    }
+    println!("all six supported modes returned Allocation under a child-only 64 MiB commit cap");
+}

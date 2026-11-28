@@ -15,6 +15,8 @@ pub enum Error {
     Unsupported,
     /// the output is not a whole number of blocks
     OutputSize,
+    /// the output buffer cannot be allocated
+    Allocation,
     /// the stream is truncated, malformed, or ends in a bad lane state
     Decode(&'static str),
 }
@@ -25,6 +27,7 @@ impl Error {
         match self {
             Error::Unsupported => "unsupported",
             Error::OutputSize => "output size",
+            Error::Allocation => "allocation",
             Error::Decode(_) => "decode",
         }
     }
@@ -35,6 +38,7 @@ impl std::fmt::Display for Error {
         match *self {
             Error::Unsupported => write!(f, "no decoder for this mode"),
             Error::OutputSize => write!(f, "the output size is not a whole number of blocks"),
+            Error::Allocation => write!(f, "could not allocate the output buffer"),
             Error::Decode(why) => write!(f, "{why}"),
         }
     }
@@ -60,7 +64,9 @@ pub fn decode(mode: u8, src: &[u8], out_len: usize) -> Result<Vec<u8>, Error> {
     if out_len == 0 || out_len % block != 0 {
         return Err(Error::OutputSize);
     }
-    let mut out = vec![0u8; out_len];
+    let mut out = Vec::new();
+    out.try_reserve_exact(out_len).map_err(|_| Error::Allocation)?;
+    out.resize(out_len, 0);
     victory::decode(mode, src, &mut out, victory::Tables::builtin())
         .map_err(|e| Error::Decode(e.0))?;
     Ok(out)
