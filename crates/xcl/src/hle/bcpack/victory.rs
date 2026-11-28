@@ -2,6 +2,8 @@
 //! DirectStorage hardware unpacks them. Decode only; BC2 is left out (no
 //! title data uses it). Ported from VIctory's victory-formats/src/bcpack.rs on 2026-11-23
 //! (https://github.com/Marvisak/VIctory, GPL-3.0, see THIRD_PARTY.md).
+//! The BC7 rotation gate follows ScarlettPort #108 on 2026-11-27
+//! (https://github.com/ZigZagBoi1/ScarlettPort/pull/108, GPL-3.0-or-later).
 //!
 //! A packed stream has no header. It is 12 or 16 interleaved rANS *lanes*;
 //! each lane is a run of fragments (header byte, length, payload) coded with
@@ -681,10 +683,18 @@ fn pbits(mode: u16) -> bool {
     matches!(mode, 0 | 1 | 3 | 6 | 7)
 }
 
+fn bc7_rotation(ctrl: u16) -> usize {
+    if matches!(ctrl & 7, 4 | 5) {
+        usize::from(ctrl >> 3 & 3)
+    } else {
+        0
+    }
+}
+
 /// Channel precisions: the p-bit is red's lowest bit; rotation swaps alpha
 /// with the rotated channel.
 fn bc7_precision(ctrl: u16) -> [u8; 4] {
-    let (mode, rot) = (ctrl & 7, usize::from(ctrl >> 3 & 3));
+    let (mode, rot) = (ctrl & 7, bc7_rotation(ctrl));
     let mut p = BC7_BITS[usize::from(mode)];
     if rot != 0 {
         p.swap(3, rot - 1);
@@ -789,7 +799,7 @@ fn bc7_pack(ep: &Bc7Ep, ix: &Bc7Ix, prec: [u8; 4], out: &mut [u8]) {
     let mode = ctrl & 7;
     let subsets = usize::from((ctrl & 0xff) >> 6);
     let part = usize::from(ctrl >> 8 & 63);
-    let rot = usize::from(ctrl >> 3 & 3);
+    let rot = bc7_rotation(ctrl);
     let mut w = Bits::default();
     w.put(1 << mode, u32::from(mode) + 1);
     match mode {
@@ -847,6 +857,30 @@ fn bc7_pack(ep: &Bc7Ep, ix: &Bc7Ix, prec: [u8; 4], out: &mut [u8]) {
         _ => indices(0),
     }
     out.copy_from_slice(&w.v.to_le_bytes());
+}
+
+#[cfg(test)]
+mod bc7_rotation_tests {
+    use super::{bc7_precision, bc7_rotation};
+
+    #[test]
+    fn rotation_is_read_only_in_modes_4_and_5() {
+        for mode in 0u16..8 {
+            let ctrl = mode | 2 << 3;
+            assert_eq!(
+                bc7_rotation(ctrl),
+                if matches!(mode, 4 | 5) { 2 } else { 0 },
+                "mode {mode}"
+            );
+        }
+        for mode in [0u16, 1, 2, 3, 6, 7] {
+            assert_eq!(
+                bc7_precision(mode | 3 << 3),
+                bc7_precision(mode),
+                "mode {mode}"
+            );
+        }
+    }
 }
 
 // BC6H.
