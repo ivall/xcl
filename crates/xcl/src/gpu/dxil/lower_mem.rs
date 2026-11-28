@@ -156,7 +156,7 @@ impl Lw {
     /// when `self.heap_mem` is set via `XCL_HEAP_WINDOWS`), returning `out_tys.len()` values
     /// merged across the window arms via a single `switch` (or single guarded heap lookup)
     /// and direct phis (`f` must not write SSA variables). Out-of-range windows (`w >= n`)
-    /// jump to `join` (reads 0, stores and atomics dropped), matching `#1693` semantics.
+    /// read 0 and drop stores and atomics. Multi-window root UAV stores use one-hot guards.
     pub(crate) fn with_mem_many_tys(
         &mut self,
         mut guard: Option<Value>,
@@ -265,11 +265,33 @@ impl Lw {
             }
             return out;
         }
-        // Multi-window dispatch via a single LLVM `switch` (default -> `join` for out-of-range
-        // or inactive lane, matching `#1693` window semantics).
         let w = self.rd(super::lower::VAR_WIN);
         let mems = self.mems.clone();
         let n = mems.len();
+        if out_tys.is_empty() {
+            // Mask the shift's result before testing any bit: an out-of-range window can
+            // otherwise alias a valid bit because shl masks the shift count.
+            let inside = self.cmpc(Pred::ULt, w, n as u32);
+            let enabled = match guard {
+                Some(g) => self.and(g, inside),
+                None => inside,
+            };
+            let one = self.c(1);
+            let zero = self.c(0);
+            let bit = self.shl(one, w);
+            let mask = self.sel(enabled, bit, zero);
+            for (k, &m) in mems.iter().enumerate() {
+                let bit = self.andc(mask, 1u32 << k);
+                let selected = self.cmpc(Pred::Ne, bit, 0);
+                self.guarded(selected, &mut |lw| {
+                    let values = f(lw, m);
+                    debug_assert!(values.is_empty());
+                    Ok(())
+                }).expect("raw store lowering cannot fail");
+            }
+            return Vec::new();
+        }
+        // The switch's default skips out-of-range windows and inactive lanes.
         let from = self.cur();
         let arms: Vec<super::module::Block> = (0..n).map(|_| self.block(None)).collect();
         let join = self.block(None);

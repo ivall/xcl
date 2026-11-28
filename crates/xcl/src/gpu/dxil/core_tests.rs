@@ -456,6 +456,54 @@ fn multi_window_mem_format_and_bvh_validate() {
     }
 }
 
+#[test]
+fn raw_stores_in_root_windows_respect_exec_and_bounds() {
+    use crate::gpu::{recomp::runner::{self, KernelState}, uma::Uma};
+
+    let code = prog(&[
+        ("V_CMPX_EQ_U32", "ENC_VOPC", &[("SRC0", 129), ("VSRC1", 3)], None),
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("DATA", 2), ("ADDR", 0), ("SADDR", 0x7D), ("OFFSET", 0)], None),
+    ]);
+    let options = KernelOptions { wave64: false, split: false, mem_windows: 4, sampler_base: 0 };
+    let wave32 = super::kernel::translate_full_as(&code, options, false).unwrap().dxil;
+    if crate::gpu::recomp::dxc::location().is_ok() {
+        let ir = super::validate::disassemble(&wave32).unwrap();
+        assert!(!ir.contains("switch i32"), "root window stores still use a switch");
+        assert!(ir.contains("shl i32 1,"), "root window stores lack a one-hot mask");
+    }
+    if !matches!(runner::wave32_supported(), Ok(true)) {
+        runner::skip_test("no wave32");
+        return;
+    }
+    let wave64 = super::kernel::translate_full_as(&code, KernelOptions { wave64: true, split: runner::split_wave64(), ..options }, false).unwrap().dxil;
+    let arena = Uma::with_windows(4, 1 << 20).unwrap();
+    let base_hi = (arena.base() >> 32) as u32;
+    let windows = [0u32, 1, 2, 3, 4, 32, u32::MAX, 0];
+    let word = |window: usize, lane: usize| (arena.window(window).0 + 0x1000 + lane * 4) as *mut u32;
+    let mut state = KernelState::default();
+    for (lane, regs) in state.vgpr.iter_mut().enumerate() {
+        regs[0] = 0x1000 + lane as u32 * 4;
+        regs[1] = base_hi.wrapping_add(windows[lane % windows.len()]);
+        regs[2] = 0xCAFE_1000 + lane as u32;
+        regs[3] = u32::from(lane % 3 != 0);
+    }
+    for (dxil, lanes) in [(&wave32, 32), (&wave64, 64)] {
+        for lane in 0..state.vgpr.len() {
+            for window in 0..4 {
+                unsafe { word(window, lane).write(0xA5A5_A5A5) };
+            }
+        }
+        runner::run_in_arena(dxil, &state, &arena).unwrap();
+        for (lane, regs) in state.vgpr.iter().enumerate() {
+            for window in 0..4 {
+                let wrote = lane < lanes && windows[lane % windows.len()] == window as u32 && regs[3] != 0;
+                let expected = if wrote { regs[2] } else { 0xA5A5_A5A5 };
+                assert_eq!(unsafe { word(window, lane).read() }, expected, "wave{lanes}, window {window}, lane {lane}");
+            }
+        }
+    }
+}
+
 /// `image_get_lod` with a static sampler (an S# built from constants in the code) translates
 /// to `CalculateLevelOfDetail` on the sampler bound at `s<i>, space1`, shared with a sample of
 /// the same S#, and validates.
