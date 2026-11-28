@@ -6948,6 +6948,33 @@ fn ds_swizzle_modes_follow_the_isa() {
     assert_eq!(lanes(0x041F), (0..32).map(|i| i ^ 1).collect::<Vec<u32>>());
 }
 
+/// `swizzle_lane` for every 16-bit `ds_swizzle_b32` offset and all 32 lanes against the lanes the
+/// hardware reads. The table was measured by running `ds_swizzle_b32` natively (OpenCL inline
+/// assembly, each lane holding its lane id, 32-lane waves) for all 65,536 offsets on an RDNA2 GPU
+/// (`gfx1036`) and on an RDNA4 GPU (`gfx1201`), which agree. It is 2 MiB, so only its FNV-1a 64
+/// hash is kept, one per mode: the source lanes as bytes, offset by offset, lane by lane.
+#[test]
+fn ds_swizzle_lanes_match_rdna2_hardware_for_every_offset() {
+    use super::emit::swizzle_lane;
+    let fnv = |offsets: std::ops::Range<u64>| {
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        for off in offsets {
+            for lane in 0..32 {
+                h = (h ^ swizzle_lane(off, lane) as u64).wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+        h
+    };
+    for (mode, offsets, hardware) in [
+        ("bit mode", 0x0000..0x8000, 0x90d2_3c00_4342_4b25u64),
+        ("quad permute", 0x8000..0xC000, 0x5602_ac37_c10b_3325),
+        ("rotate", 0xC000..0xE000, 0xa127_fe15_1832_3b25),
+        ("FFT", 0xE000..0x1_0000, 0x1462_c8f0_9559_8325),
+    ] {
+        assert_eq!(fnv(offsets.clone()), hardware, "{mode} ({offsets:#06x?}): swizzle_lane differs from the hardware table");
+    }
+}
+
 #[test]
 fn gpu_ds_swizzle_modes() {
     if !gpu_ready() {
